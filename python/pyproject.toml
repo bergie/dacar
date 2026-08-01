@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dacar"
+version = "1.0.0rc3"
+description = "Decentralized Access Control for Reticulum (Dacar 1.0-RC3) reference implementation"
+readme = "README.md"
+license = { text = "EUPL-1.2" }
+requires-python = ">=3.9"
+authors = [{ name = "Dacar Project" }]
+keywords = ["reticulum", "rns", "access-control", "authorization", "crdt", "mesh", "offline"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: European Union Public Licence 1.2 (EUPL 1.2)",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Security",
+    "Topic :: System :: Networking",
+]
+dependencies = [
+    # Same Ed25519 backend used by RNS (Reticulum Network Stack).
+    "cryptography>=2.8",
+    # Transport serialization (Dacar spec §5.3).
+    "msgpack>=1.0",
+]
+
+[project.urls]
+Specification = "https://github.com/earendil-works/dacar"
+
+[tool.setuptools]
+packages = ["dacar"]
