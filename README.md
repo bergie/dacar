@@ -1,117 +1,140 @@
 # Specification: Dacar (Decentralized Access Control for Reticulum)
-**Version:** 1.0-RC3
+**Version:** 1.0-RC6
 **License:** EUPL-1.2
 **Dependencies:** Reticulum Network Stack (RNS), LWW-Element-Set CRDT, MessagePack
 ## 1. Introduction
-In traditional Reticulum applications, access control is implemented using static lists of allowed identities provided via configuration files. While functional for isolated deployments, this approach fails to scale across distributed mesh networks. It forces administrators to manually synchronize 16-byte RNS.Identity hashes across every node, lacks support for granular permissions, and offers no secure mechanism for dynamic revocation when devices are offline.
-Dacar defines a decentralized, offline-first authorization policy plane that solves this scaling problem. It is a tuple-based authorization system inspired by Google Zanzibar, designed natively for delay-tolerant, low-bandwidth networks.
-By decoupling authorization state from transport using Conflict-free Replicated Data Types (CRDTs), Dacar allows nodes to evaluate permissions locally without real-time connectivity to a central server.
+In traditional applications, access control is implemented using static lists of allowed identities provided via configuration files or central servers. This approach fails to scale across distributed mesh networks, lacking support for granular permissions, asynchronous delegation, and secure revocation when devices are offline.
+Dacar defines a decentralized, offline-first authorization policy plane natively designed for delay-tolerant, low-bandwidth, and constrained hardware networks. By decoupling authorization state from transport using Conflict-free Replicated Data Types (CRDTs), Dacar allows edge nodes to evaluate permissions locally without real-time connectivity.
 ### 1.1 Design Goals
- * **Decentralized & Offline-Capable:** Nodes enforce permissions locally while isolated from the wider mesh.
- * **Zero-Overhead Client:** Routine application traffic requires no token injection or authorization overhead.
- * **Eventually Consistent:** Authorization state automatically converges mathematically.
- * **Delegated Trust:** Supports recursive permission delegation chaining back to a Root Trust Anchor.
- * **Transport Agnostic:** Deltas can be routed via LXMF, RFed, or physical optical transfers (QR codes).
+ * **Decentralized & Offline-Capable:** Nodes enforce permissions locally while completely isolated from the wider mesh.
+ * **Zero-Overhead Client:** Routine application traffic requires no token injection or wire overhead.
+ * **Permacomputing Frugality:** Employs strict cryptographic bounding and tombstone pruning to guarantee long-term viability on fixed-storage microcontrollers.
+ * **Namespace Label Privacy:** Protects infrastructure labels from passive observers using salted namespace hashing.
+ * **Delegated Trust:** Supports recursive permission delegation and multi-signature threshold governance.
+ * **Transport Agnostic:** Deltas can be routed via RFed, LXMF, direct links, or physical optical transfers (QR codes).
 ## 2. Terminology
- * **Operation (Delta):** A cryptographically signed instruction to Add (Grant) or Remove (Revoke) a specific permission.
- * **Tuple:** The fundamental unit of permission, defining a relationship between an Object, Relation, Grantee, and Issuer.
- * **State Vector:** The full serialized LWW-Element-Set CRDT containing all active and revoked Tuples.
- * **Root Trust Anchor:** The hardcoded RNS.Identity hash(es) designated as the ultimate authority for a given service node.
- * **Authoritative Identity:** The configured RNS.Identity designated to provide synchronous Freshness Receipts for Strict Consistency operations.
- * **Evaluation Engine:** The local runtime process that resolves a request against the State Vector and the delegation graph.
+ * **Operation (Delta):** A cryptographically signed instruction to Add (Grant) or Remove (Revoke) a permission.
+ * **Tuple:** The fundamental unit of permission: (Object, Relation, Grantee, Issuer).
+ * **State Vector:** The serialized LWW-Element-Set CRDT containing all active and revoked Tuples.
+ * **Root Trust Anchor:** The hardcoded identity or multi-sig group designated as the ultimate authority.
+ * **Evaluation Engine:** The local runtime process that resolves requests against the CRDT.
 ## 3. Core Concepts
 ### 3.1 The Authorization Tuple
-Permissions in Dacar are defined by Tuples. A Tuple asserts that a specific Grantee holds a specific Relation over a specific Object, as authorized by a specific Issuer.
-The logical tuple is: (Object, Relation, Grantee, Issuer).
- * Object: The resource identifier (String). e.g., sensor:wind.
- * Relation: The granted permission (String). e.g., calibrate.
- * Grantee: The 16-byte RNS.Identity hash receiving the permission.
- * Issuer: The 16-byte RNS.Identity hash of the administrator who signed the Operation.
-> **Per-Issuer Tuple Identity:** Because the Issuer is incorporated into the tuple identity, two different administrators granting the identical permission to the same grantee produce two mathematically distinct Tuples. Revoking one issuer's Operation only revokes that specific Tuple; the parallel Tuple remains active.
-> 
+Permissions are defined by Tuples asserting that a Grantee holds a Relation over an Object, authorized by an Issuer.
+Because the Issuer is incorporated into the tuple identity, two different administrators granting identical permissions to the same grantee produce two distinct Tuples. Revoking one only revokes that specific Tuple.
 ### 3.2 Reserved Relations & Cascade Scope
-To enable recursive trust graphs, Dacar reserves the relation string **admin**.
-Granting a user the admin relation on an Object confers the authority to issue valid Grants and Revocations for that exact Object.
-**Cascade Scope:** Authority does *not* inherently cascade to child namespaces by default. For example, admin on sensor:wind only allows delegating permissions for sensor:wind. To delegate permissions for sensor:wind:north, the issuer must hold admin on an Object ending in a wildcard (e.g., sensor:wind:*, sensor:*, or *).
-### 3.3 Namespace Grammar & Matching Algorithm
-Dacar employs segment-aware namespace matching, not raw string prefixes.
- * **Hierarchy Delimiter:** Namespaces within an Object string are delineated by the colon character (:).
- * **Suffix Wildcards (*):** The wildcard acts as a match for all subsequent segments. It MUST be the terminal segment of the string.
- * **Matching Algorithm:** To evaluate if a requested object matches a tuple object:
-   1. Split both strings by :.
-   2. Compare segments sequentially.
-   3. If the tuple object segment is *, the match is immediately successful.
-   4. If any segments differ before a * is reached, the match fails.
- * **Explicit Deny:** To revoke a specific action granted by a wildcard, the Relation is prefixed with a hyphen (e.g., -calibrate).
+The relation string admin is reserved. Granting a user admin on an Object confers the authority to issue valid Grants and Revocations for that exact Object. Authority does *not* cascade to child namespaces by default unless a wildcard is explicitly authorized.
+### 3.3 Namespace Label Privacy & Matching
+*(Design Goal Clarification: This scheme provides **Namespace Label Privacy**. It prevents passive observers from reading the specific vocabulary of your infrastructure. It does **not** hide namespace topology; observers can still infer tree depth and branching structures by tracking repeated segment hashes).*
+To prevent label disclosure over public transports, Dacar never transmits or stores Object or Relation strings in plaintext.
+ * **The Privacy Salt:** Nodes MUST be configured out-of-band with a shared Privacy Salt (a 32-byte secure random string).
+   > **WARNING:** If unused, this defaults to 32 null bytes (0x00). Using the default salt is **fail-open on privacy**, providing zero confidentiality and leaving the hashes fully vulnerable to trivial dictionary attacks.
+   >
+ * **Hashing Primitive:** All string hashing utilizes HMAC-SHA256, keyed with the Privacy Salt, strictly truncated to the first 16 bytes.
+ * **Relation Hashing:** The Relation string is hashed in its entirety. Explicit denies include the hyphen prefix (e.g., Truncated_HMAC(Salt, "-calibrate")).
+ * **Object Segmenting:** Objects are split by colons (:). Each segment is hashed individually. (e.g., sensor:wind becomes [ Truncated_HMAC(Salt, "sensor"), Truncated_HMAC(Salt, "wind") ]).
+ * **Suffix Wildcards:** The terminal wildcard (*) is stripped prior to hashing and represented by a boolean flag on the tuple.
+ * **Matching Algorithm:** To evaluate a plaintext request against a hashed tuple, the node hashes the request's segments using the local Privacy Salt and sequentially compares the byte arrays. A match succeeds if all tuple hashes match and the wildcard flag is true, or if the arrays are identical.
 ## 4. Bootstrapping & Trust Anchors
-An empty CRDT State Vector provides no access to anyone. The system must be bootstrapped with predefined trust anchors.
 ### 4.1 Configuration
-Every Dacar-enabled service node MUST be configured out-of-band with one or more **Root Trust Anchor** RNS.Identity hashes.
-If the node supports Strict Consistency operations (Section 8), it MUST also be configured with exactly one **Authoritative Identity** hash. The Authoritative Identity MAY be identical to one of the Root Trust Anchors, or it MAY be a separate, dedicated identity. *(Future specifications may support N-of-M threshold Authoritative Identities to mitigate single-point-of-failure availability risks).*
+Every Dacar-enabled service node MUST be configured out-of-band with one or more **Root Trust Anchors**.
+ 1. **Single Identity:** A standard 16-byte RNS.Identity hash.
+ 2. **Threshold Group (N-of-M):** A composite authority requiring consensus, defined by a set of M specific RNS.Identity hashes and an integer N. The Group ID is the SHA-256 hash of the alphabetically sorted M hashes concatenated with N, **strictly truncated to the first 16 bytes**.
+   > **Note on Scope:** In v1.0, Threshold Groups MAY ONLY act as Issuers. A Grantee MUST be a single Identity. Granting permissions to a Threshold Group is not currently supported.
+   >
 ### 4.2 Genesis Operations
-The Root Trust Anchor acts as the terminal point for all delegation recursion. For each configured Root Trust Anchor X, the node assumes an implicit Genesis Tuple: (*, admin, X, X).
-This ensures that every Root Trust Anchor independently possesses terminal delegation authority across all namespaces.
+For each configured Root Trust Anchor X (single or threshold), the node assumes an implicit Genesis Tuple: (*, admin, X, X). This ensures anchors independently possess terminal delegation authority.
+The Genesis Tuple is never serialized, hashed, or transmitted — it exists solely to justify the direct identity-match termination rule in §7.2
 ## 5. Cryptography & Data Serialization
 ### 5.1 Hybrid Logical Clocks (HLC)
-Dacar relies on HLCs packed into a single 64-bit unsigned integer (Big-Endian):
+Dacar relies on HLCs packed into a 64-bit unsigned integer (Big-Endian):
  * **High 48 bits:** Physical Time (Unix epoch in milliseconds).
  * **Low 16 bits:** Logical Counter.
 ### 5.2 The Signature Pre-image
-Every Operation MUST be signed. The Ed25519 signature is calculated over an unpadded binary Pre-image. Object Length is intentionally omitted as it is the terminal field, making parsing mathematically unambiguous without the extra byte overhead.
+Operations MUST be signed using Ed25519. For Threshold Groups, the operation MUST carry exactly N valid signatures from the M members. The verifier MUST confirm the N signatures correspond to N distinct members of the M-set; duplicate signatures from the same member, or signatures that verify against the same public key more than once, MUST be rejected as invalid. Signatures are calculated over an unpadded binary Pre-image:
 | Offset | Length | Field | Encoding |
 |---|---|---|---|
-| 0 | 16 bytes | **Issuer Hash** | Raw bytes of the granting admin's RNS.Identity hash |
-| 16 | 16 bytes | **Grantee Hash** | Raw bytes of the grantee's RNS.Identity hash |
-| 32 | 1 byte | **Action** | 0x01 for Grant (Add), 0x00 for Revoke (Remove) |
-| 33 | 8 bytes | **Timestamp** | 64-bit unsigned integer (HLC), Big-Endian |
-| 41 | 1 byte | **Relation Length** | Unsigned 8-bit integer |
-| 42 | Variable | **Relation String** | UTF-8 |
-| 42 + len | Variable | **Object String** | UTF-8 |
+| 0 | 16 bytes | **Issuer Hash** | 16-byte RNS.Identity hash, or truncated Threshold Group ID. |
+| 16 | 16 bytes | **Grantee Hash** | 16-byte RNS.Identity hash. |
+| 32 | 1 byte | **Action** | 0x01 for Grant (Add), 0x00 for Revoke (Remove). |
+| 33 | 8 bytes | **Timestamp** | 64-bit unsigned integer (HLC), Big-Endian. |
+| 41 | 16 bytes | **Relation Hash** | 16-byte HMAC-SHA256 hash of the relation string. |
+| 57 | 1 byte | **Wildcard Flag** | 0x01 if object ends in :* or is *, else 0x00. |
+| 58 | 1 byte | **Segment Count** | Unsigned 8-bit integer (S) representing object segments. |
+| 59 | S × 16 bytes | **Object Hashes** | Contiguous 16-byte segment hashes. |
 ### 5.3 The Transport Payload
-The Operation is serialized for transport as a 7-element MessagePack Array:
-[ <16-byte issuer_hash>, <16-byte grantee_hash>, <action_int>, <hlc_int>, <relation_str>, <object_str>, <64-byte_ed25519_sig> ]
+The Operation is serialized for transport as a MessagePack Array:
+[ <16-byte issuer>, <16-byte grantee>, <action_int>, <hlc_int>, <16-byte relation_hash>, <array_of_16-byte_segment_hashes>, <wildcard_bool>, [<64-byte_sig_1>, ..., <64-byte_sig_N>] ]
 ## 6. The Authorization State (CRDT)
-The global state is an LWW-Element-Set mapping a Tuple Hash to an HLC timestamp.
-### 6.1 Tuple Hashing
-To guarantee cross-language convergence, the Tuple Hash is derived using **SHA-256**. The hash is calculated over a packed binary byte array consisting of:
-[16-byte Issuer Hash] + [16-byte Grantee Hash] + [1-byte Relation Length] + [Variable Relation String] + [Variable Object String].
-### 6.2 Node Synchronization & Convergence
-When nodes sync Full State Vectors, the incoming state (S_{\text{remote}}) is mathematically merged with the local state (S_{\text{local}}) by taking the maximum timestamp for every known Tuple Hash (h) present in either vector.
-**Single-Delta Update Rule:**
-When a node receives a single Operation (Delta), the update is applied directly to either the Add Set (A) or Remove Set (R) depending on the Action byte. The node takes the maximum of the incoming HLC timestamp and any existing HLC timestamp for that specific Tuple Hash.
-> **Tie-Breaking:** If t_A(h) = t_R(h) precisely, the Tuple is considered revoked (Remove wins).
-> 
+The global state is an LWW-Element-Set that maps a unique **Tuple Hash** to an HLC timestamp.
+### 6.1 The Tuple Hash Calculation
+To guarantee that Add (0x01) and Remove (0x00) Operations for the same logical permission resolve against each other, the Tuple Hash MUST uniquely identify the *permission itself*, not the operation.
+The Tuple Hash is calculated as the SHA-256 hash over a packed binary array comprising ONLY:
+[16-byte Issuer Hash] + [16-byte Grantee Hash] + [16-byte Relation Hash] + [1-byte Wildcard Flag] + [1-byte Segment Count] + [Array of Object Hashes].
+**The Action byte and HLC timestamp are explicitly excluded from this hash.** This ensures that when a revocation is issued, its Tuple Hash perfectly matches the original grant, allowing the Evaluation Engine to compare the Add timestamp and Remove timestamp to determine the active state.
+**Single-Delta Update Rule:** When receiving an Operation, the node updates the Add Set (A) or Remove Set (R) based on the Action byte, taking the maximum of the incoming HLC timestamp and the existing HLC timestamp.
+> **Tie-Breaking:** If timestamps match exactly, the Tuple is considered revoked (Remove wins).
+>
 ## 7. Evaluation Engine
-When evaluating a request for Object O, Relation r, and Grantee U:
 ### 7.1 Hypothesis Generation
- 1. Generate exact and wildcard permutations for the negative relation (O, -r, U). Let this be \mathbb{H}_{\text{deny}}.
- 2. Generate exact and wildcard permutations for (O, r, U). Let this be \mathbb{H}_{\text{allow}}.
+When evaluating a request for Object O, Relation r, and Grantee U:
+ 1. **Deny Hypothesis:** Hash Grantee U, relation -r, and segment O. Generate all wildcard truncations.
+ 2. **Allow Hypothesis:** Hash Grantee U, relation r, and segment O. Generate all wildcard truncations.
 ### 7.2 Recursive Delegation & Termination
-If an active Tuple is found, the engine MUST verify the Issuer's authority recursively. Before checking cycle detection or generating further hypotheses, the engine MUST check whether the current Issuer matches any configured **Root Trust Anchor** (§4.1). If so, the delegation chain terminates successfully without further recursion.
-If the Issuer is not a Root Trust Anchor, the engine evaluates if the Issuer holds the admin relation on O by generating a new request (O, admin, Issuer) and processing it through the Hypothesis Generation and Evaluation pipeline.
- * **Cycle Detection:** The engine MUST maintain a visited_issuers set during evaluation. If an Issuer is encountered twice in the same evaluation path prior to hitting a Root Trust Anchor, the path is immediately terminated as invalid.
- * **Total Work Bound:** Implementations MUST strictly enforce a maximum recursion depth of 10 hops AND a total evaluation cap (e.g., maximum 50 visited nodes per request). If the cap is reached without tracing back to a Root Trust Anchor, the request fails.
- * **Memoization:** Implementations SHOULD memoize Issuer validation results for the duration of a request.
+The engine verifies the Issuer's authority recursively. If the Issuer matches a Root Trust Anchor, recursion terminates successfully. Otherwise, the engine verifies if the Issuer holds the admin relation on O by generating a new request and processing it.
+ * **Cycle Detection:** Circular delegations MUST be terminated immediately.
+ * **Total Work Bound:** Implementations MUST enforce a maximum recursion depth of 10 hops.
 ### 7.3 Resolution Logic
- 1. If ANY valid, active Tuple exists in \mathbb{H}_{\text{deny}}, the request is **DENIED**.
- 2. Else, if ANY valid, active Tuple exists in \mathbb{H}_{\text{allow}}, the request is **ALLOWED**.
+ 1. If ANY valid, active Tuple exists in the Deny Hypothesis, the request is **DENIED**.
+ 2. Else, if ANY valid, active Tuple exists in the Allow Hypothesis, the request is **ALLOWED**.
  3. Else, the request is **DENIED**.
 ## 8. Strict Consistency Challenge (Escape Hatch)
-For destructive operations (e.g., DROP_TABLES), eventual consistency is dangerous.
- 1. **Local Pre-Check:** The node verifies the permission locally. If denied, the request fails immediately.
- 2. **Challenge:** The node opens an RNS.Link to the Authoritative Identity to request a Freshness Receipt. To guarantee full-chain integrity and prevent stale upstream delegations, the Challenge payload MUST transmit the complete evaluation context: the target Object O, Relation r, Grantee U, and a locally generated, cryptographically secure 32-byte nonce.
- 3. **Authoritative Evaluation:** The Authoritative Identity evaluates the complete request against its own absolute-latest CRDT state using the full Evaluation Engine (§7).
- 4. **Receipt Evaluation:** The Authoritative Identity responds with a MessagePack array containing its verdict: [ <1-byte verdict_status>, <8-byte server_hlc>, <32-byte nonce>, <64-byte sig> ].
-   * The verdict_status byte is strictly binary: 0x01 for ALLOW, 0x00 for DENY.
-   * The local node MUST verify sig against the Authoritative Identity's known public key (computed over the unpadded binary concatenation of the preceding array fields) AND verify the nonce exactly matches the Challenge. An invalid signature or mismatched nonce MUST be treated identically to a link timeout (immediately **DENIED**).
-   * If the signature and nonce are valid and verdict_status == 0 (DENY), the local node MUST **DENY** the request. If any upstream tuples were found to be revoked on the server during its evaluation, the local node updates its local CRDT to match.
-   * If verdict_status == 1 (ALLOW), the local node **PROCEEDS** with the destructive operation.
- 5. **Partition Penalty:** If the link times out or cannot be established, the destructive request MUST be **DENIED**.
-## 9. Security Considerations
- * **The Permanent Deny Veto:** An Explicit Deny unconditionally overrides Allows. If a delegated admin issues a Deny, it permanently blocks access until that specific Deny Tuple is revoked.
- * **Timestamp Manipulation:** A malicious admin could artificially inflate their HLC to bias the LWW resolution. Dacar mitigates this by rejecting operations >24 hours in the future.
- * **Security Implications During Partition:** A demoted administrator's stale grants remain valid on any node that has not yet synced the demotion operation (except when performing Strict Consistency Challenges against an online Authoritative Identity).
- * **Trust Anchor & Authoritative Identity Compromise:** If a Root Trust Anchor is compromised, the entire mesh is compromised. The Authoritative Identity represents a distinct single point of failure; its compromise allows an attacker to falsify Freshness Receipts for destructive operations. Keys must be kept in highly secure environments.
- * **CRDT Flooding & Storage Exhaustion:** An attacker could flood the mesh with meaningless grants to exhaust the RAM/disk space of edge nodes. Constrained devices must enforce total payload size limits during sync.
-## 10. Future Work: CRDT Garbage Collection
-Because the LWW-Element-Set is append-only, the Remove Set (R) will eventually dominate storage. Future specifications will define an Epoch Compaction algorithm using Tombstones to safely purge historically superseded Tuples and abandoned RNS.Identity hashes once all nodes in the mesh acknowledge the Epoch.
+For destructive operations (e.g., wiping storage), eventual consistency is overridden via an **RNS Link** to guarantee synchronous evaluation. To maintain Namespace Label Privacy (§3.3), the local node MUST NOT transmit plaintext strings during the Challenge.
+ 1. **Local Pre-Check:** The node evaluates locally; if denied, the request fails.
+ 2. **Challenge Link:** The node establishes an RNS.Link to the Authoritative Anchor (App Name: dacar, Aspects: auth, v1). If unreachable, the operation defaults to **DENY**.
+ 3. **Challenge Payload:** The local node calculates hypothesized hashes across its Primary Salt and all configured Legacy Salts (§10) and transmits them over the Link as a MessagePack array:
+   [ <nonce_32_bytes>, [ <salt_id_tag, relation_hash, wildcard_bool, segment_count, segment_hashes_array, grantee_hash>, ... ] ].
+ 4. **Authoritative Evaluation:** The Authority evaluates this hashed request directly against its own absolute-latest CRDT state, never falling back to plaintext.
+ 5. **The Verdict Receipt:** The Authority responds with a MessagePack array:
+   [ <1-byte verdict_status>, <8-byte server_hlc>, <32-byte nonce>, <64-byte ed25519_sig> ].
+   * verdict_status: 0x01 for ALLOW, 0x00 for DENY.
+   * The ed25519_sig MUST be computed over the unpadded binary concatenation of the preceding three fields (verdict_status + server_hlc + nonce).
+ 6. **Enforcement:** An invalid signature, mismatched nonce, or DENY verdict fails the operation. An ALLOW verdict proceeds.
+## 9. Garbage Collection & Storage Bounds
+To guarantee bounded state growth, Dacar utilizes **Time-Horizon Tombstone Pruning**. However, Garbage Collection must never alter the resolved access state or destroy active re-grants.
+ * **The Deletion Horizon:** Nodes enforce a hard horizon of H days (default: 180 days).
+ * **Pairwise Pruning Condition:** Periodically, the node scans its state vector and identifies Tombstones (Remove Operations) that satisfy **ALL** of the following criteria:
+   1. The tuple currently resolves to inactive (t_R(h) > t_A(h)).
+   2. Both the Add timestamp and Remove timestamp are older than the deletion horizon (t_A(h) < Current Time - H and t_R(h) < Current Time - H).
+ * **Pairwise Deletion:** For each qualifying tuple, the node MUST silently delete **BOTH** the Tombstone from the Remove Set AND its corresponding Operation from the Add Set.
+   * *Constraint Note:* Time-Horizon Pruning bounds the history of revocations and historical denials. However, it does **not** cap the total count of currently-active, never-revoked grants. Deployments with many permanent grants and zero revocations maintain those active grants indefinitely.
+ * **Intake Rejection:** Any incoming Delta (Add or Remove) older than Current Time - H MUST be immediately discarded to prevent highly delayed operations from bypassing pruned revocations.
+   > **Note on Delay Tolerance:** Deployments relying heavily on high-latency optical/sneakernet transports (§11.3) SHOULD configure a significantly larger H (e.g., 365 days) to ensure valid, physically-delayed operations do not fall victim to Intake Rejection upon arrival.
+   >
+## 10. Privacy Salt Rotation & Grace Periods
+To rotate a compromised Privacy Salt without global disruption:
+### 10.1 Multi-Salt Configuration
+Nodes support a Primary Salt (for new operations) and an ordered list of Legacy Salts.
+### 10.2 Multi-Salt Evaluation Bounds
+During the Hypothesis Generation phase (§7.1), the Evaluation Engine generates duplicate hypotheses for the Primary Salt and each configured Legacy Salt.
+ * **Legacy Cap:** To prevent unbounded compute requirements, nodes MUST NOT configure more than 2 Legacy Salts concurrently.
+ * **Shared Work Bound:** The total evaluation cap (maximum 50 visited nodes, §7.2) applies **per-request**, not per-salt. The engine MUST track visited nodes across all salt hypothesis tracks simultaneously. If the total shared cap is reached, the request fails.
+### 10.3 Revocations and Sunsetting
+ * **Overrides:** To revoke a legacy Tuple, an admin either copies the exact legacy byte hashes to issue a Remove (0x00), or issues an Explicit Deny (-relation) using the Primary Salt, which globally overrides the allowance.
+ * **Sunsetting:** After H days, old Tuples naturally prune out, allowing the community to safely delete the Legacy Salt from configurations.
+## 11. Synchronization & Transport Plane
+Dacar delegates transport responsibilities to established Reticulum protocols.
+### 11.1 Eventual Consistency via RFed (Many-to-Many)
+Global convergence of the CRDT State Vector is handled via **RFed** (default topic: dacar.policy.v1). Nodes rely on RFed's native store-and-forward to asynchronously retrieve new Operations and merge them into the local LWW-Element-Set.
+### 11.2 Targeted Asynchronous Delivery (LXMF Store-and-Forward)
+For forward-secret, point-to-point delivery to offline nodes (bypassing the public RFed broadcast):
+ 1. **LXMF & Ratchets:** The target node configures an LXMF destination and calls enable_ratchets() (or enforce_ratchets()).
+ 2. **The Wrapper:** The Delta Push payload is embedded in an LXMF message with the exact title dacar/sync/delta.
+ 3. **Wake-Up Integration:** LXMF Propagation Nodes queue the message. When the edge node wakes, it pulls pending messages, decrypts via ratchets, and applies the Delta to the CRDT.
+ 4. **Cryptographic Boundaries:** Reticulum's destination ratchets provide *transport confidentiality and forward secrecy* only. The Evaluation Engine MUST extract the payload and verify the internal Ed25519 signatures (§5.2). The signature remains the sole source of authorization authenticity, ensuring a Delta is equally valid whether received via RFed, LXMF, or Optical Sneakernet.
+### 11.3 Air-Gapped & Optical Transport (Paper Messages)
+Because targeted Deltas are LXMF messages, they natively support LXMF’s **Paper Message** format. Administrators can export Deltas to high-density QR codes for physical sneakernet transport to air-gapped or radio-silent infrastructure. The receiving node scans the optical data and authenticates the payload exactly as if received via RF.
+## 12. Security Considerations
+ * **Permanent Deny Veto:** An Explicit Deny unconditionally overrides Allows until that specific Deny Tuple is revoked.
+ * **Timestamp Manipulation:** Operations projecting >24 hours into the future MUST be rejected to prevent LWW bias.
+ * **Partition Penalties:** A demoted administrator's stale grants remain valid on any node that has not yet synced the demotion operation, emphasizing the need for Strict Consistency Challenges on destructive actions.
