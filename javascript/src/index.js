@@ -50,6 +50,9 @@ export { ThresholdGroup, groupId } from "./threshold.js";
 // Operations (§5.2, §5.3)
 export { SIGNATURE_SIZE, HLC_BYTES, Action, Operation } from "./operation.js";
 
+// Verify-on-ingest (§11.2.4)
+export { IssuerKeyset, Keyring, verifyOperation } from "./verifier.js";
+
 // Config (§4, §10) + state (§6, §9)
 export { Config, DEFAULT_DELETION_HORIZON_DAYS } from "./config.js";
 export { StateVector } from "./crdt.js";

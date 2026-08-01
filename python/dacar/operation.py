@@ -166,6 +166,15 @@ class Operation:
             used.add(matched)
         return len(used) == threshold
 
+    def verify_keyset(self, keyset: Any) -> bool:
+        """Verify against a resolved :class:`~dacar.verifier.IssuerKeyset`.
+
+        This is the bridge used by verify-on-ingest (§11.2.4): a resolver maps
+        the Operation's 16-byte Issuer hash to a keyset, and this confirms the
+        threshold signature against it.
+        """
+        return self.verify_threshold(keyset.member_public_keys, keyset.threshold)
+
     # -- transport (§5.3) ---------------------------------------------------
     def to_payload(self) -> bytes:
         """Serialize to the 8-element MessagePack transport array (§5.3).

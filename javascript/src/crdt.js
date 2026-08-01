@@ -15,6 +15,7 @@ import { MsgPack } from "@reticulum/core";
 import { Action } from "./operation.js";
 import { MAX_HLC, physicalNowMs, unpackHlc } from "./hlc.js";
 import { Tuple } from "./tuple.js";
+import { verifyOperation } from "./verifier.js";
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 /** Operations more than this far in the future are rejected (§12). */
@@ -78,6 +79,30 @@ export class StateVector {
   /** @param {string} key @returns {Entry | undefined} */
   get(key) {
     return this._entries.get(key);
+  }
+
+  /**
+   * Authenticate then apply a network-received Delta (§11.2.4, §5.2).
+   *
+   * This is the secure entry point for Operations received over any transport
+   * (RFed, LXMF, optical sneakernet). The Operation's Ed25519 signature(s)
+   * MUST verify against the public key(s) resolved for its claimed Issuer
+   * before the pure CRDT update (`apply()`) is allowed to mutate state. Any
+   * authentication failure — unknown Issuer, bad signature, wrong threshold —
+   * drops the Operation (returns `false`).
+   *
+   * Returns `true` iff authenticated *and* applied. Distinct from `apply()`,
+   * which trusts its caller and performs no cryptography.
+   * @param {import("./operation.js").Operation} operation
+   * @param {import("./verifier.js").KeyResolver | import("./verifier.js").Keyring} keyResolver
+   * @param {Object} [options]
+   * @param {number} [options.nowMs]
+   * @param {number | null} [options.maxFutureMs]
+   * @returns {Promise<boolean>}
+   */
+  async ingest(operation, keyResolver, options = {}) {
+    if (!(await verifyOperation(operation, keyResolver))) return false;
+    return this.apply(operation, options);
   }
 
   /**

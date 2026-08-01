@@ -20,6 +20,7 @@ from dacar import serialization
 from dacar.hlc import MAX_HLC, physical_now_ms, unpack
 from dacar.operation import Action, Operation
 from dacar.tuple import Tuple
+from dacar.verifier import KeyResolver, verify_operation
 
 #: Operations more than this far in the future are rejected (§12 timestamp skew).
 _MS_PER_DAY = 24 * 60 * 60 * 1000
@@ -69,6 +70,30 @@ class StateVector:
         return self.deletion_horizon_days * _MS_PER_DAY
 
     # -- single-delta application (§6.1) -------------------------------------
+    def ingest(
+        self,
+        operation: Operation,
+        key_resolver: KeyResolver,
+        *,
+        now_ms: Optional[int] = None,
+        max_future_ms: Optional[int] = DEFAULT_MAX_FUTURE_MS,
+    ) -> bool:
+        """Authenticate then apply a network-received Delta (§11.2.4, §5.2).
+
+        This is the secure entry point for Operations received over any
+        transport (RFed, LXMF, optical sneakernet). The Operation's Ed25519
+        signature(s) MUST verify against the public key(s) resolved for its
+        claimed Issuer before the pure CRDT update (:meth:`apply`) is allowed
+        to mutate state. Any authentication failure -- unknown Issuer, bad
+        signature, wrong threshold -- drops the Operation (returns ``False``).
+
+        Returns ``True`` iff authenticated *and* applied. This is distinct from
+        :meth:`apply`, which trusts its caller and performs no cryptography.
+        """
+        if not verify_operation(operation, key_resolver):
+            return False
+        return self.apply(operation, now_ms=now_ms, max_future_ms=max_future_ms)
+
     def apply(
         self,
         operation: Operation,

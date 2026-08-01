@@ -24,6 +24,7 @@ from dacar.namespace import (
 from dacar.tuple import MAX_SEGMENTS, Tuple
 from dacar.threshold import ThresholdGroup, group_id
 from dacar.operation import HLC_BYTES, SIGNATURE_SIZE, Action, Operation
+from dacar.verifier import IssuerKeyset, KeyResolver, Keyring, verify_operation
 from dacar.config import Config, DEFAULT_DELETION_HORIZON_DAYS
 from dacar.crdt import StateVector
 from dacar.engine import ADMIN_RELATION, DEFAULT_MAX_DEPTH, DEFAULT_MAX_VISITED, Engine
@@ -66,6 +67,11 @@ __all__ = [
     "SIGNATURE_SIZE",
     "Action",
     "Operation",
+    # Verify-on-ingest (§11.2.4)
+    "IssuerKeyset",
+    "KeyResolver",
+    "Keyring",
+    "verify_operation",
     # Config (§4, §10) + state (§6)
     "Config",
     "DEFAULT_DELETION_HORIZON_DAYS",

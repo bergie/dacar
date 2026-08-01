@@ -5,8 +5,12 @@
 #   * Exits non-zero if NO runtime is installed.
 #   * Exits non-zero if any installed runtime's run fails.
 #
-# The tests use `node:test`, which Node runs natively and Deno/Bun support via
-# their Node compatibility layers. Run from the package root or via `npm test`.
+# The test files live flat in test/ (*.test.js). We pass an UNQUOTED POSIX glob
+# (test/*.test.js) so /bin/sh expands it to an explicit file list before handing
+# it to each runtime. This is portable across Node 18+ (no reliance on Node 21+
+# --test globbing), Deno, and Bun (which treats a bare "**" arg as a filter,
+# not a path). If test files ever nest into subdirectories, switch to
+# runtime-native discovery or a `find`-built list.
 
 set -u
 
@@ -17,19 +21,19 @@ ran=0     # 1 = at least one runtime was available
 if command -v node >/dev/null 2>&1; then
   ran=1
   echo "==> node ($(node --version))"
-  ( cd "$root" && node --test --test-force-exit "test/**/*.test.js" ) || ok=1
+  ( cd "$root" && node --test --test-force-exit test/*.test.js ) || ok=1
 fi
 
 if command -v deno >/dev/null 2>&1; then
   ran=1
   echo "==> deno ($(deno --version 2>&1 | head -1))"
-  ( cd "$root" && deno test --allow-read=test,src --allow-env --no-check "test/**/*.test.js" ) || ok=1
+  ( cd "$root" && deno test --allow-read=test,src --allow-env --no-check test/*.test.js ) || ok=1
 fi
 
 if command -v bun >/dev/null 2>&1; then
   ran=1
   echo "==> bun ($(bun --version))"
-  ( cd "$root" && bun test "test/**/*.test.js" ) || ok=1
+  ( cd "$root" && bun test test/*.test.js ) || ok=1
 fi
 
 if [ "$ran" -eq 0 ]; then

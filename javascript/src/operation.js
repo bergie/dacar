@@ -171,6 +171,17 @@ export class Operation {
     return used.size === threshold;
   }
 
+  /**
+   * Verify against a resolved `IssuerKeyset` (§11.2.4 bridge). A resolver maps
+   * the Operation's 16-byte Issuer hash to a keyset; this confirms the
+   * threshold signature against it.
+   * @param {import("./verifier.js").IssuerKeyset} keyset
+   * @returns {Promise<boolean>}
+   */
+  async verifyKeyset(keyset) {
+    return this.verifyThreshold(keyset.memberPublicKeys, keyset.threshold);
+  }
+
   /** §5.3 transport payload (the Operation must be signed first). @returns {Uint8Array} */
   toPayload() {
     if (this.signatures.length === 0) {
