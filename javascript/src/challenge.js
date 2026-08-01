@@ -3,22 +3,36 @@
  *
  * For destructive operations eventual consistency is dangerous. The node
  * performs a local pre-check, then challenges a configured Authoritative
- * Identity over an RNS link for a signed Freshness Receipt evaluated against
- * the server's absolute-latest CRDT state.
+ * Identity over an RNS link (App Name `dacar`, Aspects `auth`, `v1`) for a
+ * signed verdict evaluated against the server's absolute-latest CRDT state.
+ *
+ * To preserve Namespace Label Privacy (§3.3), the Challenge payload carries
+ * only *hashed* hypotheses — never plaintext. The client hashes the request
+ * across its Primary Salt and all Legacy Salts (§10); the server matches each by
+ * its `salt_id_tag` and evaluates directly in hash space.
+ *
+ * Canonical challenge wire format (concrete resolution of §8.3):
+ *
+ *   [ nonce(32),
+ *     [ [ salt_id_tag(16), grantee_hash(16), allow_relation_hash(16),
+ *         deny_relation_hash(16), wildcard_bool, [object_segment_hashes] ],
+ *       ... ] ]
+ *
+ * Each entry is fully self-contained for one salt and carries *both* the allow
+ * and deny relation hashes so the Authority can apply the deny-beats-allow rule
+ * (§7.3) without recovering plaintext.
  *
  * The RNS transport is abstracted behind an async `transport` callable
  * (`challengePayload -> receiptPayload | null`), so the cryptographic and
  * verdict logic is testable without a live network. A transport that returns
- * null or throws is treated as a partition -> immediately DENIED.
+ * null or throws is a partition -> immediately DENIED (§8).
  */
 
-import { Identity } from "@reticulum/core";
-import { MsgPack } from "@reticulum/core";
+import { Identity, MsgPack, toHex } from "@reticulum/core";
 import { Config } from "./config.js";
 import { Engine } from "./engine.js";
-import { Clock } from "./hlc.js";
-import { MAX_HLC } from "./hlc.js";
-import { HASH_SIZE, bytesEqual } from "./tuple.js";
+import { Clock, MAX_HLC } from "./hlc.js";
+import { HASH_SIZE, bytesEqual } from "./namespace.js";
 
 /** Cryptographically secure challenge nonces are 32 bytes. */
 export const NONCE_SIZE = 32;
@@ -36,7 +50,7 @@ export const Verdict = {
 };
 
 /**
- * @typedef {Uint8Array | import("@reticulum/core").Identity} PublicKeyLike
+ * @typedef {Uint8Array | Identity} PublicKeyLike
  */
 
 /**
@@ -47,27 +61,55 @@ async function asIdentity(value) {
   return value instanceof Identity ? value : await Identity.fromPublicKey(value);
 }
 
+/** @param {unknown} value @param {number} len @param {string} name @returns {Uint8Array} */
+function expectBytes(value, len, name) {
+  if (!(value instanceof Uint8Array) || value.length !== len) {
+    throw new Error(`${name} must be a ${len}-byte Uint8Array`);
+  }
+  return value;
+}
+
 /**
- * @typedef {Object} ChallengeInit
- * @property {string} object
- * @property {string} relation
- * @property {Uint8Array} grantee
+ * @typedef {Object} DecodedEntry
+ * @property {Uint8Array} saltIdTag
+ * @property {Uint8Array} granteeHash
+ * @property {Uint8Array} allowRelationHash
+ * @property {Uint8Array} denyRelationHash
+ * @property {boolean} wildcard
+ * @property {Uint8Array[]} objectHashes
+ */
+
+/**
+ * @typedef {Object} DecodedChallenge
  * @property {Uint8Array} nonce
+ * @property {Uint8Array} grantee
+ * @property {DecodedEntry[]} entries
  */
 
 export class Challenge {
-  /** @param {ChallengeInit} init */
-  constructor({ object, relation, grantee, nonce }) {
+  /**
+   * @param {Object} init
+   * @param {string} init.object Plaintext (held only on the client).
+   * @param {string} init.relation Plaintext (held only on the client).
+   * @param {Uint8Array} init.grantee 16-byte holder identity hash.
+   * @param {Uint8Array} init.nonce 32-byte nonce.
+   * @param {import("./namespace.js").NamespaceHasher[]} init.hashers Salts to hypothesize over.
+   */
+  constructor({ object, relation, grantee, nonce, hashers }) {
     if (!(grantee instanceof Uint8Array) || grantee.length !== HASH_SIZE) {
       throw new TypeError(`grantee must be ${HASH_SIZE} bytes`);
     }
     if (!(nonce instanceof Uint8Array) || nonce.length !== NONCE_SIZE) {
       throw new TypeError(`nonce must be ${NONCE_SIZE} bytes`);
     }
+    if (!Array.isArray(hashers) || hashers.length === 0) {
+      throw new TypeError("at least one salt hasher is required");
+    }
     this.object = object;
     this.relation = relation;
     this.grantee = grantee;
     this.nonce = nonce;
+    this.hashers = [...hashers];
   }
 
   /**
@@ -75,32 +117,85 @@ export class Challenge {
    * @param {string} object
    * @param {string} relation
    * @param {Uint8Array} grantee
+   * @param {import("./namespace.js").NamespaceHasher[]} hashers
    * @param {Object} [opts]
    * @param {Uint8Array} [opts.nonce]
    * @returns {Challenge}
    */
-  static generate(object, relation, grantee, { nonce } = {}) {
+  static generate(object, relation, grantee, hashers, { nonce } = {}) {
     return new Challenge({
       object,
       relation,
       grantee,
       nonce: nonce ?? crypto.getRandomValues(new Uint8Array(NONCE_SIZE)),
+      hashers,
     });
   }
 
-  /** Serialize as `[object, relation, grantee(16), nonce(32)]`. @returns {Uint8Array} */
-  toPayload() {
-    return MsgPack.encode([this.object, this.relation, this.grantee, this.nonce]);
+  /** Serialize the hashed multi-salt challenge (§8.3). @returns {Promise<Uint8Array>} */
+  async toPayload() {
+    const denyRelation = "-" + this.relation;
+    const entries = await Promise.all(
+      this.hashers.map(async (hasher) => {
+        const [saltIdTag, allowRelationHash, denyRelationHash, { hashes }] = await Promise.all([
+          hasher.idTag(),
+          hasher.hashRelation(this.relation),
+          hasher.hashRelation(denyRelation),
+          hasher.hashObject(this.object),
+        ]);
+        return [
+          saltIdTag,
+          this.grantee,
+          allowRelationHash,
+          denyRelationHash,
+          false, // requests are exact; tuples may still be wildcarded
+          [...hashes],
+        ];
+      }),
+    );
+    return MsgPack.encode([this.nonce, entries]);
   }
 
-  /** @param {Uint8Array} data @returns {Challenge} */
+  /**
+   * Decode a challenge payload (§8.4). Plaintext is intentionally unrecoverable.
+   * @param {Uint8Array} data
+   * @returns {DecodedChallenge}
+   */
   static fromPayload(data) {
     const decoded = MsgPack.decode(data);
-    if (!Array.isArray(decoded) || decoded.length !== 4) {
-      throw new Error("challenge payload must be a 4-element MessagePack array");
+    if (!Array.isArray(decoded) || decoded.length !== 2) {
+      throw new Error("challenge payload must be a 2-element MessagePack array");
     }
-    const [object, relation, grantee, nonce] = decoded;
-    return new Challenge({ object, relation, grantee: expectBytes(grantee, HASH_SIZE), nonce: expectBytes(nonce, NONCE_SIZE) });
+    const [nonce, entries] = decoded;
+    const nonceBytes = expectBytes(nonce, NONCE_SIZE, "nonce");
+    if (!Array.isArray(entries)) {
+      throw new Error("challenge entries must be an array");
+    }
+    /** @type {DecodedEntry[]} */
+    const result = [];
+    /** @type {Uint8Array | null} */
+    let grantee = null;
+    for (const entry of entries) {
+      if (!Array.isArray(entry) || entry.length !== 6) {
+        throw new Error("each challenge entry must be a 6-element array");
+      }
+      const [saltIdTag, granteeHash, allowRh, denyRh, wildcard, objectHashes] = entry;
+      if (typeof wildcard !== "boolean") throw new Error("wildcard must be a boolean");
+      if (!Array.isArray(objectHashes)) throw new Error("object_segment_hashes must be an array");
+      const gh = expectBytes(granteeHash, HASH_SIZE, "grantee_hash");
+      if (grantee === null) grantee = gh;
+      else if (!bytesEqual(grantee, gh)) throw new Error("all challenge entries must share one grantee");
+      result.push({
+        saltIdTag: expectBytes(saltIdTag, HASH_SIZE, "salt_id_tag"),
+        granteeHash: gh,
+        allowRelationHash: expectBytes(allowRh, HASH_SIZE, "allow_relation_hash"),
+        denyRelationHash: expectBytes(denyRh, HASH_SIZE, "deny_relation_hash"),
+        wildcard,
+        objectHashes: objectHashes.map((h) => expectBytes(h, HASH_SIZE, "object_hash")),
+      });
+    }
+    if (grantee === null) throw new Error("challenge must carry at least one entry");
+    return { nonce: nonceBytes, grantee, entries: result };
   }
 }
 
@@ -178,23 +273,47 @@ export class Receipt {
     return new Receipt({
       verdict,
       serverHlc: BigInt(serverHlc),
-      nonce: expectBytes(nonce, NONCE_SIZE),
-      signature: expectBytes(signature, SIGNATURE_SIZE),
+      nonce: expectBytes(nonce, NONCE_SIZE, "nonce"),
+      signature: expectBytes(signature, SIGNATURE_SIZE, "signature"),
     });
   }
 }
 
-/** @param {unknown} value @param {number} len @returns {Uint8Array} */
-function expectBytes(value, len) {
-  if (!(value instanceof Uint8Array) || value.length !== len) {
-    throw new Error(`expected a ${len}-byte Uint8Array`);
+/**
+ * Bind each decoded entry to a configured salt via its salt_id_tag (§8.4) and
+ * build the synchronous hypothesis objects the engine consumes.
+ * @param {import("./config.js").Config} config
+ * @param {DecodedChallenge} decoded
+ * @returns {Promise<import("./engine.js").Hypothesis[]>}
+ */
+async function buildHypotheses(config, decoded) {
+  /** @type {Map<string, import("./namespace.js").NamespaceHasher>} */
+  const byTag = new Map();
+  for (const hasher of config.hashers) {
+    byTag.set(toHex(await hasher.idTag()), hasher);
   }
-  return value;
+  /** @type {import("./engine.js").Hypothesis[]} */
+  const hyps = [];
+  for (const entry of decoded.entries) {
+    const hasher = byTag.get(toHex(entry.saltIdTag));
+    if (!hasher) continue; // unknown salt -> hypothesis unusable, skip
+    const [adminAllowHash, adminDenyHash] = await Promise.all([
+      hasher.hashRelation("admin"),
+      hasher.hashRelation("-admin"),
+    ]);
+    hyps.push({
+      hasher,
+      objectHashes: entry.objectHashes,
+      allowRelationHash: entry.allowRelationHash,
+      denyRelationHash: entry.denyRelationHash,
+      adminAllowHash,
+      adminDenyHash,
+    });
+  }
+  return hyps;
 }
 
-/**
- * The Authoritative Identity: evaluates requests and signs Freshness Receipts.
- */
+/** The Authoritative Identity: evaluates requests and signs Freshness Receipts. */
 export class AuthoritativeServer {
   /**
    * @param {Config} config
@@ -206,24 +325,22 @@ export class AuthoritativeServer {
   constructor(config, state, privateKey, { clock } = {}) {
     this._engine = new Engine(config, state);
     this._state = state;
+    this._config = config;
     this._privateKey = privateKey;
     this._clock = clock ?? new Clock();
   }
 
   /** @param {Uint8Array} challengePayload @returns {Promise<Uint8Array>} */
   async handle(challengePayload) {
-    const challenge = Challenge.fromPayload(challengePayload);
-    const allowed = this._engine.evaluate(challenge.object, challenge.relation, challenge.grantee);
+    const decoded = Challenge.fromPayload(challengePayload);
+    const hypotheses = await buildHypotheses(this._config, decoded);
+    const allowed = hypotheses.length > 0 && this._engine.evaluateHashes(decoded.grantee, hypotheses);
     const verdict = allowed ? Verdict.ALLOW : Verdict.DENY;
     const receipt = await new Receipt({
       verdict,
       serverHlc: this._clock.now(),
-      nonce: challenge.nonce,
+      nonce: decoded.nonce,
     }).sign(this._privateKey);
-    // NOTE (§8.4): when the server's DENY is due to upstream revocations not
-    // yet known to the client, the server SHOULD also ship the revoked tuples
-    // so the client can update its local CRDT. The wire format for that is not
-    // defined by spec 1.0-RC3; applications extend the Receipt payload.
     return receipt.toPayload();
   }
 }
@@ -231,12 +348,10 @@ export class AuthoritativeServer {
 /**
  * @callback Transport
  * @param {Uint8Array} challengePayload
- * @returns {Promise<Uint8Array | null>}
+ * @returns {Promise<Uint8Array | null> | Uint8Array | null}
  */
 
-/**
- * The requesting node: performs the local pre-check and the challenge exchange.
- */
+/** The requesting node: performs the local pre-check and the challenge exchange. */
 export class ChallengeClient {
   /**
    * @param {Config} config
@@ -246,10 +361,11 @@ export class ChallengeClient {
    */
   constructor(config, state, authoritativePublicKey, transport) {
     if (config.authoritativeIdentity === undefined) {
-      throw new Error("Strict Consistency requires an Authoritative Identity (§4.1)");
+      throw new Error("Strict Consistency requires an Authoritative Identity (§8)");
     }
     this._engine = new Engine(config, state);
     this._state = state;
+    this._config = config;
     this._publicKey = authoritativePublicKey;
     this._transport = transport;
   }
@@ -263,20 +379,18 @@ export class ChallengeClient {
    */
   async authorize(objectId, relation, grantee) {
     // §8.1 Local pre-check.
-    if (!this._engine.evaluate(objectId, relation, grantee)) return false;
-    // §8.2 Challenge.
-    const challenge = Challenge.generate(objectId, relation, grantee);
+    if (!(await this._engine.evaluate(objectId, relation, grantee))) return false;
+    // §8.2/§8.3 Challenge across Primary + Legacy salts.
+    const challenge = Challenge.generate(objectId, relation, grantee, this._config.hashers);
     let receiptPayload;
     try {
-      receiptPayload = await this._transport(challenge.toPayload());
+      receiptPayload = await Promise.resolve(this._transport(await challenge.toPayload()));
     } catch {
-      return false; // §8.5 partition penalty
+      return false; // partition penalty (§8)
     }
-    if (receiptPayload === null || receiptPayload === undefined) {
-      return false; // §8.5 partition penalty
-    }
+    if (receiptPayload === null || receiptPayload === undefined) return false; // partition (§8)
     const receipt = Receipt.fromPayload(receiptPayload);
-    // §8.4 Verify nonce match and signature.
+    // §8.5 Verify nonce match and signature.
     if (!bytesEqual(receipt.nonce, challenge.nonce)) return false;
     if (!(await receipt.verify(this._publicKey))) return false;
     return receipt.verdict === Verdict.ALLOW;

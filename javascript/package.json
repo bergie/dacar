@@ -1,6 +1,6 @@
 {
   "name": "@reticulum/dacar",
-  "version": "1.0.0-rc.3",
+  "version": "1.0.0-rc.6",
   "description": "JavaScript implementation of Dacar, a Decentralized Access Control system for Reticulum",
   "type": "module",
   "main": "src/index.js",
@@ -38,6 +38,6 @@
     "node": ">=20"
   },
   "dependencies": {
-    "@reticulum/core": "file:../../reticulum-js/packages/core"
+    "@reticulum/core": "^0.5.1"
   }
 }

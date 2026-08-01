@@ -1,6 +1,6 @@
 # `@reticulum/dacar` — JavaScript implementation
 
-A JavaScript implementation of the [Dacar 1.0-RC3](../README.md) specification:
+A JavaScript implementation of the [Dacar 1.0-RC6](../README.md) specification:
 decentralized, offline-first access control for Reticulum mesh networks.
 
 Dacar is a tuple-based authorization system (inspired by Google Zanzibar) built
@@ -15,17 +15,16 @@ This is a modern ES-module package with JSDoc type annotations that runs on
 
 | Need | Choice | Why |
 | ---- | ------ | --- |
-| Ed25519 sign/verify (§5.2) | `@reticulum/core` `Identity` (Web Crypto) | The canonical Reticulum JS stack; Web Crypto is native everywhere |
-| Identity hashing (16-byte) | `@reticulum/core` `Identity.identityHash` | `TRUNCATED_HASHLENGTH = 128` matches the spec exactly |
-| MessagePack (§5.3) | `@reticulum/core` `MsgPack` (`MicroMsgPack`) | Reuses the canonical stack's encoder |
-| SHA-256 (§6.1) | Web Crypto `crypto.subtle.digest` | Standard, runtime-portable |
+| Ed25519 sign/verify (§5.2) | `@reticulum/core` `Identity` (Web Crypto) | The canonical Reticulum JS stack |
+| HMAC-SHA256 / SHA-256 (§3.3, §6.1) | Web Crypto `crypto.subtle` | Standard, runtime-portable |
+| MessagePack (§5.3) | `@reticulum/core` `MsgPack` | Reuses the canonical stack's encoder |
 
 `@reticulum/core` is the only dependency.
 
 > **Note on MessagePack + 64-bit HLCs:** a packed HLC (`physical_ms << 16`)
-> exceeds `Number.MAX_SAFE_INTEGER`, so it is represented as a `bigint`. This
-> implementation requires `@reticulum/core`'s `MicroMsgPack` with BigInt support
-> (uint64 encode + lossless decode), which is contributed upstream.
+> exceeds `Number.MAX_SAFE_INTEGER`, so it is represented as a `bigint`. The HLC
+> is always encoded as a `bigint` (uint64) and normalized with `BigInt()` on
+> decode, so it round-trips losslessly.
 
 ## Install
 
@@ -34,25 +33,28 @@ cd javascript
 npm install
 ```
 
-> During development the `@reticulum/core` dependency points at a local
-> `file:` checkout (the patched source). For release, set it to the published
-> version, e.g. `"@reticulum/core": "^0.5.1"`.
-
 ## Layout
 
 ```
 src/
-  hlc.js        §5.1  Hybrid Logical Clocks (bigint, 64-bit packed, big-endian)
-  namespace.js  §3.3  segment-aware matching + suffix-wildcard permutations
-  tuple.js      §3.1, §6.1  authorization Tuple + SHA-256 Tuple Hash
-  operation.js  §5.2, §5.3  signed Operation, pre-image, transport payload
-  crdt.js       §6    LWW-Element-Set state, apply, merge (Remove wins ties)
-  config.js     §4    Root Trust Anchors + Authoritative Identity
-  engine.js     §7    recursive delegation evaluation, bounds, memoization
-  challenge.js  §8    Strict Consistency Challenge / Freshness Receipts
-  index.js            public API
-test/           node:test smoketests for every module
-scripts/test.sh cross-runtime runner (node / deno / bun)
+  hlc.js          §5.1  Hybrid Logical Clocks (bigint, 64-bit packed, big-endian)
+  namespace.js    §3.3  Namespace Label Privacy: salted HMAC-SHA256 hashing,
+                        object segmenting, wildcard flag, hashed-object matching
+  tuple.js        §3.1, §6.1  hashed authorization Tuple + SHA-256 Tuple Hash
+  threshold.js    §4.1  N-of-M Threshold Groups + 16-byte Group ID
+  operation.js    §5.2, §5.3  signed Operation (single + multi-sig), pre-image,
+                        MessagePack transport payload
+  crdt.js         §6, §9  LWW-Element-Set state, merge (Remove wins ties),
+                        Time-Horizon Tombstone Pruning, intake rejection
+  config.js       §4, §10  Root Trust Anchors, Privacy Salts (Primary + Legacy),
+                        Authoritative Identity, deletion horizon
+  engine.js       §7    recursive delegation evaluation, hashed hypotheses,
+                        multi-salt shared work bound
+  challenge.js    §8    Strict Consistency Challenge (hashed, multi-salt) +
+                        signed Freshness Receipts
+  index.js              public API
+test/             node:test smoketests for every module
+scripts/test.sh   cross-runtime runner (node / deno / bun)
 ```
 
 ## Quick start
@@ -63,6 +65,7 @@ import {
   Clock,
   Config,
   Engine,
+  NamespaceHasher,
   Operation,
   StateVector,
   Tuple,
@@ -72,19 +75,22 @@ import { Identity } from "@reticulum/core";
 const anchor = await Identity.generate();          // your Root Trust Anchor
 const ROOT = anchor.identityHash;                   // 16-byte hash
 
+const hasher = new NamespaceHasher(); // default salt is FAIL-OPEN; supply a real 32-byte salt!
 const state = new StateVector();
 const clock = new Clock();
 
 // Bootstrap: the root anchor grants "read" on "sensor:wind".
 const op = await new Operation({
-  tuple: new Tuple({ object: "sensor:wind", relation: "read", grantee: ROOT, issuer: ROOT }),
+  tuple: await Tuple.fromPlaintext({
+    objectId: "sensor:wind", relation: "read", grantee: ROOT, issuer: ROOT, hasher,
+  }),
   action: Action.GRANT,
   hlc: clock.now(),
 }).sign(anchor);
 state.apply(op);
 
 const engine = new Engine(new Config({ rootTrustAnchors: [ROOT] }), state);
-console.log(engine.evaluate("sensor:wind", "read", ROOT)); // true
+console.log(await engine.evaluate("sensor:wind", "read", ROOT)); // true
 ```
 
 ## Tests
@@ -110,5 +116,3 @@ cd javascript && deno publish
 # npm
 cd javascript && npm publish
 ```
-
-Set the released `@reticulum/core` version in `package.json` before publishing.

@@ -16,9 +16,12 @@ from dacar.challenge import (
 from dacar.config import Config
 from dacar.crdt import StateVector
 from dacar.hlc import pack
+from dacar.namespace import HASH_SIZE, NamespaceHasher, SALT_SIZE
 from dacar.operation import Action, Operation
-from dacar.tuple import HASH_SIZE, Tuple
+from dacar.tuple import Tuple
 
+SALT = bytes(range(SALT_SIZE))
+HASHER = NamespaceHasher(SALT)
 ROOT = bytes(range(HASH_SIZE))
 BOB = bytes(range(HASH_SIZE, HASH_SIZE * 2))
 NONCE = bytes(range(32))
@@ -29,16 +32,24 @@ def _allow_state() -> StateVector:
     state = StateVector()
     state.apply(
         Operation(
-            tuple=Tuple("sensor:wind", "calibrate", BOB, ROOT),
+            tuple=Tuple.from_plaintext(
+                object_id="sensor:wind", relation="calibrate",
+                grantee=BOB, issuer=ROOT, hasher=HASHER,
+            ),
             action=Action.GRANT,
             hlc=pack(1_700_000_000_000, 0),
-        )
+        ),
+        now_ms=1_700_000_000_000,
     )
     return state
 
 
 def _config() -> Config:
-    return Config(root_trust_anchors=frozenset({ROOT}), authoritative_identity=ROOT)
+    return Config(
+        root_trust_anchors=frozenset({ROOT}),
+        primary_salt=SALT,
+        authoritative_identity=ROOT,
+    )
 
 
 class ReceiptTest(unittest.TestCase):
@@ -70,20 +81,33 @@ class ReceiptTest(unittest.TestCase):
         self.assertTrue(restored.verify(self.public_bytes))
 
 
-class ChallengeTest(unittest.TestCase):
-    def setUp(self) -> None:
-        self.private_key = Ed25519PrivateKey.generate()
-        self.public_bytes = self.private_key.public_key().public_bytes_raw()
+class ChallengePayloadTest(unittest.TestCase):
+    def test_roundtrip_preserves_nonce_and_grantee(self) -> None:
+        ch = Challenge.generate("sensor:wind", "calibrate", BOB, [HASHER], nonce=NONCE)
+        decoded = Challenge.from_payload(ch.to_payload())
+        self.assertEqual(decoded.nonce, NONCE)
+        self.assertEqual(decoded.grantee, BOB)
+        self.assertEqual(len(decoded.entries), 1)
+        entry = decoded.entries[0]
+        self.assertEqual(entry.grantee_hash, BOB)
+        self.assertEqual(entry.allow_relation_hash, HASHER.hash_relation("calibrate"))
+        self.assertEqual(entry.deny_relation_hash, HASHER.hash_relation("-calibrate"))
 
-    def test_challenge_nonce_roundtrip(self) -> None:
-        ch = Challenge.generate("o", "r", BOB)
-        self.assertEqual(len(ch.nonce), 32)
-        restored = Challenge.from_payload(ch.to_payload())
-        self.assertEqual(restored, ch)
+    def test_payload_carries_no_plaintext(self) -> None:
+        ch = Challenge.generate("sensor:wind", "calibrate", BOB, [HASHER], nonce=NONCE)
+        payload = ch.to_payload()
+        # The plaintext labels must not appear anywhere in the wire bytes.
+        self.assertNotIn(b"sensor", payload)
+        self.assertNotIn(b"wind", payload)
+        self.assertNotIn(b"calibrate", payload)
 
-    def test_fixed_nonce(self) -> None:
-        ch = Challenge.generate("o", "r", BOB, nonce=NONCE)
-        self.assertEqual(ch.nonce, NONCE)
+    def test_multi_salt_emits_one_entry_per_salt(self) -> None:
+        legacy = NamespaceHasher(bytes(reversed(range(SALT_SIZE))))
+        ch = Challenge.generate("o", "r", BOB, [HASHER, legacy], nonce=NONCE)
+        decoded = Challenge.from_payload(ch.to_payload())
+        self.assertEqual(len(decoded.entries), 2)
+        tags = {e.salt_id_tag for e in decoded.entries}
+        self.assertEqual(tags, {HASHER.id_tag, legacy.id_tag})
 
 
 class FlowTest(unittest.TestCase):
@@ -117,10 +141,14 @@ class FlowTest(unittest.TestCase):
         revoked = _allow_state()
         revoked.apply(
             Operation(
-                tuple=Tuple("sensor:wind", "calibrate", BOB, ROOT),
+                tuple=Tuple.from_plaintext(
+                    object_id="sensor:wind", relation="calibrate",
+                    grantee=BOB, issuer=ROOT, hasher=HASHER,
+                ),
                 action=Action.REVOKE,
                 hlc=pack(1_700_000_000_000, 5),
-            )
+            ),
+            now_ms=1_700_000_000_000,
         )
         client = self._wire(_allow_state(), revoked)
         self.assertFalse(client.authorize("sensor:wind", "calibrate", BOB))
@@ -144,7 +172,8 @@ class FlowTest(unittest.TestCase):
         def transport(payload: bytes) -> bytes:
             receipt = Receipt.from_payload(server.handle(payload))
             # Swap in a different nonce than the one we challenged with.
-            return replace_receipt_nonce(receipt, bytes(range(1, 33))).to_payload()
+            swapped = Receipt(receipt.verdict, receipt.server_hlc, bytes(range(1, 33)), receipt.signature)
+            return swapped.to_payload()
 
         client = ChallengeClient(_config(), _allow_state(), self.public_bytes, transport)
         self.assertFalse(client.authorize("sensor:wind", "calibrate", BOB))
@@ -162,14 +191,9 @@ class FlowTest(unittest.TestCase):
         self.assertFalse(client.authorize("sensor:wind", "calibrate", BOB))
 
     def test_authoritative_identity_required(self) -> None:
-        cfg = Config(root_trust_anchors=frozenset({ROOT}))  # no authoritative id
+        cfg = Config(root_trust_anchors=frozenset({ROOT}), primary_salt=SALT)
         with self.assertRaises(ValueError):
             ChallengeClient(cfg, StateVector(), self.public_bytes, lambda _: None)
-
-
-def replace_receipt_nonce(receipt: Receipt, nonce: bytes) -> Receipt:
-    """Return a copy of ``receipt`` with a different (unsigned-over) nonce."""
-    return Receipt(receipt.verdict, receipt.server_hlc, nonce, receipt.signature)
 
 
 if __name__ == "__main__":
