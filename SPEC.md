@@ -1,5 +1,5 @@
 # Specification: Dacar (Decentralized Access Control for Reticulum)
-**Version:** 1.0-RC6
+**Version:** 1.0-RC7
 **License:** EUPL-1.2
 **Dependencies:** Reticulum Network Stack (RNS), LWW-Element-Set CRDT, MessagePack
 ## 1. Introduction
@@ -39,7 +39,7 @@ To prevent label disclosure over public transports, Dacar never transmits or sto
 ### 4.1 Configuration
 Every Dacar-enabled service node MUST be configured out-of-band with one or more **Root Trust Anchors**.
  1. **Single Identity:** A standard 16-byte RNS.Identity hash.
- 2. **Threshold Group (N-of-M):** A composite authority requiring consensus, defined by a set of M specific RNS.Identity hashes and an integer N. The Group ID is the SHA-256 hash of the alphabetically sorted M hashes concatenated with N, **strictly truncated to the first 16 bytes**.
+ 2. **Threshold Group (N-of-M):** A composite authority requiring consensus, defined by a set of M specific RNS.Identity hashes and an integer N. The **Group ID** is the SHA-256 hash of the following packed binary pre-image, **strictly truncated to the first 16 bytes**: the M member hashes (16 bytes each) sorted ascending by raw byte value (equivalent to hex-alphabetical order), followed by the threshold N encoded as an 8-byte big-endian unsigned integer. The Group ID is itself a 16-byte value usable wherever an Issuer hash is expected.
    > **Note on Scope:** In v1.0, Threshold Groups MAY ONLY act as Issuers. A Grantee MUST be a single Identity. Granting permissions to a Threshold Group is not currently supported.
    >
 ### 4.2 Genesis Operations
@@ -93,7 +93,14 @@ For destructive operations (e.g., wiping storage), eventual consistency is overr
  1. **Local Pre-Check:** The node evaluates locally; if denied, the request fails.
  2. **Challenge Link:** The node establishes an RNS.Link to the Authoritative Anchor (App Name: dacar, Aspects: auth, v1). If unreachable, the operation defaults to **DENY**.
  3. **Challenge Payload:** The local node calculates hypothesized hashes across its Primary Salt and all configured Legacy Salts (§10) and transmits them over the Link as a MessagePack array:
-   [ <nonce_32_bytes>, [ <salt_id_tag, relation_hash, wildcard_bool, segment_count, segment_hashes_array, grantee_hash>, ... ] ].
+   [ <nonce_32_bytes>, [ <entry>, ... ] ]
+   Each entry is a self-contained, fully-hashed hypothesis for exactly one salt — a 5-element array:
+   `[ <salt_id_tag(16)>, <grantee_hash(16)>, <allow_relation_hash(16)>, <deny_relation_hash(16)>, <[object_segment_hashes]> ]`.
+   * **salt_id_tag** = `Truncated_HMAC(salt, "dacar.salt.id")`; the Authority uses it to bind each entry to its matching configured salt (required to derive the `admin` relation hash for delegation recursion, §7.2) without ever exchanging the salt itself.
+   * **grantee_hash** = the 16-byte identity hash of the request Grantee U.
+   * **allow_relation_hash** = `Truncated_HMAC(salt, r)`.
+   * **deny_relation_hash** = `Truncated_HMAC(salt, "-" + r)`. Both relation hashes are carried because the Authority must apply the deny-beats-allow rule (§7.3) and cannot derive the deny hash from the allow hash without plaintext, which §8.4 forbids.
+   * **object_segment_hashes** = the per-segment `Truncated_HMAC` hashes of the request Object O, exact (the §3.3 wildcard flag is unset for a concrete request); the array length conveys the segment count.
  4. **Authoritative Evaluation:** The Authority evaluates this hashed request directly against its own absolute-latest CRDT state, never falling back to plaintext.
  5. **The Verdict Receipt:** The Authority responds with a MessagePack array:
    [ <1-byte verdict_status>, <8-byte server_hlc>, <32-byte nonce>, <64-byte ed25519_sig> ].

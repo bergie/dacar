@@ -10,16 +10,17 @@ To preserve Namespace Label Privacy (§3.3), the Challenge payload carries only
 Primary Salt and all Legacy Salts (§10); the server matches each by its
 ``salt_id_tag`` and evaluates directly in hash space.
 
-Canonical challenge wire format (concrete resolution of §8.3)::
+Canonical challenge wire format (§8.3)::
 
     [ nonce(32),
       [ [ salt_id_tag(16), grantee_hash(16), allow_relation_hash(16),
-          deny_relation_hash(16), wildcard_bool, [object_segment_hashes] ],
+          deny_relation_hash(16), [object_segment_hashes] ],
         ... ] ]
 
 Each entry is fully self-contained for one salt and carries *both* the allow and
 deny relation hashes so the Authority can apply the deny-beats-allow rule
-(§7.3) without recovering plaintext.
+(§7.3) without recovering plaintext. Requests are exact, so the §3.3 wildcard
+flag is not set on an entry; the array length conveys the segment count.
 
 The RNS transport is abstracted behind a ``transport`` callable
 (``challenge_payload -> receipt_payload | None``), so the cryptographic and
@@ -127,7 +128,6 @@ class Challenge:
                     self.grantee,
                     hasher.hash_relation(self.relation),
                     hasher.hash_relation("-" + self.relation),
-                    False,  # requests are exact; tuples may still be wildcarded
                     list(obj_hashes),
                 ]
             )
@@ -152,15 +152,13 @@ class Challenge:
         decoded: List[_DecodedEntry] = []
         grantee: Optional[bytes] = None
         for entry in entries:
-            if not isinstance(entry, (list, tuple)) or len(entry) != 6:
-                raise ValueError("each challenge entry must be a 6-element array")
-            salt_id_tag, grantee_hash, allow_rh, deny_rh, wildcard, obj_hashes = entry
+            if not isinstance(entry, (list, tuple)) or len(entry) != 5:
+                raise ValueError("each challenge entry must be a 5-element array")
+            salt_id_tag, grantee_hash, allow_rh, deny_rh, obj_hashes = entry
             salt_id_tag = _expect_blob(salt_id_tag, HASH_SIZE, "salt_id_tag")
             grantee_hash = _expect_blob(grantee_hash, HASH_SIZE, "grantee_hash")
             allow_rh = _expect_blob(allow_rh, HASH_SIZE, "allow_relation_hash")
             deny_rh = _expect_blob(deny_rh, HASH_SIZE, "deny_relation_hash")
-            if not isinstance(wildcard, bool):
-                raise ValueError("wildcard must be a bool")
             if not isinstance(obj_hashes, (list, tuple)):
                 raise ValueError("object_segment_hashes must be an array")
             obj_hashes = tuple(_expect_blob(h, HASH_SIZE, "object segment hash") for h in obj_hashes)
@@ -169,7 +167,7 @@ class Challenge:
             elif grantee != grantee_hash:
                 raise ValueError("all challenge entries must share one grantee")
             decoded.append(
-                _DecodedEntry(salt_id_tag, grantee_hash, allow_rh, deny_rh, wildcard, obj_hashes)
+                _DecodedEntry(salt_id_tag, grantee_hash, allow_rh, deny_rh, obj_hashes)
             )
         if grantee is None:
             raise ValueError("challenge must carry at least one entry")
@@ -191,7 +189,6 @@ class _DecodedEntry:
     grantee_hash: bytes
     allow_relation_hash: bytes
     deny_relation_hash: bytes
-    wildcard: bool
     object_hashes: _Tuple[bytes, ...]
 
 

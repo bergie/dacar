@@ -9,8 +9,8 @@
  * (§4.1), and the state is bounded by Time-Horizon Tombstone Pruning (§9).
  */
 
-export const __version__ = "1.0.0-rc.6";
-export const __specVersion__ = "1.0-RC6";
+export const __version__ = "1.0.0-rc.7";
+export const __specVersion__ = "1.0-RC7";
 
 // HLC (§5.1)
 export {

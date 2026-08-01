@@ -11,11 +11,11 @@
  * across its Primary Salt and all Legacy Salts (§10); the server matches each by
  * its `salt_id_tag` and evaluates directly in hash space.
  *
- * Canonical challenge wire format (concrete resolution of §8.3):
+ * Canonical challenge wire format (§8.3):
  *
  *   [ nonce(32),
  *     [ [ salt_id_tag(16), grantee_hash(16), allow_relation_hash(16),
- *         deny_relation_hash(16), wildcard_bool, [object_segment_hashes] ],
+ *         deny_relation_hash(16), [object_segment_hashes] ],
  *       ... ] ]
  *
  * Each entry is fully self-contained for one salt and carries *both* the allow
@@ -75,7 +75,6 @@ function expectBytes(value, len, name) {
  * @property {Uint8Array} granteeHash
  * @property {Uint8Array} allowRelationHash
  * @property {Uint8Array} denyRelationHash
- * @property {boolean} wildcard
  * @property {Uint8Array[]} objectHashes
  */
 
@@ -148,7 +147,6 @@ export class Challenge {
           this.grantee,
           allowRelationHash,
           denyRelationHash,
-          false, // requests are exact; tuples may still be wildcarded
           [...hashes],
         ];
       }),
@@ -176,11 +174,10 @@ export class Challenge {
     /** @type {Uint8Array | null} */
     let grantee = null;
     for (const entry of entries) {
-      if (!Array.isArray(entry) || entry.length !== 6) {
-        throw new Error("each challenge entry must be a 6-element array");
+      if (!Array.isArray(entry) || entry.length !== 5) {
+        throw new Error("each challenge entry must be a 5-element array");
       }
-      const [saltIdTag, granteeHash, allowRh, denyRh, wildcard, objectHashes] = entry;
-      if (typeof wildcard !== "boolean") throw new Error("wildcard must be a boolean");
+      const [saltIdTag, granteeHash, allowRh, denyRh, objectHashes] = entry;
       if (!Array.isArray(objectHashes)) throw new Error("object_segment_hashes must be an array");
       const gh = expectBytes(granteeHash, HASH_SIZE, "grantee_hash");
       if (grantee === null) grantee = gh;
@@ -190,7 +187,6 @@ export class Challenge {
         granteeHash: gh,
         allowRelationHash: expectBytes(allowRh, HASH_SIZE, "allow_relation_hash"),
         denyRelationHash: expectBytes(denyRh, HASH_SIZE, "deny_relation_hash"),
-        wildcard,
         objectHashes: objectHashes.map((h) => expectBytes(h, HASH_SIZE, "object_hash")),
       });
     }
