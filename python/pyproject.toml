@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "dacar"
 version = "1.0.0rc3"
-description = "Decentralized Access Control for Reticulum (Dacar 1.0-RC3) reference implementation"
+description = "Python implementation of Dacar, a Decentralized Access Control system for Reticulum"
 readme = "README.md"
 license = { text = "EUPL-1.2" }
 requires-python = ">=3.9"

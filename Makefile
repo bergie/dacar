@@ -15,6 +15,7 @@ PYTHON ?= python3
 
 .PHONY: help install test clean
 .PHONY: install-python test-python clean-python
+.PHONY: install-js test-js clean-js
 .DEFAULT_GOAL := help
 
 help: ## Show this help
@@ -27,11 +28,13 @@ help: ## Show this help
 	@echo
 	@echo "  install-python   $(PYTHON) -m pip install -e ."
 	@echo "  test-python      $(PYTHON) -m unittest discover -s tests"
+	@echo "  install-js       npm install"
+	@echo "  test-js          node/deno/bun (whichever are installed)"
 
 # --- aggregators (append new -<lang> targets here) -------------------------
-install: install-python
-test: test-python
-clean: clean-python
+install: install-python install-js
+test: test-python test-js
+clean: clean-python clean-js
 
 # --- python ----------------------------------------------------------------
 install-python: ## Install Python dependencies
@@ -45,9 +48,11 @@ clean-python: ## Remove Python build/test artifacts
 	find python -type d -name __pycache__ -prune -exec rm -rf {} +
 
 # --- javascript ------------------------------------------------------------
-# install-js:
-# 	cd javascript && npm install
-# test-js:
-# 	cd javascript && npm test
-# clean-js:
-# 	cd javascript && rm -rf node_modules
+install-js: ## Install JavaScript dependencies
+	cd javascript && npm install
+
+test-js: ## Run JavaScript tests (node, deno, bun — whichever are installed)
+	cd javascript && npm test
+
+clean-js: ## Remove JavaScript build/test artifacts
+	cd javascript && rm -rf node_modules

@@ -1,7 +1,7 @@
 """Dacar: Decentralized Access Control for Reticulum.
 
-A reference Python implementation of the Dacar 1.0-RC3 specification: a
-tuple-based, offline-first authorization policy plane built on an
+Python implementation of Dacar, a Decentralized Access Control system for
+Reticulum: a tuple-based, offline-first authorization policy plane built on an
 LWW-Element-Set CRDT, designed for delay-tolerant mesh networks.
 """
 
