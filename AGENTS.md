@@ -1,8 +1,10 @@
-This repository is for reference implementations ot the Dacar spec.
+This repository is for reference implementations ot the Dacar spec (`SPEC.md`).
 
 Each implementation should we written in a way that is idiomatic to that language. For example, the JavaScript implementation should be a modern ES module with JsDoc TypeScript annotations, written in a way that works on both browsers and typical server-side runtimes (like Node.js and Deno).
 
-We shpuld generally avoid 3rd party dependencies. In cases where a dependency may be needed (for example for cryptography in languages that don't provide it in their standard library), we should strive to use the same dependencies as that language's primary Reticulum implementation.
+Just like with Reticulum, the Pythom implementation shpuld be considered canonical, and other language ports should ensure interoperabiliyy with it.
+
+We should generally avoid 3rd party dependencies. In cases where a dependency may be needed (for example for cryptography in languages that don't provide it in their standard library), we should strive to use the same dependencies as that language's primary Reticulum implementation.
 
 ## Boundaries
 
