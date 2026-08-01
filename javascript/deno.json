@@ -1,0 +1,20 @@
+{
+  "name": "@reticulum/dacar",
+  "version": "1.0.0-rc.3",
+  "exports": "./src/index.js",
+  "exclude": [
+    "test/",
+    "scripts/",
+    "node_modules/"
+  ],
+  "publish": {
+    "include": [
+      "src/**",
+      "README.md"
+    ]
+  },
+  "tasks": {
+    "test": "deno test --allow-read=test,src --allow-env --no-check test/"
+  },
+  "node_modules_dir": "auto"
+}

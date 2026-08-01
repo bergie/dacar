@@ -1,0 +1,43 @@
+{
+  "name": "@reticulum/dacar",
+  "version": "1.0.0-rc.3",
+  "description": "JavaScript implementation of Dacar, a Decentralized Access Control system for Reticulum",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "sh scripts/test.sh",
+    "test:node": "node --test --test-force-exit \"test/**/*.test.js\"",
+    "test:deno": "deno test --allow-read=test,src --allow-env --no-check test/",
+    "test:bun": "bun test test/"
+  },
+  "keywords": [
+    "reticulum",
+    "rns",
+    "access-control",
+    "authorization",
+    "crdt",
+    "mesh",
+    "offline"
+  ],
+  "license": "EUPL-1.2",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/earendil-works/dacar.git",
+    "directory": "javascript"
+  },
+  "homepage": "https://github.com/earendil-works/dacar#readme",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@reticulum/core": "file:../../reticulum-js/packages/core"
+  }
+}
