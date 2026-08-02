@@ -27,6 +27,14 @@ from dacar.operation import HLC_BYTES, SIGNATURE_SIZE, Action, Operation
 from dacar.verifier import IssuerKeyset, KeyResolver, Keyring, verify_operation
 from dacar.config import Config, DEFAULT_DELETION_HORIZON_DAYS
 from dacar.crdt import StateVector
+from dacar.delta import DeltaReceiver
+from dacar.naming import (
+    APP_NAME,
+    CHALLENGE_ASPECTS,
+    CHALLENGE_DESTINATION,
+    RFED_TOPIC,
+    LXMF_DELIVERY_TITLE,
+)
 from dacar.engine import ADMIN_RELATION, DEFAULT_MAX_DEPTH, DEFAULT_MAX_VISITED, Engine
 from dacar.challenge import (
     NONCE_SIZE,
@@ -72,6 +80,14 @@ __all__ = [
     "KeyResolver",
     "Keyring",
     "verify_operation",
+    # Transport-agnostic Delta receive boundary (§11)
+    "DeltaReceiver",
+    # RNS naming conventions (§8, §11)
+    "APP_NAME",
+    "CHALLENGE_ASPECTS",
+    "CHALLENGE_DESTINATION",
+    "RFED_TOPIC",
+    "LXMF_DELIVERY_TITLE",
     # Config (§4, §10) + state (§6)
     "Config",
     "DEFAULT_DELETION_HORIZON_DAYS",

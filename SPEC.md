@@ -132,7 +132,7 @@ During the Hypothesis Generation phase (§7.1), the Evaluation Engine generates 
 ## 11. Synchronization & Transport Plane
 Dacar delegates transport responsibilities to established Reticulum protocols.
 ### 11.1 Eventual Consistency via RFed (Many-to-Many)
-Global convergence of the CRDT State Vector is handled via **RFed** (default topic: dacar.policy.v1). Nodes rely on RFed's native store-and-forward to asynchronously retrieve new Operations and merge them into the local LWW-Element-Set.
+Global convergence of the CRDT State Vector is handled via **RFed**. The default topic is `dacar.policy.v1`, but it is **configurable per deployment**: because RFed is a broadcast (many-to-many) medium, nodes that must isolate their policy feed from other Dacar deployments sharing an RNS network SHOULD set a deployment-specific topic. (By contrast, §11.2 LXMF delivery and the §8 Challenge destination are addressed point-to-point to a specific Identity, so they derive isolation from RNS addressing rather than from a configurable name.) Nodes rely on RFed's native store-and-forward to asynchronously retrieve new Operations and merge them into the local LWW-Element-Set.
 ### 11.2 Targeted Asynchronous Delivery (LXMF Store-and-Forward)
 For forward-secret, point-to-point delivery to offline nodes (bypassing the public RFed broadcast):
  1. **LXMF & Ratchets:** The target node configures an LXMF destination and calls enable_ratchets() (or enforce_ratchets()).

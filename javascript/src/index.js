@@ -53,6 +53,18 @@ export { SIGNATURE_SIZE, HLC_BYTES, Action, Operation } from "./operation.js";
 // Verify-on-ingest (§11.2.4)
 export { IssuerKeyset, Keyring, verifyOperation } from "./verifier.js";
 
+// Transport-agnostic Delta receive boundary (§11)
+export { DeltaReceiver } from "./delta.js";
+
+// RNS naming conventions (§8, §11)
+export {
+  APP_NAME,
+  CHALLENGE_ASPECTS,
+  CHALLENGE_DESTINATION,
+  RFED_TOPIC,
+  LXMF_DELIVERY_TITLE,
+} from "./naming.js";
+
 // Config (§4, §10) + state (§6, §9)
 export { Config, DEFAULT_DELETION_HORIZON_DAYS } from "./config.js";
 export { StateVector } from "./crdt.js";
