@@ -1,7 +1,10 @@
 {
   "name": "@reticulum/dacar",
   "version": "1.0.0-rc.7",
-  "exports": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./transport": "./src/transport/index.js"
+  },
   "exclude": [
     "scripts/",
     "node_modules/"

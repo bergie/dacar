@@ -6,6 +6,7 @@
   "main": "src/index.js",
   "exports": {
     ".": "./src/index.js",
+    "./transport": "./src/transport/index.js",
     "./package.json": "./package.json"
   },
   "files": [
