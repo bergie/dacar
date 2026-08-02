@@ -12,15 +12,15 @@ Requires the ``lxmf`` package (``dacar[transport]`` extra).
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import sys
-import tempfile
 import unittest
 
 import LXMF
 import RNS
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+from tests._rns_fixture import ensure_headless
 
 from dacar import Action, DeltaReceiver, Keyring, Operation, StateVector, Tuple
 from dacar.hlc import pack, physical_now_ms
@@ -59,21 +59,10 @@ class _FakeMsg:
         return self._title
 
 
-def _reticulum_off():
-    """A headless RNS.Reticulum that binds no interfaces."""
-    cfg = tempfile.mkdtemp(prefix="dacar-rns-")
-    with open(os.path.join(cfg, "config"), "w") as f:
-        f.write("[reticulum]\nenable_transport = False\nshare_instance = No\n\n[interfaces]\n")
-    RNS.Reticulum(cfg)
-    return cfg
-
-
 class LxmfDeltaDeliveryTest(unittest.TestCase):
-    cfg_dir = None
-
     @classmethod
     def setUpClass(cls):
-        cls.cfg_dir = _reticulum_off()
+        ensure_headless()
 
     def _dst_src(self):
         dst = RNS.Destination(

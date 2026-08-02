@@ -15,6 +15,7 @@ from dacar.transport.rns_challenge import (  # noqa: F401
     challenge_request_handler,
     establish_link,
 )
+from dacar.transport.rns_identity import RnsIdentityResolver  # noqa: F401
 
 __all__ = [
     "CHALLENGE_REQUEST_PATH",
@@ -25,6 +26,7 @@ __all__ = [
     "RnsLinkTransport",
     "challenge_request_handler",
     "establish_link",
+    "RnsIdentityResolver",
 ]
 
 # §11.2/§11.3 LXMF adapters need the ``lxmf`` package. Import gracefully so a
