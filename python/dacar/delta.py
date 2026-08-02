@@ -14,8 +14,9 @@ whether they arrived over RFed, LXMF, or a scanned QR code.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import List, Optional
 
+from dacar import serialization
 from dacar.crdt import DEFAULT_MAX_FUTURE_MS, StateVector
 from dacar.operation import Operation
 from dacar.verifier import KeyResolver
@@ -55,3 +56,59 @@ class DeltaReceiver:
         return self._state.ingest(
             operation, self._resolver, now_ms=now_ms, max_future_ms=max_future_ms
         )
+
+    def apply_payloads(
+        self,
+        payload: bytes,
+        *,
+        now_ms: Optional[int] = None,
+        max_future_ms: Optional[int] = DEFAULT_MAX_FUTURE_MS,
+    ) -> int:
+        """Authenticate and apply a *batch* of Deltas (§11.1, §11.2.4).
+
+        The secure alternative to ``StateVector.merge()`` for network sync.
+        ``payload`` is a MessagePack array of §5.3 Operation payloads
+        (``serialization.packb([op_a.to_payload(), op_b.to_payload(), ...])``);
+        each element is decoded and run through :meth:`apply_payload`, i.e. it
+        is independently Ed25519/threshold-authenticated before it may touch
+        state. A single forged, stale (§9), or future-skewed (§12) element is
+        dropped without affecting the rest of the batch.
+
+        Returns the number of Deltas authenticated *and* applied. A malformed
+        outer payload (not a MessagePack array, undecodable) yields ``0`` and
+        is swallowed, so a transport callback can never crash on arbitrary
+        bytes — exactly like :meth:`apply_payload`.
+
+        .. warning::
+           This is the *only* safe entry point for full-state / bulk
+           convergence received over the network. ``StateVector.merge()`` /
+           ``StateVector.from_payload()`` are trusted-local snapshot primitives
+           that perform **no** signature verification and **must not** be fed
+           network bytes.
+        """
+        try:
+            items = serialization.unpackb(payload)
+        except (ValueError, TypeError):
+            return 0  # malformed outer payload -> drop silently
+        if not isinstance(items, list):
+            return 0
+        applied = 0
+        for item in items:
+            if not isinstance(item, (bytes, bytearray)):
+                continue  # skip non-bin elements defensively
+            if self.apply_payload(
+                bytes(item), now_ms=now_ms, max_future_ms=max_future_ms
+            ):
+                applied += 1
+        return applied
+
+    @staticmethod
+    def pack_payloads(operation_payloads: List[bytes]) -> bytes:
+        """Encode a list of §5.3 Operation payloads as a batch (§11.1).
+
+        Inverse of :meth:`apply_payloads`: ``serialization.packb([...])`` of
+        already-signed Operation payload byte-strings, suitable for publishing
+        as one bulk sync message. Convenience wrapper so callers need not
+        import :mod:`dacar.serialization` directly.
+        """
+        return serialization.packb([bytes(p) for p in operation_payloads])

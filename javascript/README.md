@@ -120,6 +120,18 @@ Every transport funnels received bytes through the same verify-on-ingest seam
 Ed25519 signature, and only then merged — regardless of whether it arrived over
 RFed, LXMF, or a scanned QR code.
 
+For **bulk / full-state convergence** (e.g. RFed catch-up), pack many signed
+Deltas into one message and ingest them as a batch with `DeltaReceiver.applyPayloads()`
+— each element is still independently verified-on-ingest, so a forged element
+is dropped without aborting the rest. This is the secure alternative to
+`StateVector.merge()`, which is trusted-local-only (snapshot/restore of a
+node's own state) and must never be fed network bytes:
+
+```js
+const batch = DeltaReceiver.packPayloads([opA.toPayload(), opB.toPayload()]);
+const applied = await rx.applyPayloads(batch); // → # of Deltas verified + applied
+```
+
 ```js
 import {
   RnsIdentityResolver,

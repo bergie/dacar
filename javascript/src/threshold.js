@@ -33,9 +33,9 @@ function compareHashes(a, b) {
 
 /** Synchronously validate member hashes and threshold (shared by all paths). */
 function validateMembers(members, threshold) {
-  if (!(Number.isInteger(threshold) && threshold >= 1 && threshold < members.length)) {
+  if (!(Number.isInteger(threshold) && threshold >= 1 && threshold <= members.length)) {
     throw new Error(
-      `threshold must satisfy 1 <= N < M (got N=${threshold}, M=${members.length})`,
+      `threshold must satisfy 1 <= N <= M (got N=${threshold}, M=${members.length})`,
     );
   }
   for (const m of members) {

@@ -21,7 +21,7 @@ describe("Config anchors (§4)", () => {
 
   it("isRootAnchor", () => {
     const other = Uint8Array.from({ length: HASH_SIZE }, (_, i) => i + 1);
-    const cfg = new Config({ rootTrustAnchors: [ROOT, other] });
+    const cfg = new Config({ rootTrustAnchors: [ROOT, other], primarySalt: SALT_A });
     assert.equal(cfg.isRootAnchor(ROOT), true);
     assert.equal(cfg.isRootAnchor(other), true);
     assert.equal(cfg.isRootAnchor(new Uint8Array(HASH_SIZE)), false);
@@ -33,11 +33,22 @@ describe("Config anchors (§4)", () => {
 });
 
 describe("Config salts (§3.3, §10)", () => {
-  it("defaults to the fail-open null salt", () => {
-    const cfg = new Config({ rootTrustAnchors: [ROOT] });
+  it("defaults to the fail-open null salt and warns", () => {
+    const original = console.warn;
+    const calls = [];
+    console.warn = (/** @type {string} */ msg) => calls.push(String(msg));
+    let cfg;
+    try {
+      cfg = new Config({ rootTrustAnchors: [ROOT] });
+    } finally {
+      console.warn = original;
+    }
     assert.deepEqual(cfg.primarySalt, DEFAULT_SALT);
     assert.equal(cfg.hashers.length, 1);
     assert.deepEqual(cfg.hashers[0].salt, DEFAULT_SALT);
+    assert.equal(calls.length, 1);
+    assert.match(calls[0], /default null Privacy Salt/);
+    assert.match(calls[0], /fail-open/);
   });
 
   it("orders primary then legacy hashers", () => {
@@ -51,7 +62,7 @@ describe("Config salts (§3.3, §10)", () => {
 
   it("validates salt lengths", () => {
     assert.throws(() => new Config({ rootTrustAnchors: [ROOT], primarySalt: new Uint8Array(3) }));
-    assert.throws(() => new Config({ rootTrustAnchors: [ROOT], legacySalts: [new Uint8Array(3)] }));
+    assert.throws(() => new Config({ rootTrustAnchors: [ROOT], primarySalt: SALT_A, legacySalts: [new Uint8Array(3)] }));
   });
 });
 
@@ -61,7 +72,7 @@ describe("Config threshold groups (§4.1)", () => {
     const m2 = Uint8Array.from({ length: HASH_SIZE }, (_, i) => i + 1);
     const group = new ThresholdGroup([m1, m2], 1);
     const gid = await group.groupId();
-    const cfg = new Config({ rootTrustAnchors: [gid], thresholdGroups: [group] });
+    const cfg = new Config({ rootTrustAnchors: [gid], primarySalt: SALT_A, thresholdGroups: [group] });
     assert.equal(await cfg.groupFor(gid), group);
     assert.equal(await cfg.groupFor(new Uint8Array(HASH_SIZE)), undefined);
     assert.equal(cfg.isRootAnchor(gid), true);
@@ -70,10 +81,10 @@ describe("Config threshold groups (§4.1)", () => {
 
 describe("Config horizon (§9)", () => {
   it("defaults to 180 days", () => {
-    assert.equal(new Config({ rootTrustAnchors: [ROOT] }).deletionHorizonDays, DEFAULT_DELETION_HORIZON_DAYS);
+    assert.equal(new Config({ rootTrustAnchors: [ROOT], primarySalt: SALT_A }).deletionHorizonDays, DEFAULT_DELETION_HORIZON_DAYS);
   });
 
   it("validates the horizon", () => {
-    assert.throws(() => new Config({ rootTrustAnchors: [ROOT], deletionHorizonDays: 0 }));
+    assert.throws(() => new Config({ rootTrustAnchors: [ROOT], primarySalt: SALT_A, deletionHorizonDays: 0 }));
   });
 });

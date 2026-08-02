@@ -14,11 +14,19 @@ import {
   MAX_LEGACY_SALTS,
   SALT_SIZE,
   NamespaceHasher,
+  bytesEqual,
 } from "./namespace.js";
 
 /** Default deletion horizon H (days), see §9. */
 export const DEFAULT_DELETION_HORIZON_DAYS = 180;
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
+/**
+ * Guard ensuring the fail-open null-salt notice is logged at most once per
+ * process, so test suites and tooling that build many Configs are not flooded
+ * while still flagging the footgun at first startup.
+ */
+let __nullSaltWarned = false;
 
 /**
  * @typedef {Object} ConfigInit
@@ -89,6 +97,17 @@ export class Config {
     }
     /** @type {number} */
     this.deletionHorizonDays = deletionHorizonDays;
+
+    // §3.3 fail-open guard: only warn once the Config is fully valid, so a
+    // misconfiguration that already throws is not also noisily warned about.
+    if (_isDefaultSalt(primarySalt) && !__nullSaltWarned) {
+      __nullSaltWarned = true;
+      console.warn(
+        "Config started with the default null Privacy Salt: label hashes are " +
+          "fail-open (trivially dictionary-attackable, §3.3). Set a strong " +
+          "random primarySalt for any real deployment.",
+      );
+    }
   }
 
   /** Primary hasher, then Legacy hashers in order (§10.2). @returns {NamespaceHasher[]} */
@@ -124,4 +143,12 @@ export class Config {
   get deletionHorizonMs() {
     return this.deletionHorizonDays * MS_PER_DAY;
   }
+}
+
+/**
+ * @param {Uint8Array} salt
+ * @returns {boolean} `true` iff `salt` is the all-zero fail-open default.
+ */
+function _isDefaultSalt(salt) {
+  return bytesEqual(salt, DEFAULT_SALT);
 }

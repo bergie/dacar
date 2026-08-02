@@ -124,6 +124,18 @@ op = Operation(...).sign(issuer.sig_prv) # op.issuer is issuer.hash
 rx.apply_payload(op.to_payload())        # recall issuer.hash → verify → merge
 ```
 
+For **bulk / full-state convergence** (e.g. RFed catch-up or a periodic sync),
+pack many signed Deltas into one message and ingest them as a batch — each is
+still independently verified-on-ingest, so a forged element is dropped without
+aborting the rest. This is the secure alternative to `StateVector.merge()`,
+which is trusted-local-only (snapshot/restore of a node's own state) and must
+never be fed network bytes:
+
+```python
+batch = DeltaReceiver.pack_payloads([op_a.to_payload(), op_b.to_payload()])
+applied = rx.apply_payloads(batch)         # → count of Deltas verified + applied
+```
+
 > **The Issuer Hash must be the canonical RNS identity hash.** RNS defines an
 > identity hash as `SHA-256(P)[:16]` where `P` is the 64-byte public key
 > (`X25519_pub ‖ Ed25519_pub`) — *not* a hash of the Ed25519 signing key alone.

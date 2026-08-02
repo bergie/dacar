@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import unittest
+import warnings
 
-from dacar.config import Config
+from dacar.config import Config, NullPrivacySaltWarning
 from dacar.namespace import DEFAULT_SALT, MAX_LEGACY_SALTS, SALT_SIZE, NamespaceHasher
 from dacar.threshold import ThresholdGroup
 from dacar.tuple import HASH_SIZE
@@ -27,7 +28,7 @@ class AnchorsTest(unittest.TestCase):
 
     def test_is_root_anchor(self) -> None:
         other = bytes(range(1, HASH_SIZE + 1))
-        cfg = Config(root_trust_anchors=frozenset({ROOT, other}))
+        cfg = Config(root_trust_anchors=frozenset({ROOT, other}), primary_salt=SALT_A)
         self.assertTrue(cfg.is_root_anchor(ROOT))
         self.assertTrue(cfg.is_root_anchor(other))
         self.assertFalse(cfg.is_root_anchor(bytes(HASH_SIZE)))
@@ -39,9 +40,32 @@ class AnchorsTest(unittest.TestCase):
 
 class SaltsTest(unittest.TestCase):
     def test_default_salt_is_fail_open(self) -> None:
-        cfg = Config(root_trust_anchors=frozenset({ROOT}))
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            cfg = Config(root_trust_anchors=frozenset({ROOT}))
         self.assertEqual(cfg.primary_salt, DEFAULT_SALT)
         self.assertEqual(cfg.hashers, [NamespaceHasher(DEFAULT_SALT)])
+        # Starting with the default null salt emits an audible §3.3 warning.
+        self.assertTrue(
+            any(issubclass(w.category, NullPrivacySaltWarning) for w in caught)
+        )
+
+    def test_real_salt_is_silent(self) -> None:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            Config(root_trust_anchors=frozenset({ROOT}), primary_salt=SALT_A)
+        self.assertFalse(
+            any(issubclass(w.category, NullPrivacySaltWarning) for w in caught)
+        )
+
+    def test_warning_can_be_filtered_for_demo_use(self) -> None:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            warnings.filterwarnings("ignore", category=NullPrivacySaltWarning)
+            Config(root_trust_anchors=frozenset({ROOT}))
+        self.assertFalse(
+            any(issubclass(w.category, NullPrivacySaltWarning) for w in caught)
+        )
 
     def test_primary_and_legacy_hashers_ordered(self) -> None:
         cfg = Config(
@@ -70,7 +94,11 @@ class ThresholdGroupsTest(unittest.TestCase):
     def test_group_for_lookup(self) -> None:
         m1, m2 = bytes(range(HASH_SIZE)), bytes(range(1, HASH_SIZE + 1))
         group = ThresholdGroup((m1, m2), 1)
-        cfg = Config(root_trust_anchors=frozenset({group.group_id}), threshold_groups=(group,))
+        cfg = Config(
+            root_trust_anchors=frozenset({group.group_id}),
+            primary_salt=SALT_A,
+            threshold_groups=(group,),
+        )
         self.assertIs(cfg.group_for(group.group_id), group)
         self.assertIsNone(cfg.group_for(bytes(HASH_SIZE)))
         # A threshold group can be a root anchor.
@@ -79,7 +107,7 @@ class ThresholdGroupsTest(unittest.TestCase):
 
 class HorizonTest(unittest.TestCase):
     def test_default_horizon(self) -> None:
-        cfg = Config(root_trust_anchors=frozenset({ROOT}))
+        cfg = Config(root_trust_anchors=frozenset({ROOT}), primary_salt=SALT_A)
         self.assertEqual(cfg.deletion_horizon_days, 180)
 
     def test_horizon_validated(self) -> None:

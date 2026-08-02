@@ -13,6 +13,7 @@
  * they arrived over RFed, LXMF, or a scanned QR code.
  */
 
+import { MsgPack } from "@reticulum/core";
 import { Operation } from "./operation.js";
 
 export class DeltaReceiver {
@@ -48,5 +49,60 @@ export class DeltaReceiver {
       return false; // malformed -> drop silently
     }
     return this._state.ingest(operation, this._resolver, options);
+  }
+
+  /**
+   * Authenticate and apply a *batch* of Deltas (§11.1, §11.2.4).
+   *
+   * The secure alternative to `StateVector.merge()` for network sync.
+   * `payload` is a MessagePack array of §5.3 Operation payloads
+   * (`MsgPack.encode([opA.toPayload(), opB.toPayload(), ...])`); each element
+   * is decoded and run through `applyPayload()`, i.e. it is independently
+   * Ed25519/threshold-authenticated before it may touch state. A single
+   * forged, stale (§9), or future-skewed (§12) element is dropped without
+   * affecting the rest of the batch.
+   *
+   * Returns the number of Deltas authenticated *and* applied. A malformed
+   * outer payload (not a MessagePack array, undecodable) yields `0` and is
+   * swallowed, so a transport callback can never crash on arbitrary bytes —
+   * exactly like `applyPayload()`.
+   *
+   * > **Warning:** This is the *only* safe entry point for full-state / bulk
+   * > convergence received over the network. `StateVector.merge()` /
+   * > `StateVector.fromPayload()` are trusted-local snapshot primitives that
+   * > perform **no** signature verification and **must not** be fed network
+   * > bytes.
+   *
+   * @param {Uint8Array} payload A MessagePack array of Operation payloads.
+   * @param {Object} [options]
+   * @param {number} [options.nowMs]
+   * @param {number | null} [options.maxFutureMs]
+   * @returns {Promise<number>}
+   */
+  async applyPayloads(payload, options = {}) {
+    let items;
+    try {
+      items = MsgPack.decode(payload);
+    } catch {
+      return 0; // malformed outer payload -> drop silently
+    }
+    if (!Array.isArray(items)) return 0;
+    let applied = 0;
+    for (const item of items) {
+      if (!(item instanceof Uint8Array)) continue; // skip non-bin elements
+      if (await this.applyPayload(item, options)) applied += 1;
+    }
+    return applied;
+  }
+
+  /**
+   * Encode a list of §5.3 Operation payloads as a batch (§11.1). Inverse of
+   * `applyPayloads()`: `MsgPack.encode([...])` of already-signed Operation
+   * payload byte-strings, suitable for publishing as one bulk sync message.
+   * @param {Uint8Array[]} operationPayloads
+   * @returns {Uint8Array}
+   */
+  static packPayloads(operationPayloads) {
+    return MsgPack.encode(operationPayloads.map((p) => new Uint8Array(p)));
   }
 }

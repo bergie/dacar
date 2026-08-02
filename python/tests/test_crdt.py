@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import unittest
+import warnings
 
-from dacar.crdt import DEFAULT_DELETION_HORIZON_DAYS, StateVector
+from dacar.crdt import DEFAULT_DELETION_HORIZON_DAYS, StateVector, TrustedLocalOnlyWarning
 from dacar.hlc import pack, unpack
 from dacar.namespace import HASH_SIZE, NamespaceHasher, SALT_SIZE
 from dacar.operation import Action, Operation
@@ -139,7 +140,12 @@ class SerializationTest(unittest.TestCase):
         state = StateVector()
         state.apply(_op(object_id="sensor:wind:north", relation="read"), now_ms=BASE_MS)
         state.apply(_op(object_id="sensor:wind", relation="-write", ms=BASE_MS + 1), now_ms=BASE_MS + 1)
-        restored = StateVector.from_payload(state.to_payload())
+        # to_payload()/from_payload() are trusted-local snapshot primitives
+        # (see TrustedLocalOnlyWarning); silence the warning for this genuine
+        # local round-trip.
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=TrustedLocalOnlyWarning)
+            restored = StateVector.from_payload(state.to_payload())
         self.assertEqual(len(restored), len(state))
         for t in state.active_tuples():
             self.assertTrue(restored.is_active(t.hash()))

@@ -13,6 +13,7 @@ older than the horizon are rejected outright (intake rejection, §9).
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from typing import Dict, Iterator, List, Optional
 
@@ -27,6 +28,28 @@ _MS_PER_DAY = 24 * 60 * 60 * 1000
 DEFAULT_MAX_FUTURE_MS: Optional[int] = _MS_PER_DAY
 #: Default deletion horizon H for Time-Horizon Tombstone Pruning (§9).
 DEFAULT_DELETION_HORIZON_DAYS = 180
+
+
+class TrustedLocalOnlyWarning(UserWarning):
+    """Emitted when a trusted-local-only CRDT API is exercised.
+
+    ``StateVector.from_payload()`` / ``StateVector.merge()`` /
+    ``StateVector.to_payload()`` are **snapshot/restore primitives for a node's
+    own trusted state**. They carry and merge no Ed25519 signature material,
+    so feeding them network bytes lets a peer forge arbitrary authorization
+    state (including Root Trust Anchor grants) and silently bypass the §9
+    stale-horizon and §12 future-skew intake checks that per-delta ingestion
+    enforces.
+
+    Network convergence MUST instead run each signed Operation through
+    :meth:`StateVector.ingest` (single) or
+    :meth:`dacar.delta.DeltaReceiver.apply_payloads` (batch). Silence this
+    warning only for genuine local snapshot/restore of your own state::
+
+        import warnings
+        from dacar.crdt import TrustedLocalOnlyWarning
+        warnings.filterwarnings("ignore", category=TrustedLocalOnlyWarning)
+    """
 
 
 @dataclass
@@ -127,7 +150,25 @@ class StateVector:
 
     # -- full-state merge (§6.1) --------------------------------------------
     def merge(self, other: "StateVector") -> None:
-        """Merge another StateVector by taking the max HLC per set per tuple."""
+        """Merge another StateVector by taking the max HLC per set per tuple.
+
+        .. warning:: **Trusted-local-only — never feed network bytes.**
+
+           ``merge()`` trusts its argument completely and performs **no**
+           signature verification, so it can inject or alter authorization
+           state (including Root Trust Anchor grants) for any tuple. It also
+           skips the §9 stale-horizon and §12 future-skew intake checks that
+           :meth:`apply`/ :meth:`ingest` enforce per-delta, so even a trusted
+           source can silently reintroduce operations per-delta ingestion
+           would have rejected.
+
+           Legitimate uses are confined to a node's own trusted state:
+           CRDT unit testing and restoring a snapshot previously produced by
+           :meth:`to_payload` on the *same* node. For network convergence use
+           :meth:`ingest` (single Delta) or
+           :meth:`dacar.delta.DeltaReceiver.apply_payloads` (batch of signed
+           Deltas) instead.
+        """
         for th, other_entry in other._entries.items():
             entry = self._entries.get(th)
             if entry is None:
@@ -181,6 +222,15 @@ class StateVector:
     def to_payload(self) -> bytes:
         """Serialize the full state vector as a MessagePack array of entries.
 
+        .. warning:: **Trusted-local-only.** The payload is an unauthenticated
+           dump of this node's CRDT and carries **no** Ed25519 signature
+           material; it exists for a node to snapshot *its own* state (e.g. a
+           local backup or CRDT unit test). It MUST NOT be accepted from the
+           network — deserialize such bytes only via your own trusted store,
+           and if it ever crosses a trust boundary use
+           :meth:`dacar.delta.DeltaReceiver.apply_payloads` (a batch of signed
+           §5.3 Operations) instead.
+
         Each entry is ``[relation_hash(16), [object_hashes], wildcard_bool,
         grantee(16), issuer(16), add_ts | nil, remove_ts | nil]``. The Tuple
         Hash is recoverable from the first five fields, so it is not stored.
@@ -204,7 +254,30 @@ class StateVector:
     def from_payload(
         cls, data: bytes, deletion_horizon_days: int = DEFAULT_DELETION_HORIZON_DAYS
     ) -> "StateVector":
-        """Deserialize a state vector produced by :meth:`to_payload`."""
+        """Deserialize a state vector produced by :meth:`to_payload`.
+
+        .. warning:: **Trusted-local-only — never feed network bytes.**
+
+           The payload carries **no** signature material, so deserializing
+           attacker bytes and then :meth:`merge`-ing it lets a peer forge
+           arbitrary authorization state (including Root Trust Anchor grants)
+           and silently bypass the §9 stale-horizon and §12 future-skew intake
+           checks. Only deserialize bytes from your own trusted store (a
+           snapshot you previously produced with :meth:`to_payload` on this
+           node). For network convergence use
+           :meth:`dacar.delta.DeltaReceiver.apply_payloads` (a batch of signed
+           §5.3 Operations) instead.
+
+           A :class:`TrustedLocalOnlyWarning` is emitted to make this
+           contract audible; filter it only for genuine local snapshot/restore.
+        """
+        warnings.warn(
+            "StateVector.from_payload() is trusted-local-only: it performs no "
+            "signature verification and must not be fed network bytes. For "
+            "network convergence use DeltaReceiver.apply_payloads() instead.",
+            TrustedLocalOnlyWarning,
+            stacklevel=2,
+        )
         rows = serialization.unpackb(data)
         if not isinstance(rows, list):
             raise ValueError("state vector payload must be a MessagePack array")

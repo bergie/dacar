@@ -39,9 +39,9 @@ def group_id(members: Iterable[bytes], threshold: int) -> bytes:
     for m in member_hashes:
         if len(m) != HASH_SIZE:
             raise ValueError(f"member hash must be {HASH_SIZE} bytes, got {m!r}")
-    if not 1 <= threshold < len(member_hashes):
+    if not 1 <= threshold <= len(member_hashes):
         raise ValueError(
-            f"threshold must satisfy 1 <= N < M (got N={threshold}, M={len(member_hashes)})"
+            f"threshold must satisfy 1 <= N <= M (got N={threshold}, M={len(member_hashes)})"
         )
     blob = b"".join(member_hashes) + int(threshold).to_bytes(_THRESHOLD_BYTES, "big")
     import hashlib

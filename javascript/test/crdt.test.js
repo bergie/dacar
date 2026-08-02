@@ -131,16 +131,28 @@ describe("StateVector merge (§6)", () => {
   });
 });
 
-describe("StateVector serialization", () => {
-  it("round-trips through MessagePack", async () => {
+describe("StateVector serialization (trusted-local-only snapshot/restore)", () => {
+  it("round-trips through MessagePack and warns trusted-local-only", async () => {
     const s = new StateVector();
     s.apply(await op({ object: "sensor:wind:north", relation: "read" }), { nowMs: BASE });
     s.apply(await op({ object: "sensor:wind", relation: "-write", ms: BASE + 1 }), { nowMs: BASE + 1 });
-    const restored = StateVector.fromPayload(s.toPayload());
+    const payload = s.toPayload();
+    const original = console.warn;
+    const calls = [];
+    console.warn = (/** @type {string} */ msg) => calls.push(String(msg));
+    let restored;
+    try {
+      restored = StateVector.fromPayload(payload);
+    } finally {
+      console.warn = original;
+    }
     assert.equal(restored.size, s.size);
     for (const t of s.activeTuples()) {
       assert.equal(restored.isActive(t.key), true);
     }
     assert.equal(DEFAULT_DELETION_HORIZON_DAYS, 180);
+    assert.equal(calls.length, 1);
+    assert.match(calls[0], /trusted-local-only/);
+    assert.match(calls[0], /applyPayloads/);
   });
 });

@@ -42,6 +42,13 @@ function maxBoth(a, b) {
   return a > b ? a : b;
 }
 
+/**
+ * Guard ensuring the trusted-local-only notice for `StateVector.fromPayload()`
+ * is logged at most once per process, so legitimate snapshot/restore does not
+ * flood logs while still flagging the footgun the first time.
+ */
+let __trustedLocalWarned = false;
+
 /** @param {number | bigint | null} value @returns {bigint | null} */
 function normalizeTs(value) {
   return value === null ? null : BigInt(value);
@@ -132,7 +139,23 @@ export class StateVector {
     return true;
   }
 
-  /** Merge another StateVector by taking the max HLC per set per tuple (§6.1). */
+  /**
+   * Merge another StateVector by taking the max HLC per set per tuple (§6.1).
+   *
+   * > **Warning: Trusted-local-only — never feed network bytes.**
+   * > `merge()` trusts its argument completely and performs **no** signature
+   * > verification, so it can inject or alter authorization state (including
+   * > Root Trust Anchor grants) for any tuple. It also skips the §9
+   * > stale-horizon and §12 future-skew intake checks that `apply()`/`ingest()`
+   * > enforce per-delta, so even a trusted source can silently reintroduce
+   * > operations per-delta ingestion would have rejected.
+   * >
+   * > Legitimate uses are confined to a node's own trusted state: CRDT unit
+   * > testing and restoring a snapshot previously produced by `toPayload()` on
+   * > the *same* node. For network convergence use `DeltaReceiver.applyPayloads()`
+   * > (a batch of signed Deltas) instead.
+   * @param {StateVector} other
+   */
   merge(other) {
     for (const [key, otherEntry] of other._entries) {
       let entry = this._entries.get(key);
@@ -194,6 +217,14 @@ export class StateVector {
    * Serialize the full state vector as a MessagePack array of entries. Each
    * entry is `[relationHash(16), [objectHashes], wildcard_bool, grantee(16),
    * issuer(16), addTs | null, removeTs | null]`.
+   *
+   * > **Warning: Trusted-local-only.** The payload is an unauthenticated dump
+   * > of this node's CRDT and carries **no** Ed25519 signature material; it
+   * > exists for a node to snapshot *its own* state (e.g. a local backup or
+   * > CRDT unit test). It MUST NOT be accepted from the network — deserialize
+   * > such bytes only via your own trusted store, and if it ever crosses a
+   * > trust boundary use `DeltaReceiver.applyPayloads()` (a batch of signed
+   * > §5.3 Operations) instead.
    * @returns {Uint8Array}
    */
   toPayload() {
@@ -214,12 +245,32 @@ export class StateVector {
 
   /**
    * Deserialize a state vector produced by `toPayload()`.
+   *
+   * > **Warning: Trusted-local-only — never feed network bytes.** The payload
+   * > carries **no** signature material, so deserializing attacker bytes and
+   * > then `merge()`-ing it lets a peer forge arbitrary authorization state
+   * > (including Root Trust Anchor grants) and silently bypass the §9
+   * > stale-horizon and §12 future-skew intake checks. Only deserialize bytes
+   * > from your own trusted store (a snapshot you previously produced with
+   * > `toPayload()` on this node). For network convergence use
+   * > `DeltaReceiver.applyPayloads()` (a batch of signed §5.3 Operations)
+   * > instead.
+   * >
+   * > A one-time `console.warn` is emitted to make this contract audible.
    * @param {Uint8Array} data
    * @param {Object} [opts]
    * @param {number} [opts.deletionHorizonDays]
    * @returns {StateVector}
    */
   static fromPayload(data, { deletionHorizonDays = DEFAULT_DELETION_HORIZON_DAYS } = {}) {
+    if (!__trustedLocalWarned) {
+      __trustedLocalWarned = true;
+      console.warn(
+        "StateVector.fromPayload() is trusted-local-only: it performs no " +
+          "signature verification and must not be fed network bytes. For " +
+          "network convergence use DeltaReceiver.applyPayloads() instead.",
+      );
+    }
     const rows = MsgPack.decode(data);
     if (!Array.isArray(rows)) {
       throw new Error("state vector payload must be a MessagePack array");
