@@ -26,17 +26,14 @@ dependencies = [
     "cryptography>=2.8",
     # Transport serialization (Dacar spec §5.3).
     "msgpack>=1.0",
-]
-
-[project.optional-dependencies]
-# The pure core (crypto, CRDT, engine, verifier, challenge logic) has no RNS
-# dependency. The transport adapters (§8 RNS-Link, §11.2 LXMF, §11.3 Paper)
-# live in ``dacar.transport`` and pull in Reticulum's own Python stack.
-transport = [
     # Reticulum Network Stack — §8 Challenge Link, future RFed adapter.
     "rns>=1.4",
     # LXMF — §11.2 targeted Delta delivery + §11.3 Paper Messages.
     "lxmf>=0.3",
+]
+
+[project.optional-dependencies]
+transport = [
 ]
 
 [project.urls]
