@@ -31,14 +31,17 @@
   "license": "EUPL-1.2",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/earendil-works/dacar.git",
+    "url": "git+https://github.com/bergie/dacar.git",
     "directory": "javascript"
   },
-  "homepage": "https://github.com/earendil-works/dacar#readme",
+  "homepage": "https://github.com/bergie/dacar#readme",
   "engines": {
     "node": ">=20"
   },
   "dependencies": {
     "@reticulum/core": "^0.5.3"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

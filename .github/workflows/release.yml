@@ -1,0 +1,119 @@
+# Dacar — release publisher.
+#
+# Publishes all three artifacts when a `v*` tag is pushed, and can be triggered
+# manually from the Actions tab (toggle "dry_run" to validate packaging without
+# uploading anything).
+#
+#   * PyPI  build sdist+wheel (make release-python-dry) + upload via OIDC
+#           trusted publishing (pypa/gh-action-pypi-publish). No API token.
+#   * npm   npm publish --provenance with an NPM_TOKEN secret. Prereleases are
+#           dist-tagged (NPM_DIST_TAG) — a stable release sets NPM_DIST_TAG=latest.
+#   * JSR   deno publish; JSR authenticates to this repo via GitHub OIDC.
+#
+# Before tagging, bump the version in all THREE configs in lockstep:
+#   python/pyproject.toml, javascript/package.json, javascript/jsr.json
+#
+# One-time registry setup (see file header of each job below for details):
+#   PyPI trusted publisher, npm NPM_TOKEN secret (+ provenance for the org),
+#   and link the @reticulum JSR scope to this repo.
+#
+# Releases assume the tagged commit already passed test.yml.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Validate packaging without uploading"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  pypi:
+    # Trusted publishing (OIDC). Configure once at https://pypi.org:
+    #   Add a publisher  ->  GitHub  ->  owner: <this repo owner>,
+    #   repository: <name>, workflow: release.yml, environment: (leave blank).
+    name: PyPI
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tooling
+        run: python -m pip install --upgrade build twine
+
+      - name: Build sdist + wheel and validate metadata
+        run: make release-python-dry
+
+      - name: Publish to PyPI (OIDC trusted publishing)
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: python/dist/
+
+  npm:
+    # Needs secret NPM_TOKEN (automation/granular publish token for the
+    # @reticulum scope) and provenance enabled for the npm org.
+    name: npm
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Publish to npm (provenance, dist-tag rc)
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: make release-js NPM_PUBLISH_FLAGS="--access public --provenance"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Validate packaging (dry-run)
+        if: ${{ github.event.inputs.dry_run == 'true' }}
+        run: make release-js-dry
+
+  jsr:
+    # No token: JSR authenticates via GitHub OIDC. Link the @reticulum scope to
+    # this repository once at https://jsr.io.
+    name: JSR
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Publish to JSR
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: make release-jsr
+
+      - name: Validate packaging (dry-run)
+        if: ${{ github.event.inputs.dry_run == 'true' }}
+        run: make release-jsr-dry

@@ -1,6 +1,7 @@
 {
   "name": "@reticulum/dacar",
   "version": "1.0.0-rc.7",
+  "license": "EUPL-1.2",
   "exports": {
     ".": "./src/index.js",
     "./transport": "./src/transport/index.js"

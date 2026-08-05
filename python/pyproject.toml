@@ -9,7 +9,7 @@ description = "Python implementation of Dacar, a Decentralized Access Control sy
 readme = "README.md"
 license = { text = "EUPL-1.2" }
 requires-python = ">=3.9"
-authors = [{ name = "Dacar Project" }]
+authors = [{ name = "Henri Bergius" }]
 keywords = ["reticulum", "rns", "access-control", "authorization", "crdt", "mesh", "offline"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -37,7 +37,11 @@ transport = [
 ]
 
 [project.urls]
-Specification = "https://github.com/earendil-works/dacar"
+Homepage = "https://github.com/bergie/dacar"
+Repository = "https://github.com/bergie/dacar"
+Issues = "https://github.com/bergie/dacar/issues"
+Specification = "https://github.com/bergie/dacar/blob/main/SPEC.md"
+Changelog = "https://github.com/bergie/dacar/releases"
 
 [tool.setuptools]
 packages = ["dacar", "dacar.transport"]
