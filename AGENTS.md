@@ -18,6 +18,7 @@ When planning new work, there should always be a corresponding work document cre
 - ✅ **Always**: ensure type safety.
 - ✅ **Always**: use consistent formatting on per-language level
 - ✅ **Always**: Use `git mv` instead of `mv' for renaming files
+- ✅ **Always**: document any major changes in the `CHANGELOG.md`. Changes always go to the Unreleased segment
 - ⚠️ **Ask first**: adding dependencies
 - ⚠️ **Ask first**: modify CI config
 - 🚫 **Never**: AI agents may not make commits on their own, instead notify user that there are uncommitted changes to review
