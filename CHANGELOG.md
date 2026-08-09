@@ -5,7 +5,7 @@ All notable changes to Dacar will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.0.0-RC7] - 2024-08-08
+## [1.0.0] - 2024-08-08
 
 ### Added
 - Initial release of Dacar specification (v1.0-RC7)

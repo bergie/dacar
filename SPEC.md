@@ -1,5 +1,5 @@
 # Specification: Dacar (Decentralized Access Control for Reticulum)
-**Version:** 1.0-RC7
+**Version:** 1.0
 **License:** EUPL-1.2
 **Dependencies:** Reticulum Network Stack (RNS), LWW-Element-Set CRDT, MessagePack
 ## 1. Introduction
