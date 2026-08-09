@@ -26,6 +26,10 @@ dependencies = [
     "cryptography>=2.8",
     # Transport serialization (Dacar spec §5.3).
     "msgpack>=1.0",
+    # Reticulum Network Stack. The `dacar` CLI keeps an RNS Identity in its
+    # store, and the §8 Challenge / §11.2.4 identity-recall transport adapters
+    # build on RNS. (The LXMF §11.2/§11.3 adapters stay opt-in below.)
+    "rns>=1.4",
 ]
 
 [project.scripts]
@@ -33,9 +37,8 @@ dacar = "dacar.cli:main"
 
 [project.optional-dependencies]
 transport = [
-    # Reticulum Network Stack — §8 Challenge Link, future RFed adapter.
-    "rns>=1.4",
     # LXMF — §11.2 targeted Delta delivery + §11.3 Paper Messages.
+    # The §8 RNS Challenge adapters use `rns`, which is a base dependency.
     "lxmf>=0.3",
 ]
 

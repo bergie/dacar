@@ -29,7 +29,7 @@ help: ## Show this help
 	@echo "  test      run tests for every implementation"
 	@echo "  clean     remove build/test artifacts"
 	@echo
-	@echo "  install-python   $(PYTHON) -m pip install -e ."
+	@echo "  install-python   $(PYTHON) -m pip install -e .[transport]"
 	@echo "  test-python      $(PYTHON) -m unittest discover -s tests"
 	@echo "  install-js       npm install"
 	@echo "  test-js          node/deno/bun (whichever are installed)"
@@ -46,8 +46,8 @@ test: test-python test-js
 clean: clean-python clean-js
 
 # --- python ----------------------------------------------------------------
-install-python: ## Install Python dependencies
-	cd python && $(PYTHON) -m pip install -e .
+install-python: ## Install Python dependencies (core + transport extra)
+	cd python && $(PYTHON) -m pip install -e ".[transport]"
 
 test-python: ## Run Python tests
 	cd python && $(PYTHON) -m unittest discover -s tests

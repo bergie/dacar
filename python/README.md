@@ -15,18 +15,20 @@ that terminate at configured Root Trust Anchors.
 | Ed25519 (§5.2)    | [`cryptography`](https://cryptography.io) | Same backend RNS (Reticulum) selects when present |
 | SHA-256 / HMAC (§3.3, §6.1) | stdlib `hashlib` / `hmac`   | In the standard library                        |
 | MessagePack (§5.3)| `msgpack`                                | Spec-listed dependency                         |
+| RNS Identity / §8 Challenge | [`rns`](https://reticulum.network) (Reticulum) | The `dacar` CLI keeps an RNS Identity; §8 transport adapters build on RNS |
 
 ## Install
 
 ```bash
 cd python
-pip install -e .            # pure core + the `dacar` CLI: cryptography + msgpack only
-pip install -e ".[transport]"  # + the §8/§11 RNS & LXMF transport adapters
+pip install -e .            # core + the `dacar` CLI (cryptography, msgpack, rns)
+pip install -e ".[transport]"  # + the §11.2/§11.3 LXMF transport adapters (lxmf)
 ```
 
-The pure core has **no RNS dependency**. `import dacar` never pulls in the
-`dacar.transport` subpackage (the `rns`/`lxmf` packages); those adapters are
-opt-in via the `transport` extra. The `dacar` command is part of the base
+The pure core stays import-clean: `import dacar` never pulls in the
+`dacar.transport` subpackage. `rns` is a base dependency (the `dacar` CLI
+keeps an RNS Identity, and the §8 transport adapters build on it); only `lxmf`
+is opt-in, via the `transport` extra. The `dacar` command is part of the base
 install — `pip install dacar` gives a working `dacar` CLI with no extras.
 
 ## Layout
@@ -61,7 +63,8 @@ dacar/
     store.py           persistent node store (INI config, identity, HLC clock,
                        CRDT state, rnns aliases, plaintext ledger)
     commands.py        command implementations + identity/tuple rendering
-  transport/      §8, §11.2, §11.3  optional RNS/LXMF adapters (`transport` extra):
+  transport/      §8, §11.2, §11.3  RNS & LXMF adapters (`rns` is a base dep; `lxmf`
+                    needs the `transport` extra):
     rns_challenge.py  §8 Challenge over an RNS Link (server endpoint + client transport)
     rns_identity.py   §3.1, §11.2.4  RnsIdentityResolver (recall → verify key)
     lxmf_sync.py      §11.2/§11.3 targeted LXMF Delta delivery + Paper Messages
@@ -110,7 +113,7 @@ state** (§11.2.4), and only then merges it. A `KeyResolver` maps an Operation's
 
 - **`Keyring`** — a dict-backed resolver for offline / air-gapped / test use; you
   register each Issuer hash → keyset out of band.
-- **`RnsIdentityResolver`** (`dacar[transport]`) — resolves a single-identity
+- **`RnsIdentityResolver`** (base; needs `rns`) — resolves a single-identity
   Issuer by **recalling the `RNS.Identity` behind its hash from the network's
   announce store**, with no out-of-band key exchange. Threshold Groups (composite
   IDs RNS cannot recall) and any out-of-band identities fall through to an
