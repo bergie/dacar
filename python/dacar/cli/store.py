@@ -29,6 +29,7 @@ from dacar import serialization
 from dacar.config import Config, DEFAULT_DELETION_HORIZON_DAYS
 from dacar.crdt import StateVector, TrustedLocalOnlyWarning
 from dacar.hlc import Clock
+from dacar.naming import RFED_TOPIC
 from dacar.namespace import DEFAULT_SALT, HASH_SIZE, MAX_LEGACY_SALTS, SALT_SIZE
 from dacar.verifier import Keyring
 
@@ -399,6 +400,8 @@ class Store:
         anchors: List[bytes],
         authoritative: Optional[bytes],
         horizon_days: int,
+        rfed_topic: str = RFED_TOPIC,
+        rfed_node: Optional[bytes] = None,
     ) -> None:
         parser = configparser.ConfigParser()
         parser["salt"] = {"primary": primary_salt.hex()}
@@ -408,6 +411,9 @@ class Store:
         if authoritative is not None:
             parser["trust"]["authoritative"] = authoritative.hex()
         parser["policy"] = {"deletion_horizon_days": str(horizon_days)}
+        parser["rfed"] = {"topic": rfed_topic}
+        if rfed_node is not None:
+            parser["rfed"]["node"] = rfed_node.hex()
         with open(self.config_path, "w") as fh:
             parser.write(fh)
         os.chmod(self.config_path, SECRET_MODE)
@@ -429,12 +435,22 @@ class Store:
             authoritative = _hex(parser.get("trust", "authoritative"), 16)
         horizon = parser.getint("policy", "deletion_horizon_days",
                                 fallback=DEFAULT_DELETION_HORIZON_DAYS)
+        rfed_topic = RFED_TOPIC
+        rfed_node: Optional[bytes] = None
+        if parser.has_section("rfed"):
+            rfed_topic = parser.get("rfed", "topic", fallback=RFED_TOPIC)
+            if parser.has_option("rfed", "node"):
+                node_hex = parser.get("rfed", "node").strip()
+                if node_hex:
+                    rfed_node = _hex(node_hex, 16)
         return {
             "primary_salt": primary,
             "legacy_salts": tuple(legacy),
             "anchors": anchors,
             "authoritative": authoritative,
             "horizon_days": horizon,
+            "rfed_topic": rfed_topic,
+            "rfed_node": rfed_node,
         }
 
     def load_config(self) -> Config:
@@ -466,6 +482,8 @@ class Store:
         anchors: Optional[List[bytes]] = None,
         authoritative: Optional[bytes] = None,
         horizon_days: Optional[int] = None,
+        rfed_topic: Optional[str] = None,
+        rfed_node: Optional[bytes] = None,
     ) -> None:
         """Write the INI config, preserving unspecified fields from disk."""
         raw = self.load_config_raw() if self.exists() else {}
@@ -477,6 +495,8 @@ class Store:
             horizon_days=horizon_days if horizon_days is not None else raw.get(
                 "horizon_days", DEFAULT_DELETION_HORIZON_DAYS
             ),
+            rfed_topic=rfed_topic if rfed_topic is not None else raw.get("rfed_topic", RFED_TOPIC),
+            rfed_node=rfed_node if rfed_node is not None else raw.get("rfed_node"),
         )
 
     # -- identity -----------------------------------------------------------
@@ -529,8 +549,9 @@ class Store:
             anchors=anchors,
             authoritative=raw["authoritative"],
             horizon_days=raw["horizon_days"],
+            rfed_topic=raw.get("rfed_topic", RFED_TOPIC),
+            rfed_node=raw.get("rfed_node"),
         )
-
         # Re-point the ``self`` alias.
         aliases = self.load_aliases()
         aliases.set_self(new_identity.hash)

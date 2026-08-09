@@ -21,6 +21,7 @@ from typing import List, Optional, Tuple as _Tuple
 from dacar import Action, Engine, Operation, Tuple
 from dacar.delta import DeltaReceiver
 from dacar.hlc import unpack
+from dacar.naming import RFED_TOPIC
 from dacar.namespace import DEFAULT_SALT, covers
 
 from dacar.cli.store import (
@@ -169,6 +170,10 @@ def cmd_config_show(args) -> int:
         _err(f"  authoritative : {render_identity(raw['authoritative'], aliases, full=full)}")
     _err("[policy]")
     _err(f"  deletion_horizon_days : {raw['horizon_days']}")
+    _err("[rfed]")
+    _err(f"  topic : {raw.get('rfed_topic', RFED_TOPIC)}")
+    node = raw.get("rfed_node")
+    _err(f"  node  : {render_identity(node, aliases, full=full) if node else '(not set)'}")
     _err(f"[aliases] {len(aliases.entries)} entries ({store.aliases_path})")
     if raw["primary_salt"] == DEFAULT_SALT:
         _err("WARNING: primary salt is the default null (§3.3 fail-open on privacy).")
@@ -430,6 +435,8 @@ def _issue(args, action: Action) -> int:
         _err("  (not applied locally: --no-apply)")
     elif applied:
         _err("  (applied locally)")
+    if getattr(args, "publish", False):
+        _publish_delta(args, store, identity, payload)
     return EXIT_OK
 
 
@@ -769,4 +776,144 @@ def cmd_ledger_annotate(args) -> int:
             row["relation"] = args.relation
     store.save_ledger(ledger)
     _err(f"✔ annotated tuple {tuple_hash[:SHORT_HASH_HEX].hex()}…")
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# Online commands (work doc #4 — one-shot, no daemon)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_rfed_node(args, store: Store, aliases: AliasRegistry) -> bytes:
+    """Resolve the rfed node identity hash from --node or [rfed] node config."""
+    node = getattr(args, "node", None)
+    if node:
+        return resolve_identity(node, aliases)
+    raw = store.load_config_raw()
+    if raw.get("rfed_node"):
+        return raw["rfed_node"]
+    raise CliError(
+        "no rfed node configured (use --node <hash> or set [rfed] node in config)"
+    )
+
+
+def _resolve_topic(args, store: Store) -> str:
+    """Resolve the rfed topic from --topic or [rfed] topic config."""
+    topic = getattr(args, "topic", None)
+    if topic:
+        return topic
+    raw = store.load_config_raw()
+    return raw.get("rfed_topic", RFED_TOPIC)
+
+
+def _resolve_rns_config_dir(args) -> str:
+    """Resolve the RNS config directory per the priority order (work doc #4)."""
+    from dacar.cli.rns import resolve_config_dir
+    return resolve_config_dir(
+        explicit=getattr(args, "rns_config", None),
+        store_path=args.store,
+    )
+
+
+def run_publish(
+    identity: object,
+    payload: bytes,
+    node_hash: bytes,
+    topic: str,
+    client: object,
+) -> None:
+    """Publish a signed Delta to the rfed channel (§11.1, work doc #4).
+
+    Testable core: takes an explicit ``client`` (RFedClient or compatible fake)
+    so tests inject doubles without booting RNS. The ``cmd_*`` wrappers handle
+    RNS boot + announce + real client creation.
+    """
+    from dacar.transport.rfed_sync import RfedDeltaSync
+    sync = RfedDeltaSync(client=client, topic=topic)
+    sync.subscribe(node_hash)
+    sync.publish(payload, node_hash)
+
+
+def run_sync(
+    store: Store,
+    state: object,
+    node_hash: bytes,
+    topic: str,
+    client: object,
+    receiver: DeltaReceiver,
+) -> int:
+    """Pull pending Deltas from the rfed channel and apply via verify-on-ingest.
+
+    Testable core: takes an explicit ``client`` and ``receiver`` so tests inject
+    doubles. Routes every blob through :meth:`DeltaReceiver.apply_payload`
+    (§11.2.4) — never through the unauthenticated ``StateVector.merge`` path.
+    Persists the CRDT if any Delta was applied. Returns the count applied.
+    """
+    from dacar.transport.rfed_sync import RfedDeltaSync
+    sync = RfedDeltaSync(receiver=receiver, client=client, topic=topic)
+    sync.subscribe(node_hash)
+    applied = sync.pull(node_hash)
+    if applied > 0:
+        store.save_state(state)
+    return applied
+
+
+def _publish_delta(args, store: Store, identity, payload: bytes) -> None:
+    """Online publish hook for ``grant --publish`` / ``revoke --publish``."""
+    from dacar.cli.rns import announce_identity, boot
+    from dacar.rfed.client import RFedClient
+
+    aliases = store.load_aliases()
+    node_hash = _resolve_rfed_node(args, store, aliases)
+    topic = _resolve_topic(args, store)
+
+    config_dir = _resolve_rns_config_dir(args)
+    rns = boot(config_dir)
+    announce_identity(identity)  # announce invariant (§11.2.4)
+
+    client = RFedClient(identity=identity, rns=rns)
+    run_publish(identity, payload, node_hash, topic, client)
+    _err(f"  published to rfed channel {topic!r} via "
+         f"{_short(node_hash, full=args.full_hashes)}")
+
+
+def cmd_sync(args) -> int:
+    """``dacar sync`` — pull pending Deltas from the rfed channel (§11.1).
+
+    One-shot: attach-or-spawn RNS, announce the node identity, subscribe +
+    pull (drain to empty), route every blob through verify-on-ingest, persist
+    the CRDT, exit. No daemon — store-and-forward means transient online windows
+    suffice (work doc #4).
+    """
+    from dacar.cli.rns import announce_identity, boot
+    from dacar.rfed.client import RFedClient
+    from dacar.transport.rns_identity import RnsIdentityResolver
+
+    store = Store(args.store, identity_override=args.identity)
+    store.ensure()
+    config = store.load_config()
+    aliases = store.load_aliases()
+
+    identity = store.load_identity()
+    if identity is None:
+        raise CliError("no signing identity (run `dacar init` or `dacar identity new`)")
+
+    node_hash = _resolve_rfed_node(args, store, aliases)
+    topic = _resolve_topic(args, store)
+
+    # Boot RNS + announce (announce invariant, §11.2.4).
+    config_dir = _resolve_rns_config_dir(args)
+    rns = boot(config_dir)
+    announce_identity(identity)
+
+    # Receiver: RNS-first resolver (announced identities) + local keyring
+    # fallback (node's own identity + --identity overrides).
+    state = store.load_state(config)
+    resolver = RnsIdentityResolver(fallback=store.keyring_for_verify())
+    rx = DeltaReceiver(state, resolver)
+
+    client = RFedClient(identity=identity, rns=rns)
+    applied = run_sync(store, state, node_hash, topic, client, rx)
+
+    _err(f"✔ synced: applied {applied} delta(s) from rfed channel {topic!r}")
     return EXIT_OK

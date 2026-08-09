@@ -26,6 +26,7 @@ import sys
 from typing import List, Optional
 
 from dacar.config import DEFAULT_DELETION_HORIZON_DAYS
+from dacar.naming import RFED_TOPIC
 from dacar.namespace import MAX_LEGACY_SALTS
 
 from dacar.cli.commands import CliError, EXIT_FAIL, EXIT_OK
@@ -49,6 +50,16 @@ def _add_global_flags(parser: argparse.ArgumentParser) -> None:
                         help="path to an RNS Identity file overriding the signing identity")
     parser.add_argument("-v", "--full-hashes", action="store_true",
                         help="show full 32-hex identity hashes instead of short prefixes")
+
+
+def _add_online_flags(parser: argparse.ArgumentParser) -> None:
+    """Flags for online commands (grant --publish, sync) that open RNS."""
+    parser.add_argument("--node", default=None,
+                        help="rfed node identity hash or alias (default: [rfed] node in config)")
+    parser.add_argument("--topic", default=None,
+                        help=f"rfed channel topic (default: {RFED_TOPIC!r} or [rfed] topic in config)")
+    parser.add_argument("--rns-config", default=None,
+                        help="RNS config directory (default: ~/.reticulum or $DACAR_RNS_CONFIG)")
 
 
 def _store_path(args) -> str:
@@ -130,8 +141,17 @@ def build_parser() -> argparse.ArgumentParser:
                        help=f"use legacy salt index 0-{MAX_LEGACY_SALTS - 1} (§10.3)")
         p.add_argument("--copy-hashes", default=None,
                        help="revoke by exact pre-hashed tuple fields from a file (no salt)")
+        p.add_argument("--publish", action="store_true",
+                       help="publish the signed Delta to the rfed channel (online, §11.1)")
+        _add_online_flags(p)
         _add_global_flags(p)
         p.set_defaults(func=_cmd_grant if name == "grant" else _cmd_revoke)
+
+    # -- sync ---------------------------------------------------------------
+    p = sub.add_parser("sync", help="pull pending Deltas from the rfed channel (online, §11.1)")
+    _add_online_flags(p)
+    _add_global_flags(p)
+    p.set_defaults(func=_cmd_sync)
 
     # -- apply --------------------------------------------------------------
     p = sub.add_parser("apply", help="ingest a received delta payload (verify-on-ingest)")
@@ -325,6 +345,12 @@ def _cmd_ledger_annotate(args):
     from dacar.cli.commands import cmd_ledger_annotate
     args.store = _store_path(args)
     return cmd_ledger_annotate(args)
+
+
+def _cmd_sync(args):
+    from dacar.cli.commands import cmd_sync
+    args.store = _store_path(args)
+    return cmd_sync(args)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
