@@ -5,6 +5,10 @@ Stack). The pure ``dacar`` core has no such dependency: ``import dacar`` does
 not import this subpackage.
 """
 
+from dacar.transport.rfed_sync import (  # noqa: F401
+    RfedDeltaSync,
+    message_content,
+)
 from dacar.transport.rns_challenge import (  # noqa: F401
     CHALLENGE_REQUEST_PATH,
     DEFAULT_CHALLENGE_TIMEOUT,
@@ -27,6 +31,8 @@ __all__ = [
     "challenge_request_handler",
     "establish_link",
     "RnsIdentityResolver",
+    "RfedDeltaSync",
+    "message_content",
 ]
 
 # §11.2/§11.3 LXMF adapters need the ``lxmf`` package. Import gracefully so a

@@ -5,6 +5,18 @@ All notable changes to Dacar will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Python `RfedDeltaSync` transport adapter (§11.1) — wraps the RFed client
+  and routes received Deltas through the shared `DeltaReceiver`
+  verify-on-ingest seam, mirroring the JavaScript implementation. The RFed
+  client subpackage (`dacar.rfed`) is now packaged and ships in the wheel.
+- `dacar.rfed` smoketests (`tests/test_transport_rfed.py`): publish wraps the
+  Delta under the `dacar/sync/delta` title; `listen`/`pull` route through
+  verify-on-ingest and swallow malformed/forged payloads; `pull` unwraps a
+  real EC-encrypted rfed `inner_blob` end-to-end.
+
 ## [1.0.0] - 2024-08-08
 
 ### Added

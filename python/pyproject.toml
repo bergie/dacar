@@ -50,4 +50,4 @@ Specification = "https://github.com/bergie/dacar/blob/main/SPEC.md"
 Changelog = "https://github.com/bergie/dacar/releases"
 
 [tool.setuptools]
-packages = ["dacar", "dacar.transport", "dacar.cli"]
+packages = ["dacar", "dacar.transport", "dacar.rfed", "dacar.cli"]
