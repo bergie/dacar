@@ -83,6 +83,9 @@ jobs:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
 
+      - name: Install deps
+        run: make install-js
+
       - name: Publish to npm (provenance, dist-tag rc)
         if: ${{ github.event.inputs.dry_run != 'true' }}
         run: make release-js NPM_PUBLISH_FLAGS="--access public --provenance"
@@ -109,6 +112,9 @@ jobs:
         uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
+
+      - name: Install deps
+        run: cd javascript && deno install
 
       - name: Publish to JSR
         if: ${{ github.event.inputs.dry_run != 'true' }}
