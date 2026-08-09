@@ -31,7 +31,7 @@ from dacar.crdt import StateVector, TrustedLocalOnlyWarning
 from dacar.hlc import Clock
 from dacar.naming import RFED_TOPIC
 from dacar.namespace import DEFAULT_SALT, HASH_SIZE, MAX_LEGACY_SALTS, SALT_SIZE
-from dacar.verifier import Keyring
+from dacar.verifier import Keyring, _PUBLIC_KEY_SIZE
 
 #: File modes.
 DIR_MODE = 0o700
@@ -47,6 +47,7 @@ CLOCK_NAME = "clock.msgpack"
 STATE_NAME = "state.msgpack"
 ALIASES_NAME = "aliases"
 LEDGER_NAME = "ledger.msgpack"
+IDENTITIES_NAME = "identities.msgpack"
 
 
 def _generate_salt() -> bytes:
@@ -321,6 +322,10 @@ class Store:
     def ledger_path(self) -> Path:
         return self.path / LEDGER_NAME
 
+    @property
+    def identities_path(self) -> Path:
+        return self.path / IDENTITIES_NAME
+
     def exists(self) -> bool:
         return self.config_path.exists()
 
@@ -559,13 +564,14 @@ class Store:
         return (old_hash if old_hash is not None else b""), new_identity.hash
 
     def keyring_for_verify(self) -> Keyring:
-        """Build a verify-on-ingest keyring from resolvable identity files.
+        """Build a verify-on-ingest keyring from the persisted cache + own identity.
 
-        Offline v1 resolves the node's own identity and any ``--identity PATH``
-        override. Issuers RNS cannot resolve offline are dropped (§11.2.4) —
-        not silently trusted.
+        The durable issuer cache (work doc #5) is loaded as the base so issuers
+        observed in a prior session (or seeded via ``identity remember``) are
+        resolvable without a live re-announce. The node's own identity is
+        registered on top so self-signed Deltas always verify.
         """
-        keyring = Keyring()
+        keyring = self.load_keyring()
         own = self.load_identity()
         if own is not None:
             keyring.register_single(own.hash, own.sig_pub_bytes)
@@ -639,6 +645,46 @@ class Store:
         data = serialization.packb(ledger.rows)
         self.ledger_path.write_bytes(data)
         os.chmod(self.ledger_path, SECRET_MODE)
+
+    # -- issuer identity cache (work doc #5) ---------------------------------
+    def load_keyring(self) -> Keyring:
+        """Load the persisted issuer identity cache (work doc #5).
+
+        Returns an empty :class:`Keyring` if no cache file exists yet. The
+        on-disk format is ``{hash_hex: sig_pub_bytes}`` — single-identity
+        entries only; threshold-group keysets are a separate (future) item.
+        """
+        keyring = Keyring()
+        if self.identities_path.exists():
+            data = self.identities_path.read_bytes()
+            if data:
+                obj = serialization.unpackb(data)
+                if isinstance(obj, dict):
+                    for hash_hex, sig_pub in obj.items():
+                        h = (hash_hex.decode("utf-8")
+                              if isinstance(hash_hex, (bytes, bytearray)) else hash_hex)
+                        if isinstance(sig_pub, (bytes, bytearray)) and len(sig_pub) == _PUBLIC_KEY_SIZE:
+                            try:
+                                keyring.register_single(bytes.fromhex(h), bytes(sig_pub))
+                            except ValueError:
+                                continue  # skip malformed hash
+        return keyring
+
+    def save_keyring(self, keyring: Keyring) -> None:
+        """Persist the issuer identity cache (work doc #5).
+
+        Serializes single-identity entries as ``{hash_hex: sig_pub_bytes}``,
+        mode ``0600``. Threshold-group keysets are skipped (out of scope: a
+        poisoned cache entry causes a signature mismatch → drop, not a trust
+        breach — design decision #2).
+        """
+        obj = {}
+        for issuer_hash, keyset in keyring.entries():
+            if keyset.threshold == 1 and len(keyset.member_public_keys) == 1:
+                obj[issuer_hash.hex()] = bytes(keyset.member_public_keys[0])
+        data = serialization.packb(obj)
+        self.identities_path.write_bytes(data)
+        os.chmod(self.identities_path, SECRET_MODE)
 
 
 class StoreError(Exception):

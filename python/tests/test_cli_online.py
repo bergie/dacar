@@ -40,6 +40,7 @@ from dacar.cli.rns import (
     ensure_default_config,
     DEFAULT_CONFIG,
     ENV_RNS_CONFIG,
+    DacarAnnounceHandler,
 )
 
 from tests._rns_fixture import ensure_headless
@@ -700,6 +701,496 @@ class CliOnlineParserTest(unittest.TestCase):
         parser = build_parser()
         args = parser.parse_args(["grant", "alice", "read", "sensor:wind"])
         self.assertFalse(args.publish)
+
+
+# ===========================================================================
+# Durable issuer identity cache (work doc #5)
+# ===========================================================================
+
+
+class KeyringCacheTest(unittest.TestCase):
+    """``Store.save_keyring``/``load_keyring`` round-trip + ``0600`` mode (doc #5 #1)."""
+
+    def setUp(self):
+        self.store_dir = Path(tempfile.mkdtemp(prefix="dacar-cache-"))
+        Store.init(self.store_dir, salt=SALT)
+        self.store = Store(self.store_dir)
+
+    def test_roundtrip_single_identity_entries(self):
+        """save/load preserves hash→pubkey mappings."""
+        id_a = RNS.Identity()
+        id_b = RNS.Identity()
+        keyring = Keyring()
+        keyring.register_single(id_a.hash, id_a.sig_pub_bytes)
+        keyring.register_single(id_b.hash, id_b.sig_pub_bytes)
+        self.store.save_keyring(keyring)
+
+        loaded = self.store.load_keyring()
+        self.assertIn(id_a.hash, loaded)
+        self.assertIn(id_b.hash, loaded)
+        ks_a = loaded.resolve(id_a.hash)
+        self.assertEqual(ks_a.member_public_keys[0], id_a.sig_pub_bytes)
+
+    def test_empty_keyring_when_no_file(self):
+        """A fresh store has no cache file; load returns an empty Keyring."""
+        keyring = self.store.load_keyring()
+        self.assertEqual(len(keyring), 0)
+
+    def test_persisted_file_is_mode_0600(self):
+        """The cache file holds public keys; it must be owner-only (doc #5 #1)."""
+        import stat
+        id_a = RNS.Identity()
+        keyring = Keyring()
+        keyring.register_single(id_a.hash, id_a.sig_pub_bytes)
+        self.store.save_keyring(keyring)
+        mode = stat.S_IMODE(self.store.identities_path.stat().st_mode)
+        self.assertEqual(mode, 0o600)
+
+    def test_overwrite_on_resave(self):
+        """Re-saving replaces the file (no append / no stale entries)."""
+        id_a = RNS.Identity()
+        keyring = Keyring()
+        keyring.register_single(id_a.hash, id_a.sig_pub_bytes)
+        self.store.save_keyring(keyring)
+        # Save an empty keyring — the file should now be empty.
+        self.store.save_keyring(Keyring())
+        self.assertEqual(len(self.store.load_keyring()), 0)
+
+
+class AnnounceHandlerTest(unittest.TestCase):
+    """``DacarAnnounceHandler`` seeds from ``dacar.node``, ignores non-dacar (doc #5 #2)."""
+
+    def test_dacar_node_announce_seeds_cache(self):
+        """A validated dacar.node announce registers the issuer pubkey."""
+        identity = RNS.Identity()
+        keyring = Keyring()
+        saved = {}
+        handler = DacarAnnounceHandler(keyring, on_save=lambda kr: saved.update({"kr": kr}))
+
+        # Simulate a dacar.node announce.
+        dacar_node_hash = RNS.Destination.hash(identity, "dacar", "node")
+        handler.received_announce(dacar_node_hash, identity)
+
+        self.assertEqual(handler.seeded, 1)
+        self.assertIn(identity.hash, keyring)
+        ks = keyring.resolve(identity.hash)
+        self.assertEqual(ks.member_public_keys[0], identity.sig_pub_bytes)
+        self.assertIsNotNone(saved.get("kr"))  # on_save was called
+
+    def test_non_dacar_announce_ignored(self):
+        """An announce under a different app does not seed the cache (design decision #3)."""
+        identity = RNS.Identity()
+        keyring = Keyring()
+        handler = DacarAnnounceHandler(keyring)
+
+        # An announce under a different app (e.g. "otherapp.node").
+        other_hash = RNS.Destination.hash(identity, "otherapp", "node")
+        handler.received_announce(other_hash, identity)
+
+        self.assertEqual(handler.seeded, 0)
+        self.assertNotIn(identity.hash, keyring)
+        self.assertEqual(len(keyring), 0)
+
+    def test_wrong_aspect_under_dacar_ignored(self):
+        """A dacar.<not-node> announce (different aspect) is ignored."""
+        identity = RNS.Identity()
+        keyring = Keyring()
+        handler = DacarAnnounceHandler(keyring)
+
+        other_aspect_hash = RNS.Destination.hash(identity, "dacar", "challenge")
+        handler.received_announce(other_aspect_hash, identity)
+        self.assertEqual(handler.seeded, 0)
+
+
+class DurableFallbackTest(unittest.TestCase):
+    """cmd_sync resolves an issuer that is ONLY in the dacar cache (doc #5 #3).
+
+    The issuer ≠ sender: the rfed sender is remembered by unwrap_channel_message,
+    but the issuer (a different identity) is not in RNS recall — it is only in
+    the dacar-owned persisted keyring. The RnsIdentityResolver fallback resolves
+    it, so the Delta applies.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        ensure_headless()
+
+    def setUp(self):
+        self.store_dir = Path(tempfile.mkdtemp(prefix="dacar-fb-"))
+        Store.init(self.store_dir, salt=SALT)
+        self.store = Store(self.store_dir)
+
+    def _trust(self, issuer_hash):
+        raw = self.store.load_config_raw()
+        anchors = list(raw["anchors"])
+        if issuer_hash not in anchors:
+            anchors.append(issuer_hash)
+        self.store.save_config(
+            primary_salt=raw["primary_salt"], legacy_salts=raw["legacy_salts"],
+            anchors=anchors, authoritative=raw["authoritative"],
+            horizon_days=raw["horizon_days"],
+        )
+
+    def test_issuer_only_in_dacar_cache_applies(self):
+        """An issuer in the cache (but not RNS recall) is resolved via fallback."""
+        # B = issuer (signs the Delta). NOT remembered by RNS.
+        b_identity = RNS.Identity()
+        self._trust(b_identity.hash)
+
+        # Seed the dacar cache with B's pubkey (NOT RNS recall).
+        keyring = self.store.load_keyring()
+        keyring.register_single(b_identity.hash, b_identity.sig_pub_bytes)
+        self.store.save_keyring(keyring)
+
+        # A = rfed sender (wraps the Delta). A is remembered by unwrap.
+        a_identity = RNS.Identity()
+
+        # B signs a Delta claiming issuer=B.
+        delta = _signed_delta(b_identity.hash, b_identity)
+
+        config = self.store.load_config()
+        state = self.store.load_state(config)
+        # keyring_for_verify loads the persisted cache + own identity.
+        resolver = RnsIdentityResolver(fallback=self.store.keyring_for_verify())
+        rx = DeltaReceiver(state, resolver)
+
+        client = _FakeRFedClient()
+        client.deferred.append(_wrap_delta(delta, a_identity))  # A is the sender
+
+        applied = run_sync(self.store, state, NODE, RFED_TOPIC, client, rx)
+        self.assertEqual(applied, 1)
+        engine = Engine(config, state)
+        self.assertTrue(engine.evaluate("sensor:wind", "read", GRANTEE))
+
+    def test_issuer_in_neither_recall_nor_cache_dropped(self):
+        """Without the cache entry, the same Delta is dropped (unknown issuer)."""
+        b_identity = RNS.Identity()
+        self._trust(b_identity.hash)
+        # Do NOT seed the cache — B is unknown everywhere.
+        a_identity = RNS.Identity()
+        delta = _signed_delta(b_identity.hash, b_identity)
+
+        config = self.store.load_config()
+        state = self.store.load_state(config)
+        resolver = RnsIdentityResolver(fallback=self.store.keyring_for_verify())
+        rx = DeltaReceiver(state, resolver)
+
+        client = _FakeRFedClient()
+        client.deferred.append(_wrap_delta(delta, a_identity))
+        applied = run_sync(self.store, state, NODE, RFED_TOPIC, client, rx)
+        self.assertEqual(applied, 0)
+
+
+class ForgedCacheEntryTest(unittest.TestCase):
+    """A poisoned cache entry (wrong pubkey) → Delta dropped, not trusted (doc #5 #6).
+
+    Integrity is not a security property of the cache: a wrong pubkey causes a
+    signature mismatch → drop, never a trust breach (design decision #2).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        ensure_headless()
+
+    def setUp(self):
+        self.store_dir = Path(tempfile.mkdtemp(prefix="dacar-forged-"))
+        Store.init(self.store_dir, salt=SALT)
+        self.store = Store(self.store_dir)
+
+    def test_wrong_pubkey_in_cache_drops_delta(self):
+        b_identity = RNS.Identity()
+        # Seed the cache with a WRONG pubkey (a random different identity).
+        wrong_identity = RNS.Identity()
+        keyring = self.store.load_keyring()
+        keyring.register_single(b_identity.hash, wrong_identity.sig_pub_bytes)
+        self.store.save_keyring(keyring)
+
+        a_identity = RNS.Identity()  # rfed sender (remembered by unwrap)
+        delta = _signed_delta(b_identity.hash, b_identity)  # signed by B
+
+        config = self.store.load_config()
+        state = self.store.load_state(config)
+        resolver = RnsIdentityResolver(fallback=self.store.keyring_for_verify())
+        rx = DeltaReceiver(state, resolver)
+
+        client = _FakeRFedClient()
+        client.deferred.append(_wrap_delta(delta, a_identity))
+        applied = run_sync(self.store, state, NODE, RFED_TOPIC, client, rx)
+        self.assertEqual(applied, 0, "forged cache entry must drop the Delta, not trust it")
+
+
+class CrossRestartTest(unittest.TestCase):
+    """The cache persists across process restarts (doc #5 #5)."""
+
+    @classmethod
+    def setUpClass(cls):
+        ensure_headless()
+
+    def setUp(self):
+        self.store_dir = Path(tempfile.mkdtemp(prefix="dacar-restart-"))
+        Store.init(self.store_dir, salt=SALT)
+
+    def test_cache_survives_new_store_instance(self):
+        """A fresh Store pointing at the same dir resolves a previously-cached issuer."""
+        b_identity = RNS.Identity()
+        # Process 1: seed the cache.
+        store1 = Store(self.store_dir)
+        keyring = store1.load_keyring()
+        keyring.register_single(b_identity.hash, b_identity.sig_pub_bytes)
+        store1.save_keyring(keyring)
+
+        # Process 2: a brand-new Store (no in-memory state) loads the cache.
+        store2 = Store(self.store_dir)
+        loaded = store2.load_keyring()
+        self.assertIn(b_identity.hash, loaded)
+        ks = loaded.resolve(b_identity.hash)
+        self.assertEqual(ks.member_public_keys[0], b_identity.sig_pub_bytes)
+
+    def test_fresh_process_resolves_cached_issuer_without_reannounce(self):
+        """End-to-end: a cached issuer applies without RNS recall or re-announce."""
+        b_identity = RNS.Identity()
+        # Seed the cache.
+        store1 = Store(self.store_dir)
+        kr = store1.load_keyring()
+        kr.register_single(b_identity.hash, b_identity.sig_pub_bytes)
+        store1.save_keyring(kr)
+        # Add B as a root anchor so its grants evaluate.
+        raw = store1.load_config_raw()
+        anchors = list(raw["anchors"]) + [b_identity.hash]
+        store1.save_config(
+            primary_salt=raw["primary_salt"], legacy_salts=raw["legacy_salts"],
+            anchors=anchors, authoritative=raw["authoritative"],
+            horizon_days=raw["horizon_days"],
+        )
+
+        # Process 2: new store, no RNS recall for B.
+        store2 = Store(self.store_dir)
+        config = store2.load_config()
+        state = store2.load_state(config)
+        resolver = RnsIdentityResolver(fallback=store2.keyring_for_verify())
+
+        # B's identity should resolve via the fallback.
+        ks = resolver.resolve(b_identity.hash)
+        self.assertIsNotNone(ks, "cached issuer must resolve without re-announce")
+        self.assertEqual(ks.member_public_keys[0], b_identity.sig_pub_bytes)
+
+
+class IdentityRememberForgetTest(unittest.TestCase):
+    """``identity remember``/``forget``/``list`` CLI round-trip (doc #5 #4)."""
+
+    @classmethod
+    def setUpClass(cls):
+        ensure_headless()
+
+    def setUp(self):
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+        self.store_dir = Path(tempfile.mkdtemp(prefix="dacar-rem-"))
+        Store.init(self.store_dir, salt=SALT)
+        self._redirect_stderr = redirect_stderr
+        self._redirect_stdout = redirect_stdout
+        self._io = io
+
+    def test_remember_with_pubkey_then_forget(self):
+        """``--pubkey`` round-trip: remember adds, forget removes."""
+        from dacar.cli import main
+        issuer = RNS.Identity()
+        pubkey_hex = issuer.sig_pub_bytes.hex()
+
+        argv = ["identity", "remember", issuer.hash.hex(), "--pubkey", pubkey_hex,
+                "--store", str(self.store_dir)]
+        err = self._io.StringIO()
+        with self._redirect_stderr(err):
+            code = main(argv)
+        self.assertEqual(code, 0, err.getvalue())
+
+        store = Store(self.store_dir)
+        self.assertIn(issuer.hash, store.load_keyring())
+
+        # forget
+        argv = ["identity", "forget", issuer.hash.hex(), "--store", str(self.store_dir)]
+        err = self._io.StringIO()
+        with self._redirect_stderr(err):
+            code = main(argv)
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertNotIn(issuer.hash, store.load_keyring())
+
+    def test_remember_via_file(self):
+        """``--file`` reads a 32-byte raw public key."""
+        from dacar.cli import main
+        issuer = RNS.Identity()
+        keyfile = Path(self.store_dir, "pub.bin")
+        keyfile.write_bytes(issuer.sig_pub_bytes)
+
+        argv = ["identity", "remember", issuer.hash.hex(), "--file", str(keyfile),
+                "--store", str(self.store_dir)]
+        err = self._io.StringIO()
+        with self._redirect_stderr(err):
+            code = main(argv)
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertIn(issuer.hash, Store(self.store_dir).load_keyring())
+
+    def test_remember_without_pubkey_errors_when_not_recallable(self):
+        """``remember`` without ``--pubkey`` errors clearly when RNS can't recall."""
+        from dacar.cli import main
+        unknown_hash = b"\xee" * 16
+        argv = ["identity", "remember", unknown_hash.hex(), "--store", str(self.store_dir)]
+        err = self._io.StringIO()
+        with self._redirect_stderr(err):
+            code = main(argv)
+        self.assertNotEqual(code, 0)
+        self.assertIn("--pubkey", err.getvalue())
+
+    def test_forget_unknown_errors(self):
+        """Forgetting an issuer not in the cache is an error."""
+        from dacar.cli import main
+        unknown_hash = b"\xee" * 16
+        argv = ["identity", "forget", unknown_hash.hex(), "--store", str(self.store_dir)]
+        err = self._io.StringIO()
+        with self._redirect_stderr(err):
+            code = main(argv)
+        self.assertNotEqual(code, 0)
+
+    def test_forget_refuses_when_issuer_has_active_grants(self):
+        """forget refuses to purge an issuer with live CRDT grants (strands them)."""
+        from dacar.cli import main
+        from dacar.delta import DeltaReceiver
+        from dacar.verifier import IssuerKeyset
+        issuer = RNS.Identity()
+        # Seed the cache with the issuer.
+        store = Store(self.store_dir)
+        kr = store.load_keyring()
+        kr.register_single(issuer.hash, issuer.sig_pub_bytes)
+        store.save_keyring(kr)
+        # Add the issuer as a root anchor + apply one of its grants.
+        raw = store.load_config_raw()
+        anchors = list(raw["anchors"]) + [issuer.hash]
+        store.save_config(
+            primary_salt=raw["primary_salt"], legacy_salts=raw["legacy_salts"],
+            anchors=anchors, authoritative=raw["authoritative"],
+            horizon_days=raw["horizon_days"],
+        )
+        config = store.load_config()
+        state = store.load_state(config)
+        delta = _signed_delta(issuer.hash, issuer)
+        rx = DeltaReceiver(state, Keyring({issuer.hash: IssuerKeyset.single(issuer.sig_pub_bytes)}))
+        self.assertTrue(rx.apply_payload(delta))
+        store.save_state(state)
+        self.assertEqual(len(state), 1)
+
+        # forget without --force must refuse.
+        argv = ["identity", "forget", issuer.hash.hex(), "--store", str(self.store_dir)]
+        err = self._io.StringIO()
+        with self._redirect_stderr(err):
+            code = main(argv)
+        self.assertNotEqual(code, 0, err.getvalue())
+        self.assertIn("active grant", err.getvalue())
+        # The cache entry is still there (not purged).
+        self.assertIn(issuer.hash, store.load_keyring())
+
+    def test_forget_force_overrides_active_grants(self):
+        """--force purges even an issuer with live grants."""
+        from dacar.cli import main
+        from dacar.delta import DeltaReceiver
+        from dacar.verifier import IssuerKeyset
+        issuer = RNS.Identity()
+        store = Store(self.store_dir)
+        kr = store.load_keyring()
+        kr.register_single(issuer.hash, issuer.sig_pub_bytes)
+        store.save_keyring(kr)
+        # Apply a grant so the guard would normally fire.
+        raw = store.load_config_raw()
+        anchors = list(raw["anchors"]) + [issuer.hash]
+        store.save_config(
+            primary_salt=raw["primary_salt"], legacy_salts=raw["legacy_salts"],
+            anchors=anchors, authoritative=raw["authoritative"],
+            horizon_days=raw["horizon_days"],
+        )
+        config = store.load_config()
+        state = store.load_state(config)
+        delta = _signed_delta(issuer.hash, issuer)
+        rx = DeltaReceiver(state, Keyring({issuer.hash: IssuerKeyset.single(issuer.sig_pub_bytes)}))
+        rx.apply_payload(delta)
+        store.save_state(state)
+
+        argv = ["identity", "forget", issuer.hash.hex(), "--force",
+                "--store", str(self.store_dir)]
+        err = self._io.StringIO()
+        with self._redirect_stderr(err):
+            code = main(argv)
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertNotIn(issuer.hash, store.load_keyring())
+
+    def test_remember_resolves_alias(self):
+        """``remember`` accepts an alias (resolved via the aliases registry)."""
+        from dacar.cli import main
+        issuer = RNS.Identity()
+        # Add an alias for the issuer.
+        store = Store(self.store_dir)
+        aliases = store.load_aliases()
+        aliases.add("node-b", issuer.hash)
+        store.save_aliases(aliases)
+
+        argv = ["identity", "remember", "node-b", "--pubkey", issuer.sig_pub_bytes.hex(),
+                "--store", str(self.store_dir)]
+        err = self._io.StringIO()
+        with self._redirect_stderr(err):
+            code = main(argv)
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertIn(issuer.hash, Store(self.store_dir).load_keyring())
+
+    def test_list_shows_cached_entries(self):
+        """``identity list`` prints the cached issuers."""
+        from dacar.cli import main
+        issuer = RNS.Identity()
+        store = Store(self.store_dir)
+        kr = store.load_keyring()
+        kr.register_single(issuer.hash, issuer.sig_pub_bytes)
+        store.save_keyring(kr)
+
+        argv = ["identity", "list", "--store", str(self.store_dir)]
+        out = self._io.StringIO()
+        err = self._io.StringIO()
+        with self._redirect_stdout(out), self._redirect_stderr(err):
+            code = main(argv)
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertIn("ISSUER IDENTITY CACHE", err.getvalue())
+        self.assertIn("1", err.getvalue())  # 1 entry
+
+    def test_list_empty_shows_hint(self):
+        """``identity list`` on an empty cache suggests ``remember``."""
+        from dacar.cli import main
+        argv = ["identity", "list", "--store", str(self.store_dir)]
+        err = self._io.StringIO()
+        with self._redirect_stderr(err):
+            code = main(argv)
+        self.assertEqual(code, 0)
+        self.assertIn("remember", err.getvalue())
+
+
+class CliIdentityCacheParserTest(unittest.TestCase):
+    """The parser accepts the new ``identity remember/forget/list`` subcommands."""
+
+    def test_remember_subcommand(self):
+        from dacar.cli import build_parser
+        parser = build_parser()
+        args = parser.parse_args([
+            "identity", "remember", "aabbccdd" * 4, "--pubkey", "00" * 32,
+        ])
+        self.assertEqual(args.identity_command, "remember")
+        self.assertEqual(args.pubkey, "00" * 32)
+
+    def test_forget_subcommand(self):
+        from dacar.cli import build_parser
+        parser = build_parser()
+        args = parser.parse_args(["identity", "forget", "aabbccdd" * 4])
+        self.assertEqual(args.identity_command, "forget")
+
+    def test_list_subcommand(self):
+        from dacar.cli import build_parser
+        parser = build_parser()
+        args = parser.parse_args(["identity", "list"])
+        self.assertEqual(args.identity_command, "list")
 
 
 if __name__ == "__main__":

@@ -26,7 +26,7 @@ a *default entry*, not a hardcoded programmatic fallback.
 from __future__ import annotations
 
 import os
-from typing import Optional
+from typing import Callable, Optional
 
 import RNS
 
@@ -46,6 +46,8 @@ __all__ = [
     "ensure_default_config",
     "boot",
     "announce_identity",
+    "DacarAnnounceHandler",
+    "register_announce_handler",
 ]
 
 
@@ -133,3 +135,65 @@ def announce_identity(identity: RNS.Identity) -> bytes:
     )
     dest.announce()
     return dest.hash
+
+
+class DacarAnnounceHandler:
+    """Announce handler that seeds the durable issuer cache (work doc #5).
+
+    RNS's own persistence policy differs across runtimes: Python RNS persists
+    *all* validated announces to disk, but reticulum-js persists only
+    *contacted*/*favorited* destinations — and in the rfed model a peer never
+    sends a routable packet to the issuer directly, so passively-observed
+    announces are lost on restart. This handler makes dacar-owned durability
+    independent of the RNS runtime: on a validated ``dacar.node`` announce it
+    registers the issuer's Ed25519 public key into the persisted
+    :class:`~dacar.verifier.Keyring` (the ``RnsIdentityResolver`` fallback).
+
+    Scoped to the ``dacar`` app (design decision #3): only ``dacar.node``
+    announces seed the cache; arbitrary RNS announces are ignored (dacar is not
+    a general identity directory). The filter is applied in
+    :meth:`received_announce` (not via ``aspect_filter``) so it is directly
+    testable without a live RNS transport.
+    """
+
+    #: ``None`` = receive all announces; we filter by app in the callback.
+    aspect_filter = None
+
+    def __init__(
+        self,
+        keyring: "object",
+        on_save: Optional[Callable[["object"], None]] = None,
+    ) -> None:
+        self._keyring = keyring
+        self._on_save = on_save
+        self.seeded: int = 0  # count of announces that seeded the cache (test aid)
+
+    def received_announce(
+        self, destination_hash: bytes, announced_identity: RNS.Identity,
+        app_data=None, *args, **kwargs,
+    ) -> None:
+        """Cache a ``dacar.node`` announce's issuer pubkey (design decision #3)."""
+        # Only seed from dacar.node announces: verify the destination hash
+        # matches what a dacar.node destination under this identity would be.
+        expected = RNS.Destination.hash(announced_identity, APP_NAME, "node")
+        if bytes(destination_hash) != bytes(expected):
+            return  # not a dacar.node announce — ignore (dacar is not a directory)
+        self._keyring.register_single(announced_identity.hash, announced_identity.sig_pub_bytes)
+        self.seeded += 1
+        if self._on_save is not None:
+            self._on_save(self._keyring)
+
+
+def register_announce_handler(
+    keyring: "object",
+    on_save: Optional[Callable[["object"], None]] = None,
+) -> DacarAnnounceHandler:
+    """Register a :class:`DacarAnnounceHandler` with the live RNS transport.
+
+    Called by every online command (``grant --publish``, ``sync``) after
+    booting RNS, so passively-observed ``dacar.node`` announces seed the durable
+    cache during the command's online window (work doc #5, design decision #4).
+    """
+    handler = DacarAnnounceHandler(keyring, on_save=on_save)
+    RNS.Transport.register_announce_handler(handler)
+    return handler

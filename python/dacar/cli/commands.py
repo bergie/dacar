@@ -311,6 +311,118 @@ def cmd_identity_new(args) -> int:
     return EXIT_OK
 
 
+# -- issuer identity cache (work doc #5) ------------------------------------
+
+_PUBLIC_KEY_HEX_LEN = 64  # 32-byte Ed25519 public key as hex
+
+
+def cmd_identity_remember(args) -> int:
+    """Pre-load an issuer pubkey into the durable cache (work doc #5).
+
+    Reads the pubkey from ``--pubkey <hex>`` / ``--file <path>`` if given, else
+    boots RNS and tries :meth:`RNS.Identity.recall` (the live recall store,
+    populated from persisted announces on Python RNS). Errors clearly if the
+    issuer cannot be resolved out-of-band.
+    """
+    store = Store(args.store, identity_override=args.identity)
+    store.ensure()
+    aliases = store.load_aliases()
+    issuer_hash = resolve_identity(args.hash, aliases)
+
+    if args.pubkey is not None:
+        try:
+            sig_pub = bytes.fromhex(args.pubkey)
+        except ValueError:
+            raise CliError(f"--pubkey is not valid hex: {args.pubkey!r}")
+        if len(sig_pub) != 32:
+            raise CliError(f"--pubkey must be 32 bytes (64 hex), got {len(sig_pub)}")
+    elif args.file is not None:
+        sig_pub = Path(args.file).read_bytes()
+        if len(sig_pub) != 32:
+            raise CliError(f"pubkey file must contain 32 bytes, got {len(sig_pub)}")
+    else:
+        # Boot RNS if not already running, then try to recall (Python RNS loads
+        # persisted announces).
+        import RNS
+        from dacar.cli.rns import boot, resolve_config_dir
+        if RNS.Reticulum.get_instance() is None:
+            config_dir = resolve_config_dir(store_path=args.store)
+            boot(config_dir)
+        recalled = RNS.Identity.recall(issuer_hash, from_identity_hash=True)
+        if recalled is None:
+            raise CliError(
+                f"could not recall {render_identity(issuer_hash, aliases, full=args.full_hashes)} "
+                "from RNS; use --pubkey <hex> or --file <path> to specify the key out-of-band"
+            )
+        sig_pub = recalled.sig_pub_bytes
+
+    keyring = store.load_keyring()
+    keyring.register_single(issuer_hash, sig_pub)
+    store.save_keyring(keyring)
+    _err(f"✔ remembered issuer {render_identity(issuer_hash, aliases, full=args.full_hashes)}")
+    _err(f"  pubkey : {sig_pub.hex()}")
+    _err(f"  cache  : {store.identities_path} ({len(keyring)} entries)")
+    return EXIT_OK
+
+
+def cmd_identity_forget(args) -> int:
+    """Remove an issuer from the durable cache (work doc #5).
+
+    Refuses to purge an issuer that still has *active* grants in the live CRDT:
+    forgetting such an issuer would make its future revokes unverifiable,
+    leaving those grants stuck (unrevocable from this node's perspective).
+    Override with ``--force`` once you understand the consequence.
+    """
+    store = Store(args.store, identity_override=args.identity)
+    store.ensure()
+    aliases = store.load_aliases()
+    issuer_hash = resolve_identity(args.hash, aliases)
+
+    if not args.force:
+        config = store.load_config()
+        state = store.load_state(config)
+        active = [
+            tup for tup, add_ts, remove_ts in state.iter_entries()
+            if tup.issuer == issuer_hash
+            and add_ts is not None
+            and (remove_ts is None or add_ts > remove_ts)
+        ]
+        if active:
+            raise CliError(
+                f"issuer {render_identity(issuer_hash, aliases, full=args.full_hashes)} "
+                f"has {len(active)} active grant(s) in the live CRDT; forgetting it would "
+                "make its revokes unverifiable (use --force to override)"
+            )
+
+    keyring = store.load_keyring()
+    if not keyring.forget(issuer_hash):
+        raise CliError(
+            f"issuer {render_identity(issuer_hash, aliases, full=args.full_hashes)} "
+            "not in the cache"
+        )
+    store.save_keyring(keyring)
+    _err(f"✔ forgot issuer {render_identity(issuer_hash, aliases, full=args.full_hashes)}")
+    _err(f"  cache : {store.identities_path} ({len(keyring)} entries)")
+    return EXIT_OK
+
+
+def cmd_identity_list(args) -> int:
+    """List the durable issuer identity cache (work doc #5)."""
+    store = Store(args.store, identity_override=args.identity)
+    store.ensure()
+    aliases = store.load_aliases()
+    keyring = store.load_keyring()
+    _err(f"ISSUER IDENTITY CACHE ({len(keyring)})  {store.identities_path}")
+    if not len(keyring):
+        _err("(none — use `dacar identity remember <hash>` to seed)")
+        return EXIT_OK
+    for issuer_hash, keyset in keyring.entries():
+        pubkey = keyset.member_public_keys[0] if keyset.member_public_keys else b""
+        _err(f"  {render_identity(issuer_hash, aliases, full=args.full_hashes)}  "
+             f"pubkey={pubkey.hex()[:SHORT_HASH_HEX]}…")
+    return EXIT_OK
+
+
 # ---------------------------------------------------------------------------
 # Issuing operations (grant / revoke)
 # ---------------------------------------------------------------------------
@@ -860,7 +972,7 @@ def run_sync(
 
 def _publish_delta(args, store: Store, identity, payload: bytes) -> None:
     """Online publish hook for ``grant --publish`` / ``revoke --publish``."""
-    from dacar.cli.rns import announce_identity, boot
+    from dacar.cli.rns import announce_identity, boot, register_announce_handler
     from dacar.rfed.client import RFedClient
 
     aliases = store.load_aliases()
@@ -870,6 +982,12 @@ def _publish_delta(args, store: Store, identity, payload: bytes) -> None:
     config_dir = _resolve_rns_config_dir(args)
     rns = boot(config_dir)
     announce_identity(identity)  # announce invariant (§11.2.4)
+
+    # Seed the durable cache from any dacar.node announces observed during the
+    # publish window (work doc #5, design decision #4).
+    keyring = store.load_keyring()
+    keyring.register_single(identity.hash, identity.sig_pub_bytes)
+    register_announce_handler(keyring, on_save=store.save_keyring)
 
     client = RFedClient(identity=identity, rns=rns)
     run_publish(identity, payload, node_hash, topic, client)
@@ -885,7 +1003,7 @@ def cmd_sync(args) -> int:
     the CRDT, exit. No daemon — store-and-forward means transient online windows
     suffice (work doc #4).
     """
-    from dacar.cli.rns import announce_identity, boot
+    from dacar.cli.rns import announce_identity, boot, register_announce_handler
     from dacar.rfed.client import RFedClient
     from dacar.transport.rns_identity import RnsIdentityResolver
 
@@ -906,14 +1024,24 @@ def cmd_sync(args) -> int:
     rns = boot(config_dir)
     announce_identity(identity)
 
-    # Receiver: RNS-first resolver (announced identities) + local keyring
-    # fallback (node's own identity + --identity overrides).
+    # Durable issuer cache (work doc #5): load the persisted keyring, ensure our
+    # own identity is in it, and register an announce handler so any
+    # dacar.node announces observed during the sync window seed the cache for
+    # future runs. The keyring is the RnsIdentityResolver fallback (RNS recall
+    # is consulted first — announced identities win).
+    keyring = store.load_keyring()
+    keyring.register_single(identity.hash, identity.sig_pub_bytes)
+    register_announce_handler(keyring, on_save=store.save_keyring)
+
     state = store.load_state(config)
-    resolver = RnsIdentityResolver(fallback=store.keyring_for_verify())
+    resolver = RnsIdentityResolver(fallback=keyring)
     rx = DeltaReceiver(state, resolver)
 
     client = RFedClient(identity=identity, rns=rns)
     applied = run_sync(store, state, node_hash, topic, client, rx)
+
+    # Persist the keyring if any announces were observed during the window.
+    store.save_keyring(keyring)
 
     _err(f"✔ synced: applied {applied} delta(s) from rfed channel {topic!r}")
     return EXIT_OK

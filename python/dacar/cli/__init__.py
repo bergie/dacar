@@ -122,6 +122,21 @@ def build_parser() -> argparse.ArgumentParser:
     pn = idn_sub.add_parser("new", help="generate a fresh RNS Identity (rotates the self-anchor)")
     _add_global_flags(pn)
     pn.set_defaults(func=_cmd_identity_new)
+    pr = idn_sub.add_parser("remember", help="seed an issuer pubkey into the durable cache (work doc #5)")
+    pr.add_argument("hash", help="issuer identity hash or alias")
+    pr.add_argument("--pubkey", default=None, help="32-byte Ed25519 public key as 64 hex chars")
+    pr.add_argument("--file", default=None, help="path to a 32-byte raw public key file")
+    _add_global_flags(pr)
+    pr.set_defaults(func=_cmd_identity_remember)
+    pf = idn_sub.add_parser("forget", help="remove an issuer from the durable cache (work doc #5)")
+    pf.add_argument("hash", help="issuer identity hash or alias")
+    pf.add_argument("--force", action="store_true",
+                    help="purge even if the issuer has active grants in the CRDT (may strand them)")
+    _add_global_flags(pf)
+    pf.set_defaults(func=_cmd_identity_forget)
+    pl = idn_sub.add_parser("list", help="list the durable issuer identity cache (work doc #5)")
+    _add_global_flags(pl)
+    pl.set_defaults(func=_cmd_identity_list)
 
     # -- grant / revoke -----------------------------------------------------
     for name, verb in (("grant", "issue a signed Grant"), ("revoke", "issue a signed Revoke")):
@@ -273,6 +288,24 @@ def _cmd_identity_new(args):
     from dacar.cli.commands import cmd_identity_new
     args.store = _store_path(args)
     return cmd_identity_new(args)
+
+
+def _cmd_identity_remember(args):
+    from dacar.cli.commands import cmd_identity_remember
+    args.store = _store_path(args)
+    return cmd_identity_remember(args)
+
+
+def _cmd_identity_forget(args):
+    from dacar.cli.commands import cmd_identity_forget
+    args.store = _store_path(args)
+    return cmd_identity_forget(args)
+
+
+def _cmd_identity_list(args):
+    from dacar.cli.commands import cmd_identity_list
+    args.store = _store_path(args)
+    return cmd_identity_list(args)
 
 
 def _cmd_grant(args):

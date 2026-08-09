@@ -36,6 +36,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   trips and survives salt/identity rotations; RNS config dir priority;
   `announce_identity` creates the `dacar.node` destination; cross-node Delta
   applies via RNS recall (announce invariant, §11.2.4).
+- Durable issuer identity cache (work doc #5): a dacar-owned persisted
+  `Keyring` (`identities.msgpack`, mode `0600`) used as the
+  `RnsIdentityResolver` fallback in `sync` and `grant --publish` — so issuers
+  observed in a prior session (or seeded out-of-band) are resolvable without a
+  live re-announce, closing the cross-runtime announce-persistence asymmetry
+  (Python RNS persists all announces; reticulum-js persists only
+  contacted/favorited). A `dacar.node` announce handler seeds the cache during
+  the online window; `dacar identity remember/forget/list` commands seed, remove,
+  and inspect the cache. `forget` refuses to purge an issuer that still has
+  active grants in the live CRDT (would strand them — revokes become
+  unverifiable); `--force` overrides.
+- `Keyring` gained `forget()`, `entries()`, `__len__`, `__contains__` for cache
+  management and listing.
 
 ## [1.0.0] - 2024-08-08
 

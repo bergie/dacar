@@ -112,6 +112,24 @@ class Keyring:
     def resolve(self, issuer_hash: bytes) -> "Optional[IssuerKeyset]":
         return self._map.get(bytes(issuer_hash))
 
+    def forget(self, issuer_hash: bytes) -> bool:
+        """Remove an Issuer from the keyring. Returns ``True`` if it existed."""
+        h = bytes(issuer_hash)
+        if h in self._map:
+            del self._map[h]
+            return True
+        return False
+
+    def entries(self) -> "list[_Tuple[bytes, IssuerKeyset]]":
+        """Return ``(issuer_hash, keyset)`` pairs for all registered Issuers."""
+        return list(self._map.items())
+
+    def __contains__(self, issuer_hash: bytes) -> bool:
+        return bytes(issuer_hash) in self._map
+
+    def __len__(self) -> int:
+        return len(self._map)
+
     def __call__(self, issuer_hash: bytes) -> "Optional[IssuerKeyset]":
         # Make a Keyring directly usable as a KeyResolver callable.
         return self.resolve(issuer_hash)
