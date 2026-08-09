@@ -151,5 +151,35 @@ class SerializationTest(unittest.TestCase):
             self.assertTrue(restored.is_active(t.hash()))
 
 
+class IterEntriesTest(unittest.TestCase):
+    """iter_entries() exposes active AND revoked tombstones for inspection tools."""
+
+    def test_yields_active_and_revoked_with_timestamps(self) -> None:
+        state = StateVector()
+        state.apply(_op(ms=BASE_MS), now_ms=BASE_MS)
+        state.apply(_op(action=Action.REVOKE, ms=BASE_MS + 1), now_ms=BASE_MS + 1)
+        entries = list(state.iter_entries())
+        self.assertEqual(len(entries), 1)
+        tup, add_ts, remove_ts = entries[0]
+        self.assertEqual(tup, _op().tuple)
+        self.assertIsNotNone(add_ts)
+        self.assertIsNotNone(remove_ts)
+        self.assertGreater(remove_ts, add_ts)
+
+    def test_active_tuples_subset_of_iter_entries(self) -> None:
+        state = StateVector()
+        state.apply(_op(object_id="sensor:wind"), now_ms=BASE_MS)
+        state.apply(_op(object_id="sensor:temp", ms=BASE_MS + 1), now_ms=BASE_MS + 1)
+        state.apply(
+            _op(object_id="sensor:temp", action=Action.REVOKE, ms=BASE_MS + 2),
+            now_ms=BASE_MS + 2,
+        )
+        active_hashes = {t.hash() for t in state.active_tuples()}
+        all_hashes = {t.hash() for (t, _a, _r) in state.iter_entries()}
+        self.assertLessEqual(active_hashes, all_hashes)
+        self.assertEqual(len(all_hashes), 2)
+        self.assertEqual(len(active_hashes), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

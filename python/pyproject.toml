@@ -28,6 +28,9 @@ dependencies = [
     "msgpack>=1.0",
 ]
 
+[project.scripts]
+dacar = "dacar.cli:main"
+
 [project.optional-dependencies]
 transport = [
     # Reticulum Network Stack — §8 Challenge Link, future RFed adapter.
@@ -44,4 +47,4 @@ Specification = "https://github.com/bergie/dacar/blob/main/SPEC.md"
 Changelog = "https://github.com/bergie/dacar/releases"
 
 [tool.setuptools]
-packages = ["dacar", "dacar.transport"]
+packages = ["dacar", "dacar.transport", "dacar.cli"]

@@ -20,13 +20,14 @@ that terminate at configured Root Trust Anchors.
 
 ```bash
 cd python
-pip install -e .            # pure core: cryptography + msgpack only
+pip install -e .            # pure core + the `dacar` CLI: cryptography + msgpack only
 pip install -e ".[transport]"  # + the §8/§11 RNS & LXMF transport adapters
 ```
 
 The pure core has **no RNS dependency**. `import dacar` never pulls in the
 `dacar.transport` subpackage (the `rns`/`lxmf` packages); those adapters are
-opt-in via the `transport` extra.
+opt-in via the `transport` extra. The `dacar` command is part of the base
+install — `pip install dacar` gives a working `dacar` CLI with no extras.
 
 ## Layout
 
@@ -55,6 +56,11 @@ dacar/
                         (decode → verify → apply)
   naming.py       §8, §11  RNS naming constants (fixed discriminators +
                         configurable RFed topic)
+  cli/             the `dacar` command-line tool (work doc #2):
+    __init__.py        argparse dispatch + `main()` entry point
+    store.py           persistent node store (INI config, identity, HLC clock,
+                       CRDT state, rnns aliases, plaintext ledger)
+    commands.py        command implementations + identity/tuple rendering
   transport/      §8, §11.2, §11.3  optional RNS/LXMF adapters (`transport` extra):
     rns_challenge.py  §8 Challenge over an RNS Link (server endpoint + client transport)
     rns_identity.py   §3.1, §11.2.4  RnsIdentityResolver (recall → verify key)
@@ -145,6 +151,41 @@ applied = rx.apply_payloads(batch)         # → count of Deltas verified + appl
 > registration, not recall.) The quick-start example above uses a placeholder
 > 16-byte hash purely to demonstrate the API; real deployments use RNS identity
 > hashes for Issuer and Grantee.
+
+## Command-line tool (`dacar`)
+
+`pip install dacar` provides a `dacar` command for managing authorization
+grants offline-first — no running daemon, no network. It keeps its own RNS
+Identity in its store dir (like `rnid`/`rnx`/`rncp`), signs Grant/Revoke
+operations, ingests received deltas (verify-on-ingest), and evaluates
+permissions locally against the persisted CRDT.
+
+```bash
+dacar init                              # bootstrap ~/.dacar (random salt, own identity)
+dacar alias add bergie 7f3a9c2b…        # name an identity hash (rnns format)
+dacar grant bergie read sensor:wind     # sign + apply locally; hex payload on stdout
+dacar grant bergie read sensor:wind --no-apply > delta.hex   # export only
+dacar apply delta.hex                  # ingest a received delta (verify-on-ingest)
+dacar check bergie read sensor:wind     # local Engine.evaluate → ALLOW/DENY
+dacar grants                            # list active grants (plaintext + alias + hash)
+dacar grants --all                     # include revoked tombstones
+dacar grants --effective                # ✔/⚠ whether each issuer traces to an anchor
+dacar revoke bergie read sensor:wind    # sign + apply a Revoke
+dacar prune                            # §9 Time-Horizon Tombstone Pruning
+dacar config show --reveal             # show config (salt masked unless --reveal)
+dacar salt new                         # rotate the Privacy Salt (§10.2)
+```
+
+Global flags on every command: `--store DIR` (default `$DACAR_HOME` or
+`~/.dacar`), `--identity PATH` (override the signing identity), and
+`-v`/`--full-hashes` (show full 32-hex hashes).
+
+**Offline verification model:** verify-on-ingest resolves issuer pubkeys from
+the node's own identity (`<store>/identity`) and any `--identity PATH`.
+Issuers RNS cannot resolve offline are dropped (§11.2.4) — not silently
+trusted. Full network recall (`RnsIdentityResolver`) arrives with the
+live-transport phase. `init` bootstraps the node's own identity as the root
+trust anchor (aliased `self`), so locally-issued grants evaluate ALLOW.
 
 ## Tests
 

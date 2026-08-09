@@ -218,6 +218,18 @@ class StateVector:
             if entry.active():
                 yield entry.tuple
 
+    def iter_entries(self) -> "Iterator[Tuple, Optional[int], Optional[int]]":
+        """Yield ``(tuple, add_ts, remove_ts)`` for *every* stored entry.
+
+        Unlike :meth:`active_tuples`, this also exposes resolved (revoked)
+        tombstones, which management/inspection tools need to list revoked
+        tuples and their tombstone timestamps (e.g. ``grants --all``). Each
+        item is ``(tuple, add_ts, remove_ts)`` where a ``None`` timestamp
+        means that set has no entry for the tuple.
+        """
+        for entry in self._entries.values():
+            yield entry.tuple, entry.add_ts, entry.remove_ts
+
     # -- state-vector serialization (for sync) ------------------------------
     def to_payload(self) -> bytes:
         """Serialize the full state vector as a MessagePack array of entries.
