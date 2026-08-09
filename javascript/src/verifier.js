@@ -144,6 +144,33 @@ export class Keyring {
   resolve(issuerHash) {
     return this._map.get(toHex(_asHash(issuerHash))) ?? null;
   }
+
+  /**
+   * Remove an Issuer from the keyring.
+   * @param {Uint8Array} issuerHash
+   * @returns {boolean} `true` if the Issuer was present (and is now removed).
+   */
+  forget(issuerHash) {
+    return this._map.delete(toHex(_asHash(issuerHash)));
+  }
+
+  /**
+   * Return `[issuerHashHex, keyset]` pairs for all registered Issuers.
+   * @returns {[string, IssuerKeyset][]}
+   */
+  entries() {
+    return [...this._map.entries()];
+  }
+
+  /** Number of registered Issuers. @returns {number} */
+  get size() {
+    return this._map.size;
+  }
+
+  /** @param {Uint8Array} issuerHash @returns {boolean} */
+  has(issuerHash) {
+    return this._map.has(toHex(_asHash(issuerHash)));
+  }
 }
 
 /**

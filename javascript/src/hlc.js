@@ -68,6 +68,39 @@ export class Clock {
   #lastMs = 0;
   #logical = 0;
 
+  /**
+   * Get the last physical timestamp (ms).
+   * @returns {number}
+   */
+  get lastMs() {
+    return this.#lastMs;
+  }
+
+  /**
+   * Get the current logical counter.
+   * @returns {number}
+   */
+  get logical() {
+    return this.#logical;
+  }
+
+  /**
+   * Restore the clock from a snapshot (for store persistence).
+   * @param {{ lastMs: number, logical: number }} snap
+   */
+  restore(snap) {
+    if (!snap || typeof snap.lastMs !== "number" || typeof snap.logical !== "number") {
+      throw new Error("restore requires an object with lastMs and logical");
+    }
+    this.#lastMs = snap.lastMs;
+    this.#logical = snap.logical;
+  }
+
+  /** Obtain a snapshot for persistence. @returns {{ lastMs: number, logical: number }} */
+  snapshot() {
+    return { lastMs: this.#lastMs, logical: this.#logical };
+  }
+
   /** Advance from a local event and return the new HLC. @returns {bigint} */
   now() {
     const phys = physicalNowMs();

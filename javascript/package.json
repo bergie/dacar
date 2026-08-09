@@ -7,7 +7,12 @@
   "exports": {
     ".": "./src/index.js",
     "./transport": "./src/transport/index.js",
+    "./cli/session": "./src/cli/session.js",
+    "./cli/store": "./src/cli/store.js",
     "./package.json": "./package.json"
+  },
+  "bin": {
+    "dacar": "src/cli/dacar.js"
   },
   "files": [
     "src",
@@ -39,7 +44,8 @@
     "node": ">=20"
   },
   "dependencies": {
-    "@reticulum/core": "^0.5.3"
+    "@reticulum/core": "^0.5.3",
+    "@reticulum/node": "^0.6.1"
   },
   "publishConfig": {
     "access": "public"
