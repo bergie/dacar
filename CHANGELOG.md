@@ -5,31 +5,6 @@ All notable changes to Dacar will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-### Changed
-- Python: `rns` (Reticulum Network Stack) is now a **required** dependency
-  instead of living in the optional `[transport]` extra. The `dacar` CLI's
-  store layer imports `RNS` to keep a node RNS Identity, so a base
-  `pip install dacar` must yield a working `dacar` command — previously the
-  base install omitted `rns` and the CLI (and its tests) failed with
-  `ModuleNotFoundError: No module named 'RNS'` (it only worked locally because
-  the dev venv happened to have `rns` installed). `lxmf` remains opt-in via the
-  `[transport]` extra (§11.2/§11.3 adapters).
-- Python: the `[transport]` extra now installs only `lxmf` (the `rns` it used to
-  pull in moved to base deps). `make install` still installs `.[transport]` so
-  `make test` can run the LXMF transport smoketests.
-
-### Added
-- Python: `dacar` command-line tool for offline-first grant management
-  (work doc #2). Ships with the pip package via a console-script entry point
-  (`pip install dacar` → `dacar` command, no extras). Commands: `init`,
-  `config show`, `salt new`/`set`, `anchor add`/`list`, `identity show`/`new`,
-  `grant`, `revoke`, `apply` (verify-on-ingest), `check`, `grants`, `show`,
-  `prune`, `alias` (rnns `hash name` format), and `ledger annotate`.
-- Python: `StateVector.iter_entries()` to expose active and revoked tombstone
-  tuples with their timestamps (for inspection tooling).
-
 ## [1.0.0-RC7] - 2024-08-01
 
 ### Added
@@ -53,3 +28,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Verify-on-ingest security boundary for all network deltas
 - Ed25519 signature verification for operations
 - MessagePack serialization for transport payloads
+-  `dacar` command-line tool for offline-first grant management (work doc #2)
