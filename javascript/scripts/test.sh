@@ -27,7 +27,12 @@ fi
 if command -v deno >/dev/null 2>&1; then
   ran=1
   echo "==> deno ($(deno --version 2>&1 | head -1))"
-  ( cd "$root" && deno test --allow-read=test,src --allow-env --no-check test/*.test.js ) || ok=1
+  # --allow-read/--allow-write are unscoped: test/cli-rns-boot.test.js boots a
+  # real Reticulum via FileStorageAdapter(configDir) against an OS temp dir
+  # (mkdtempSync(os.tmpdir())), which both reads and writes there. The temp
+  # dir path is OS/user-specific (macOS /var/folders, Linux /tmp), so it can't
+  # be portably added to --allow-read=test,src — read+write must cover it.
+  ( cd "$root" && deno test --allow-read --allow-write --allow-env --no-check test/*.test.js ) || ok=1
 fi
 
 if command -v bun >/dev/null 2>&1; then
