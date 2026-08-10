@@ -256,14 +256,20 @@ export class StateVector {
    * > `DeltaReceiver.applyPayloads()` (a batch of signed §5.3 Operations)
    * > instead.
    * >
-   * > A one-time `console.warn` is emitted to make this contract audible.
+   * > A one-time `console.warn` is emitted to make this contract audible —
+   * > unless `opts.trusted` is set, which a caller that has already asserted
+   * > it is loading its own persisted snapshot (e.g. `DacarStore.loadState`)
+   * > passes to keep normal CLI output free of developer-footgun noise.
    * @param {Uint8Array} data
    * @param {Object} [opts]
    * @param {number} [opts.deletionHorizonDays]
+   * @param {boolean} [opts.trusted=false] Suppress the audible warning when the
+   *   caller has asserted the bytes are a trusted-local snapshot (its own
+   *   store). The JSDoc contract above still applies regardless.
    * @returns {StateVector}
    */
-  static fromPayload(data, { deletionHorizonDays = DEFAULT_DELETION_HORIZON_DAYS } = {}) {
-    if (!__trustedLocalWarned) {
+  static fromPayload(data, { deletionHorizonDays = DEFAULT_DELETION_HORIZON_DAYS, trusted = false } = {}) {
+    if (!trusted && !__trustedLocalWarned) {
       __trustedLocalWarned = true;
       console.warn(
         "StateVector.fromPayload() is trusted-local-only: it performs no " +

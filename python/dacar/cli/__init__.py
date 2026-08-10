@@ -56,6 +56,11 @@ def _add_online_flags(parser: argparse.ArgumentParser) -> None:
     """Flags for online commands (grant --publish, sync) that open RNS."""
     parser.add_argument("--node", default=None,
                         help="rfed node identity hash or alias (default: [rfed] node in config)")
+    parser.add_argument("--discover", action="store_true",
+                        help="autodiscover rfed node by waiting for announces")
+    parser.add_argument("--interface", default="shared",
+                        choices=["shared", "auto", "tcp"],
+                        help="RNS interface mode (shared=attach to rnsd, auto=create default, tcp=direct TCP)")
     parser.add_argument("--topic", default=None,
                         help=f"rfed channel topic (default: {RFED_TOPIC!r} or [rfed] topic in config)")
     parser.add_argument("--rns-config", default=None,

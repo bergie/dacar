@@ -132,7 +132,7 @@ describe("StateVector merge (§6)", () => {
 });
 
 describe("StateVector serialization (trusted-local-only snapshot/restore)", () => {
-  it("round-trips through MessagePack and warns trusted-local-only", async () => {
+  it("round-trips through MessagePack and warns trusted-local-only by default", async () => {
     const s = new StateVector();
     s.apply(await op({ object: "sensor:wind:north", relation: "read" }), { nowMs: BASE });
     s.apply(await op({ object: "sensor:wind", relation: "-write", ms: BASE + 1 }), { nowMs: BASE + 1 });
@@ -154,5 +154,22 @@ describe("StateVector serialization (trusted-local-only snapshot/restore)", () =
     assert.equal(calls.length, 1);
     assert.match(calls[0], /trusted-local-only/);
     assert.match(calls[0], /applyPayloads/);
+  });
+
+  it("suppresses the audible warning when the caller asserts `trusted: true`", async () => {
+    const s = new StateVector();
+    s.apply(await op({ object: "sensor:wind:north", relation: "read" }), { nowMs: BASE });
+    const payload = s.toPayload();
+    const original = console.warn;
+    const calls = [];
+    console.warn = (/** @type {string} */ msg) => calls.push(String(msg));
+    let restored;
+    try {
+      restored = StateVector.fromPayload(payload, { trusted: true });
+    } finally {
+      console.warn = original;
+    }
+    assert.equal(restored.size, s.size, "round-trip still works with trusted:true");
+    assert.equal(calls.length, 0, "no audible warning for a trusted-local caller");
   });
 });

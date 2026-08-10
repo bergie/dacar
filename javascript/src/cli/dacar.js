@@ -30,15 +30,11 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import process from "node:process";
 
-import { Identity, Reticulum, toHex } from "@reticulum/core";
+import { Identity, toHex } from "@reticulum/core";
 import { MemoryStorageAdapter } from "@reticulum/core";
-import {
-  AutoInterface,
-  FileStorageAdapter,
-  LocalClientInterface,
-  TCPClientInterface,
-} from "@reticulum/node";
+import { FileStorageAdapter } from "@reticulum/node";
 import { RFedClient } from "@reticulum/core/src/rfed/client.js";
+import { bootRns } from "./rns_boot.js";
 
 import { Action, Operation, Tuple, Engine } from "../index.js";
 import { DeltaReceiver } from "../delta.js";
@@ -48,7 +44,7 @@ import { NamespaceHasher, DEFAULT_SALT, SALT_SIZE, HASH_SIZE } from "../namespac
 import { Keyring, IssuerKeyset } from "../verifier.js";
 
 import { DacarStore, SELF_ALIAS, AliasRegistry } from "./store.js";
-import { announceIdentity, runPublish, runSync, registerAnnounceHandler } from "./session.js";
+import { announceIdentity, discoverRfedNode, ensureNodeIdentity, runPublish, runSync, registerAnnounceHandler } from "./session.js";
 
 const SHORT_HASH = 7;
 
@@ -131,30 +127,18 @@ async function resolveRnsConfigDir(args) {
   return dir;
 }
 
-/**
- * Boot RNS with an interface. Mirrors `@reticulum/node`'s `rfed` CLI:
- * `--interface shared|auto|tcp` (default `shared`).
- */
-async function bootRns(configDir, iface) {
-  const rns = new Reticulum({ storageAdapter: new FileStorageAdapter(configDir) });
-  if (iface === "auto") {
-    rns.addInterface(new AutoInterface({}));
-  } else if (iface === "tcp") {
-    const host = process.env.RNS_HOST || "127.0.0.1";
-    const port = parseInt(process.env.RNS_PORT || "42424", 10);
-    rns.addInterface(new TCPClientInterface({ host, port }));
-  } else {
-    // shared (default): attach to a running rnsd, else no-op (standalone).
-    rns.addInterface(new LocalClientInterface({}));
-  }
-  return rns;
-}
+// `bootRns` lives in `./rns_boot.js` (Node-only): it constructs, **connects**,
+// and default-attaches the chosen mesh interface, and optionally raises the
+// Reticulum log threshold + logs each announce for `--verbose`. See
+// `src/cli/rns_boot.js` for why `connect()` + `isDefault=true` are
+// non-optional (the `--discover` silent-timeout symptom).
 
-async function resolveRfedNode(args, store, aliases) {
+async function resolveRfedNode(args, store, aliases, rns) {
   if (args.node) return resolveIdentityHash(args.node, aliases);
   const raw = await store.loadConfig();
   if (raw.rfedNode) return raw.rfedNode;
-  throw new CliError("no rfed node configured (use --node <hash> or set [rfed] node in config)");
+  if (args.discover && rns) return discoverRfedNode({ rns, timeout: 30000 });
+  throw new CliError("no rfed node configured (use --node <hash>, --discover, or set [rfed] node in config)");
 }
 
 async function resolveTopic(args, store) {
@@ -251,12 +235,22 @@ async function _issue(args, action) {
 
 async function publishDelta(args, store, identity, payload) {
   const aliases = await store.loadAliases();
-  const nodeHash = await resolveRfedNode(args, store, aliases);
   const topic = await resolveTopic(args, store);
-
   const configDir = await resolveRnsConfigDir(args);
-  const rns = await bootRns(configDir, args.interface || "shared");
-  await announceIdentity(identity);
+  const rns = await bootRns(configDir, args.interface || "shared", {
+    verbose: !!args.verbose,
+  });
+  // RNS must be booted before resolveRfedNode: --discover listens for peer
+  // announces on the live transport (mirrors Python's _publish_delta).
+  const nodeHash = await resolveRfedNode(args, store, aliases, rns);
+  await announceIdentity(identity, rns);
+  // Proactively fetch the rfed node's identity: when --node is given (or
+  // --discover derived it), the destination's announce may not yet be in
+  // the recall store. Send a path? request and wait for the announce rather
+  // than failing with "wait for its announce" (work doc #6).
+  await ensureNodeIdentity(rns, nodeHash, {
+    onRequest: () => err("  requesting rfed node identity…"),
+  });
 
   // Durable issuer cache (doc #5): seed from observed dacar.node announces.
   const keyring = await store.loadKeyring();
@@ -276,18 +270,27 @@ async function cmdSync(args) {
   const identity = await store.loadIdentity();
   if (!identity) throw new CliError("no signing identity (run `dacar init`)");
 
-  const nodeHash = await resolveRfedNode(args, store, aliases);
-  const topic = await resolveTopic(args, store);
-
+  // RNS must be booted before discover if we're autodiscovering
   const configDir = await resolveRnsConfigDir(args);
-  const rns = await bootRns(configDir, args.interface || "shared");
-  await announceIdentity(identity);
+  const rns = await bootRns(configDir, args.interface || "shared", {
+    verbose: !!args.verbose,
+  });
+  await announceIdentity(identity, rns);
 
   // Durable issuer cache (doc #5): load persisted keyring + announce handler.
   const keyring = await store.loadKeyring();
   keyring.registerSingle(identity.identityHash, await identity.getPublicKey());
   await registerAnnounceHandler({ rns, keyring, onSave: (kr) => store.saveKeyring(kr) });
 
+  const nodeHash = await resolveRfedNode(args, store, aliases, rns);
+  // Proactively fetch the rfed node's identity: when --node is given (or
+  // --discover derived it), the destination's announce may not yet be in
+  // the recall store. Send a path? request and wait for the announce rather
+  // than failing with "wait for its announce" (work doc #6).
+  await ensureNodeIdentity(rns, nodeHash, {
+    onRequest: () => err("  requesting rfed node identity…"),
+  });
+  const topic = await resolveTopic(args, store);
   const state = await store.loadState(config);
   const resolver = new RnsIdentityResolver(keyring);
   const rx = new DeltaReceiver(state, resolver);
@@ -358,7 +361,9 @@ async function cmdIdentityRemember(args) {
   } else {
     // Boot RNS and try to recall.
     const configDir = await resolveRnsConfigDir(args);
-    const rns = await bootRns(configDir, args.interface || "shared");
+    const rns = await bootRns(configDir, args.interface || "shared", {
+      verbose: !!args.verbose,
+    });
     const { Destination } = await import("@reticulum/core");
     const recalled = await Destination.recall(issuerHash, true);
     if (!recalled) {
@@ -466,19 +471,19 @@ const SUBCOMMANDS = {
   },
   grant: {
     run: cmdGrant,
-    opts: { publish: "boolean", node: "string", topic: "string", "rns-dir": "string", interface: "string" },
+    opts: { publish: "boolean", node: "string", discover: "boolean", topic: "string", "rns-dir": "string", interface: "string" },
     positional: ["grantee", "relation", "object"],
     online: true,
   },
   revoke: {
     run: cmdRevoke,
-    opts: { publish: "boolean", node: "string", topic: "string", "rns-dir": "string", interface: "string" },
+    opts: { publish: "boolean", node: "string", discover: "boolean", topic: "string", "rns-dir": "string", interface: "string" },
     positional: ["grantee", "relation", "object"],
     online: true,
   },
   sync: {
     run: cmdSync,
-    opts: { node: "string", topic: "string", "rns-dir": "string", interface: "string" },
+    opts: { node: "string", discover: "boolean", topic: "string", "rns-dir": "string", interface: "string" },
     online: true,
   },
   apply: { run: cmdApply, opts: { binary: "boolean" }, positional: ["payload"], online: false },
@@ -503,6 +508,10 @@ function buildOptions(spec) {
   for (const [k, t] of Object.entries(spec.opts || {})) {
     opts[k] = { type: t };
   }
+  // --verbose / -v is global: accepted by every (sub)command so it never
+  // errors out, and threaded into bootRns to raise the Reticulum log
+  // threshold + log interface/announce diagnostics.
+  opts.verbose = { type: "boolean", short: "v" };
   if (spec.positional && spec.positional.length) {
     opts.store = { type: "string" };
     opts.identity = { type: "string" };
@@ -513,7 +522,7 @@ function buildOptions(spec) {
 
 async function main() {
   if (process.argv.includes("--help") || process.argv.includes("-h")) {
-    err(`usage: dacar <command> [options]\n\ncommands: ${Object.keys(SUBCOMMANDS).join(", ")}\n\nGlobal options: --store <path>, --identity <hex|path>, --full-hashes`);
+    err(`usage: dacar <command> [options]\n\ncommands: ${Object.keys(SUBCOMMANDS).join(", ")}\n\nGlobal options: --store <path>, --identity <hex|path>, --full-hashes, -v/--verbose`);
     return 0;
   }
   const argv = process.argv.slice(2);

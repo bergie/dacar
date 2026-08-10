@@ -896,7 +896,7 @@ def cmd_ledger_annotate(args) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _resolve_rfed_node(args, store: Store, aliases: AliasRegistry) -> bytes:
+def _resolve_rfed_node(args, store: Store, aliases: AliasRegistry, rns: object = None) -> bytes:
     """Resolve the rfed node identity hash from --node or [rfed] node config."""
     node = getattr(args, "node", None)
     if node:
@@ -904,8 +904,11 @@ def _resolve_rfed_node(args, store: Store, aliases: AliasRegistry) -> bytes:
     raw = store.load_config_raw()
     if raw.get("rfed_node"):
         return raw["rfed_node"]
+    if getattr(args, "discover", False) and rns is not None:
+        from dacar.cli.rns import discover_rfed_node
+        return discover_rfed_node(rns, timeout=30000)
     raise CliError(
-        "no rfed node configured (use --node <hash> or set [rfed] node in config)"
+        "no rfed node configured (use --node <hash>, --discover, or set [rfed] node in config)"
     )
 
 
@@ -972,15 +975,24 @@ def run_sync(
 
 def _publish_delta(args, store: Store, identity, payload: bytes) -> None:
     """Online publish hook for ``grant --publish`` / ``revoke --publish``."""
-    from dacar.cli.rns import announce_identity, boot, register_announce_handler
+    from dacar.cli.rns import announce_identity, boot, ensure_node_identity, register_announce_handler
     from dacar.rfed.client import RFedClient
 
     aliases = store.load_aliases()
-    node_hash = _resolve_rfed_node(args, store, aliases)
     topic = _resolve_topic(args, store)
 
+    # RNS must be booted first for discover mode
     config_dir = _resolve_rns_config_dir(args)
     rns = boot(config_dir)
+
+    node_hash = _resolve_rfed_node(args, store, aliases, rns)
+    # Proactively fetch the rfed node's identity: when --node is given (or
+    # --discover derived it), the destination's announce may not yet be in
+    # RNS's recall store. Send a path? request and wait for the announce
+    # rather than failing with "wait for its announce" (work doc #6).
+    ensure_node_identity(
+        node_hash, on_request=lambda: _err("  requesting rfed node identity…")
+    )
     announce_identity(identity)  # announce invariant (§11.2.4)
 
     # Seed the durable cache from any dacar.node announces observed during the
@@ -1003,7 +1015,7 @@ def cmd_sync(args) -> int:
     the CRDT, exit. No daemon — store-and-forward means transient online windows
     suffice (work doc #4).
     """
-    from dacar.cli.rns import announce_identity, boot, register_announce_handler
+    from dacar.cli.rns import announce_identity, boot, ensure_node_identity, register_announce_handler
     from dacar.rfed.client import RFedClient
     from dacar.transport.rns_identity import RnsIdentityResolver
 
@@ -1016,7 +1028,6 @@ def cmd_sync(args) -> int:
     if identity is None:
         raise CliError("no signing identity (run `dacar init` or `dacar identity new`)")
 
-    node_hash = _resolve_rfed_node(args, store, aliases)
     topic = _resolve_topic(args, store)
 
     # Boot RNS + announce (announce invariant, §11.2.4).
@@ -1034,6 +1045,14 @@ def cmd_sync(args) -> int:
     register_announce_handler(keyring, on_save=store.save_keyring)
 
     state = store.load_state(config)
+    node_hash = _resolve_rfed_node(args, store, aliases, rns)
+    # Proactively fetch the rfed node's identity: when --node is given (or
+    # --discover derived it), the destination's announce may not yet be in
+    # RNS's recall store. Send a path? request and wait for the announce
+    # rather than failing with "wait for its announce" (work doc #6).
+    ensure_node_identity(
+        node_hash, on_request=lambda: _err("  requesting rfed node identity…")
+    )
     resolver = RnsIdentityResolver(fallback=keyring)
     rx = DeltaReceiver(state, resolver)
 

@@ -221,7 +221,15 @@ export class DacarStore {
     const horizon = config?.deletionHorizonDays ?? (await this.loadConfig()).horizonDays;
     const bytes = await this._adapter.get(NS, "state");
     if (bytes && bytes.length) {
-      return StateVector.fromPayload(bytes, { deletionHorizonDays: horizon });
+      // `trusted: true` — these are this node's own persisted CRDT snapshot
+      // (written by `saveState()` → `toPayload()`), never network bytes.
+      // Network Operations arrive as signed Deltas through `DeltaReceiver`
+      // (the verify-on-ingest path), not here. Asserting `trusted` silences
+      // the audible `fromPayload` footgun warning during normal CLI use.
+      return StateVector.fromPayload(bytes, {
+        deletionHorizonDays: horizon,
+        trusted: true,
+      });
     }
     return new StateVector({ deletionHorizonDays: horizon });
   }

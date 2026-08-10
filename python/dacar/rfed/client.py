@@ -277,10 +277,11 @@ class RFedClient:
         dest = self._out_destination(CHANNEL_SUBSCRIBE_NAME, node_identity)
         link = self._establish_link(dest)
         link.identify(self.identity)
+        # RNS already msgpack-unpacks the request response into a Python object
+        # (see RequestReceipt.response_received), so decode it directly — do not
+        # double-unpack with msgpack.unpackb, which would raise on a list.
         raw = self._request(link, SUBSCRIBE_PATH, payload, timeout=timeout)
-        decoded = _decode_subscribe_response(
-            msgpack.unpackb(raw, raw=False) if raw else False
-        )
+        decoded = _decode_subscribe_response(raw if raw is not None else False)
         if decoded.ok:
             self.stamp_costs[_hex(channel["channel_hash"])] = decoded.stamp_cost
         return decoded
@@ -300,10 +301,10 @@ class RFedClient:
         dest = self._out_destination(CHANNEL_UNSUBSCRIBE_NAME, node_identity)
         link = self._establish_link(dest)
         link.identify(self.identity)
+        # RNS already msgpack-unpacks the request response into a Python object;
+        # decode it directly (mirrors the JS reference's link.request usage).
         raw = self._request(link, UNSUBSCRIBE_PATH, payload, timeout=timeout)
-        decoded = _decode_subscribe_response(
-            msgpack.unpackb(raw, raw=False) if raw else False
-        )
+        decoded = _decode_subscribe_response(raw if raw is not None else False)
         return SubscribeResult(ok=decoded.ok)
 
     # -- publish -----------------------------------------------------------
@@ -361,14 +362,14 @@ class RFedClient:
         dest = self._out_destination(CHANNEL_PULL_NAME, node_identity)
         link = self._establish_link(dest)
         link.identify(self.identity)
+        # RNS already msgpack-unpacks the request response into a Python object;
+        # ``raw`` is the decoded ``[[[channel_hash, blob], ...], more_pending]``
+        # structure (or None on failure), not raw bytes.
         raw = self._request(link, PULL_PATH, bytes(channel["channel_hash"]), timeout=timeout)
-        if not raw:
+        if not isinstance(raw, (list, tuple)) or len(raw) < 2:
             return PullPage([], False)
-        response = msgpack.unpackb(raw, raw=False)
-        if not isinstance(response, (list, tuple)) or len(response) < 2:
-            return PullPage([], False)
-        pairs = response[0]
-        more_pending = response[1] is True
+        pairs = raw[0]
+        more_pending = raw[1] is True
         items = [
             PullItem(channel_hash=pair[0], blob=pair[1])
             for pair in (pairs if isinstance(pairs, (list, tuple)) else [])
