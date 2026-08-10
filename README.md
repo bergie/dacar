@@ -39,13 +39,13 @@ Dacar acts as a decentralized authorization firewall for your off-grid systems. 
    ```bash
    dacar grant bob switch device:anchorLight                  # sign + apply locally; hex payload on stdout
    dacar grant bob switch device:anchorLight --no-apply > delta.hex   # export a signed delta only
+   dacar grant bob switch device:anchorLight --publish  # …or publish directly to the rfed channel
    ```
 
 4. Sync the State: You transmit this signed payload to the edge device over any available transport—broadcast it via RFed, send it point-to-point via LXMF over VHF/LoRa, or physically scan it as a QR code. The device merges this delta into its local CRDT state.
 
    ```bash
    dacar apply delta.hex                                # ingest a received delta (verify-on-ingest)
-   dacar grant bob switch device:anchorLight --publish  # …or publish directly to the rfed channel
    dacar sync                                          # pull pending deltas from the rfed channel
    ```
 
