@@ -18,6 +18,7 @@
  *   dacar check <grantee> <relation> <object>
  *   dacar grants
  *   dacar revoke <grantee> <relation> <object> [--publish]
+ *   dacar publish <file> [<file>...] | --all   (work doc #8)
  *   dacar identity remember|forget|list ...
  *
  * Online flags: --node <hash>, --topic <topic>, --interface shared|auto|tcp,
@@ -28,6 +29,7 @@ import { parseArgs } from "node:util";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import process from "node:process";
 
 import { Identity, toHex } from "@reticulum/core";
@@ -219,16 +221,25 @@ async function _issue(args, action) {
 
   // Record plaintext ledger.
   const ledger = await store.loadLedger();
-  ledger.set(toHex(tuple.key), { object: args.object, relation: args.relation, wildcard: args.object.endsWith("*") && args.object !== "*", firstSeen: Number(hlc >> 16n) });
+  ledger.set(tuple.key, { object: args.object, relation: args.relation, wildcard: args.object.endsWith("*") && args.object !== "*", firstSeen: Number(hlc >> 16n) });
   await store.saveLedger(ledger);
 
-  out(payload.hex());
+  out(toHex(payload));
   err(`✔ ${action === Action.GRANT ? "granted" : "revoked"} ${shortHash(grantee, args.fullHashes)}  ${args.relation}  on  ${args.object}`);
   err(`  hlc     : 0x${hlc.toString(16)}`);
   err(`  payload : hex on stdout (${payload.length} bytes)`);
 
   if (args.publish) {
     await publishDelta(args, store, identity, payload);
+  } else {
+    // Outbox (work doc #8): queue locally-issued deltas for `publish --all`.
+    // `--publish` sends immediately and never enqueues. (JS `grant` always
+    // applies locally — there is no `--no-apply` — so every non-publish grant
+    // is a candidate for later batch publish.)
+    const outbox = await store.loadOutbox();
+    outbox.push(payload);
+    await store.saveOutbox(outbox);
+    err("  (queued in outbox: `dacar publish --all` to flush)");
   }
   return 0;
 }
@@ -334,6 +345,107 @@ async function cmdApply(args) {
   }
   err("✘ delta rejected (unknown issuer, bad signature, stale §9, or malformed)");
   return 1;
+}
+
+/**
+ * Read a payload file (or stdin) and auto-detect hex (mirrors Python's
+ * `_read_payload_input`): an all-hex, even-length ASCII blob decodes to bytes.
+ * `--binary` forces raw bytes.
+ * @param {string} path
+ * @param {boolean} forceBinary
+ * @returns {Promise<Uint8Array>}
+ */
+async function readPayloadInput(path, forceBinary) {
+  const data = path === "-" ? new Uint8Array(await readStdin()) : await readFile(path);
+  return coercePayload(data, forceBinary);
+}
+
+/**
+ * Auto-detect a hex payload: if *all* bytes are ASCII hex characters (after
+ * trimming surrounding whitespace) and the length is even, decode to bytes;
+ * otherwise return the raw bytes unchanged.
+ * @param {Uint8Array | Buffer} data
+ * @param {boolean} forceBinary
+ * @returns {Uint8Array}
+ */
+function coercePayload(data, forceBinary) {
+  const bytes = new Uint8Array(data);
+  if (forceBinary || !bytes.length) return bytes;
+  let s;
+  try {
+    s = Buffer.from(bytes).toString("ascii");
+  } catch {
+    return bytes; // not ASCII -> raw bytes
+  }
+  const trimmed = s.trim();
+  if (!trimmed || trimmed.length % 2 !== 0) return bytes;
+  if (!/^[0-9a-fA-F]+$/.test(trimmed)) return bytes;
+  return hexToBytes(trimmed);
+}
+
+export { coercePayload };
+
+/**
+ * `dacar publish` — push signed delta(s) to the rfed channel (§11.1, doc #8).
+ *
+ * Two modes:
+ *   - `dacar publish <file> [<file>...]` — publish previously-signed delta
+ *     payload(s) (exact bytes, no re-sign; multiple files → one batch).
+ *   - `dacar publish --all` — pack + publish the outbox of locally-issued
+ *     deltas, then clear it. A no-op (exit 0) on an empty outbox.
+ *
+ * Reuses the `grant --publish` machinery (`publishDelta`: boot RNS, announce,
+ * subscribe, publish).
+ */
+async function cmdPublish(args) {
+  const store = await openStore(args);
+  const identity = await store.loadIdentity();
+  if (!identity) throw new CliError("no signing identity (run `dacar init`)");
+
+  const useAll = !!args.all;
+  const files = args._positionals ?? [];
+
+  if (useAll && files.length) {
+    throw new CliError("publish: use either <file>... or --all, not both");
+  }
+  if (!useAll && !files.length) {
+    throw new CliError("publish: provide <file>... (one or more) or --all");
+  }
+
+  /** @type {Uint8Array[]} */
+  let toPublish;
+  if (useAll) {
+    toPublish = await store.loadOutbox();
+    if (!toPublish.length) {
+      err("outbox empty (nothing to publish)");
+      return 0;
+    }
+  } else {
+    toPublish = [];
+    for (const path of files) {
+      const data = await readPayloadInput(path, !!args.binary);
+      if (!data.length) throw new CliError(`empty payload: ${path}`);
+      toPublish.push(data);
+    }
+  }
+
+  // Pack: a single delta as raw bytes, multiple as a batch payload.
+  const batch = toPublish.length === 1
+    ? toPublish[0]
+    : DeltaReceiver.packPayloads(toPublish);
+
+  const label = useAll ? "outbox" : `${toPublish.length} file(s)`;
+  const kind = toPublish.length > 1 ? "a batch" : "a single delta";
+  err(`  publishing ${toPublish.length} delta(s) (${label}) as ${kind}`);
+
+  // Reuse the grant --publish machinery (boot RNS, announce, subscribe, publish).
+  await publishDelta(args, store, identity, batch);
+
+  if (useAll) {
+    await store.saveOutbox([]);
+    err("  outbox cleared");
+  }
+  return 0;
 }
 
 async function readStdin() {
@@ -447,7 +559,7 @@ async function cmdGrants(args) {
   err(`${label} (${rows.length})`);
   for (const { entry, active } of rows) {
     const t = entry.tuple;
-    const row = ledger.get(toHex(t.key));
+    const row = ledger.get(t.key);
     const rel = row?.relation || `[${shortHash(t.relationHash, args.fullHashes)}]`;
     const obj = row?.object || "[hash]";
     err(
@@ -486,6 +598,12 @@ const SUBCOMMANDS = {
     opts: { node: "string", discover: "boolean", topic: "string", "rns-dir": "string", interface: "string" },
     online: true,
   },
+  publish: {
+    run: cmdPublish,
+    opts: { all: "boolean", binary: "boolean", node: "string", discover: "boolean", topic: "string", "rns-dir": "string", interface: "string" },
+    // variable file list (0..N) accessed via args._positionals
+    online: true,
+  },
   apply: { run: cmdApply, opts: { binary: "boolean" }, positional: ["payload"], online: false },
   check: { run: cmdCheck, opts: {}, positional: ["grantee", "relation", "object"], online: false },
   grants: { run: cmdGrants, opts: { all: "boolean", revoked: "boolean" }, online: false },
@@ -512,11 +630,12 @@ function buildOptions(spec) {
   // errors out, and threaded into bootRns to raise the Reticulum log
   // threshold + log interface/announce diagnostics.
   opts.verbose = { type: "boolean", short: "v" };
-  if (spec.positional && spec.positional.length) {
-    opts.store = { type: "string" };
-    opts.identity = { type: "string" };
-    opts["full-hashes"] = { type: "boolean" };
-  }
+  // --store / --identity / --full-hashes are global on every (sub)command
+  // (they were previously gated on `positional`, which silently dropped them
+  // for commands with no positionals — e.g. `sync`, `config show`, `grants`).
+  opts.store = { type: "string" };
+  opts.identity = { type: "string" };
+  opts["full-hashes"] = { type: "boolean" };
   return opts;
 }
 
@@ -568,7 +687,25 @@ async function main() {
   }
 }
 
-main().then((code) => process.exit(code ?? 0)).catch((e) => {
-  err("fatal: " + (e?.stack || e));
-  process.exit(1);
-});
+// Only auto-run when invoked as the entry script (Node/Bun via `pathToFileURL`,
+// Deno via `import.meta.main`), so the module can be imported in tests without
+// triggering the CLI dispatch (mirrors how `./cli/store` + `./cli/session`
+// are unit-tested).
+const isMain = (() => {
+  try {
+    if (import.meta.main === true) return true; // Deno
+  } catch { /* not Deno */ }
+  try {
+    if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+      return true; // Node / Bun
+    }
+  } catch { /* pathToFileURL unavailable */ }
+  return false;
+})();
+
+if (isMain) {
+  main().then((code) => process.exit(code ?? 0)).catch((e) => {
+    err("fatal: " + (e?.stack || e));
+    process.exit(1);
+  });
+}

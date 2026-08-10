@@ -20,7 +20,7 @@ from typing import List, Optional, Tuple as _Tuple
 
 from dacar import Action, Engine, Operation, Tuple
 from dacar.delta import DeltaReceiver
-from dacar.hlc import unpack
+from dacar.hlc import unpack, physical_now_ms
 from dacar.naming import RFED_TOPIC
 from dacar.namespace import DEFAULT_SALT, covers
 
@@ -549,6 +549,14 @@ def _issue(args, action: Action) -> int:
         _err("  (applied locally)")
     if getattr(args, "publish", False):
         _publish_delta(args, store, identity, payload)
+    else:
+        # Outbox (work doc #8): queue locally-issued deltas for ``publish --all``.
+        # ``--publish`` sends immediately and never enqueues; ``--no-apply`` only
+        # governs local CRDT apply, not whether the delta was issued.
+        outbox = store.load_outbox()
+        outbox.append(payload)
+        store.save_outbox(outbox)
+        _err("  (queued in outbox: `dacar publish --all` to flush)")
     return EXIT_OK
 
 
@@ -806,6 +814,12 @@ def cmd_prune(args) -> int:
     count = state.prune()
     store.save_state(state)
     _err(f"✔ pruned {count} resolved tombstone pair(s) (§9)")
+    # Also drop outbox entries older than the §9 horizon: such deltas are
+    # intake-rejected by receivers (§9) so publishing them is pointless, and
+    # this keeps the outbox bounded for long-lived offline nodes (work doc #8).
+    dropped = _prune_outbox(store, state.deletion_horizon_ms)
+    if dropped:
+        _err(f"  outbox: pruned {dropped} stale delta(s) (older than horizon)")
     return EXIT_OK
 
 
@@ -1064,3 +1078,101 @@ def cmd_sync(args) -> int:
 
     _err(f"✔ synced: applied {applied} delta(s) from rfed channel {topic!r}")
     return EXIT_OK
+
+
+def cmd_publish(args) -> int:
+    """``dacar publish`` — push signed delta(s) to the rfed channel (§11.1, doc #8).
+
+    Two modes:
+
+      * ``dacar publish <file> [<file>...]`` — publish previously-signed delta
+        payload(s). Files (or ``-`` for stdin) are read with the same
+        hex/binary auto-detect as ``apply`` (+ ``--binary`` to force raw).
+        Multiple files are packed into one batch payload
+        (:meth:`DeltaReceiver.pack_payloads`). The **exact signed bytes** are
+        published — no re-signing, no new HLC, no local state change — so the
+        receiver's verify-on-ingest authenticates the *original* issuer.
+
+      * ``dacar publish --all`` — pack every locally-issued, not-yet-published
+        delta from the outbox into one batch, publish it, then clear the
+        outbox. A no-op (exit 0) on an empty outbox.
+
+    Both reuse the ``grant --publish`` machinery (boot RNS, announce the node
+    identity, subscribe, publish) via :func:`_publish_delta`.
+    """
+    store = Store(args.store, identity_override=args.identity)
+    store.ensure()
+    identity = store.load_identity()
+    if identity is None:
+        raise CliError("no signing identity (run `dacar init` or `dacar identity new`)")
+
+    use_all = getattr(args, "all", False)
+    payloads = list(args.payloads or [])
+
+    if use_all and payloads:
+        raise CliError("publish: use either <file>... or --all, not both")
+    if not use_all and not payloads:
+        raise CliError("publish: provide <file>... (one or more) or --all")
+
+    if use_all:
+        to_publish = store.load_outbox()
+        if not to_publish:
+            _err("outbox empty (nothing to publish)")
+            return EXIT_OK
+    else:
+        to_publish = []
+        for path in payloads:
+            data = _read_payload_input(path, args.binary)
+            if not data:
+                raise CliError(f"empty payload: {path}")
+            to_publish.append(data)
+
+    # Pack into a single rfed message: a batch if >1, raw bytes if exactly 1
+    # (so a single-delta publish stays a single-delta payload on the wire).
+    if len(to_publish) == 1:
+        batch = to_publish[0]
+    else:
+        batch = DeltaReceiver.pack_payloads(to_publish)
+
+    label = "outbox" if use_all else f"{len(to_publish)} file(s)"
+    kind = "a batch" if len(to_publish) > 1 else "a single delta"
+    _err(f"  publishing {len(to_publish)} delta(s) ({label}) as {kind}")
+
+    # Reuse the grant --publish machinery (boot RNS, announce, subscribe, publish).
+    _publish_delta(args, store, identity, batch)
+
+    if use_all:
+        store.save_outbox([])
+        _err("  outbox cleared")
+    return EXIT_OK
+
+
+def _prune_outbox(store: Store, horizon_ms: int, *, now_ms: Optional[int] = None) -> int:
+    """Drop outbox entries whose HLC physical time is older than the §9 horizon.
+
+    Such deltas are intake-rejected by receivers (§9), so publishing them is
+    pointless; pruning keeps the outbox bounded for long-lived offline nodes.
+    Entries that fail to decode are left intact (do not destroy on a decode
+    error). Returns the number dropped.
+    """
+    outbox = store.load_outbox()
+    if not outbox:
+        return 0
+    now = now_ms if now_ms is not None else physical_now_ms()
+    cutoff = now - horizon_ms
+    kept: List[bytes] = []
+    dropped = 0
+    for payload in outbox:
+        try:
+            op = Operation.from_payload(payload)
+            phys, _ = unpack(op.hlc)
+        except (ValueError, TypeError):
+            kept.append(payload)  # can't decode -> keep (don't destroy)
+            continue
+        if phys < cutoff:
+            dropped += 1
+        else:
+            kept.append(payload)
+    if dropped:
+        store.save_outbox(kept)
+    return dropped

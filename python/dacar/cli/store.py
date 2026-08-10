@@ -9,10 +9,12 @@ Manages the on-disk store directory and its Reticulum-native file formats
   * ``state.msgpack``  — ``StateVector.to_payload()`` (the CRDT)
   * ``aliases``        — rnns ``hash name [# note]`` format
   * ``ledger.msgpack`` — ``{ tuple_hash_hex: { object, relation, wildcard, first_seen } }``
+  * ``outbox.msgpack`` — outbox of locally-issued, not-yet-published signed
+    Delta payloads (work doc #8); flushed + cleared by ``dacar publish --all``
 
-The store dir is mode ``0700``; the config, identity, state, and ledger files
-are mode ``0600`` (they hold the salt, the private key, CRDT state, and
-plaintext labels respectively).
+The store dir is mode ``0700``; the config, identity, state, ledger, and outbox
+files are mode ``0600`` (they hold the salt, the private key, CRDT state,
+plaintext labels, and node-local signed payloads respectively).
 """
 
 from __future__ import annotations
@@ -48,6 +50,7 @@ STATE_NAME = "state.msgpack"
 ALIASES_NAME = "aliases"
 LEDGER_NAME = "ledger.msgpack"
 IDENTITIES_NAME = "identities.msgpack"
+OUTBOX_NAME = "outbox.msgpack"
 
 
 def _generate_salt() -> bytes:
@@ -325,6 +328,10 @@ class Store:
     @property
     def identities_path(self) -> Path:
         return self.path / IDENTITIES_NAME
+
+    @property
+    def outbox_path(self) -> Path:
+        return self.path / OUTBOX_NAME
 
     def exists(self) -> bool:
         return self.config_path.exists()
@@ -685,6 +692,40 @@ class Store:
         data = serialization.packb(obj)
         self.identities_path.write_bytes(data)
         os.chmod(self.identities_path, SECRET_MODE)
+
+    # -- outbox (work doc #8) -----------------------------------------------
+    def load_outbox(self) -> List[bytes]:
+        """Load the outbox of locally-issued, not-yet-published signed Deltas.
+
+        Returns the list of raw §5.3 Operation payloads (byte-strings) in the
+        order they were issued. Returns an empty list when no outbox file
+        exists yet (fresh store, or one that has never issued without
+        ``--publish``).
+        """
+        if not self.outbox_path.exists():
+            return []
+        data = self.outbox_path.read_bytes()
+        if not data:
+            return []
+        try:
+            obj = serialization.unpackb(data)
+        except (ValueError, TypeError):
+            return []  # corrupted -> treat as empty (do not crash the CLI)
+        if not isinstance(obj, list):
+            return []
+        return [bytes(item) for item in obj if isinstance(item, (bytes, bytearray))]
+
+    def save_outbox(self, payloads: List[bytes]) -> None:
+        """Persist the outbox as a MessagePack array of signed Delta payloads.
+
+        Mode ``0600``: the file is a node-local cache of signed payloads this
+        node itself originated. (The payloads carry only hashed tuples +
+        signatures — no plaintext — but are kept owner-only for consistency
+        with the other state files.)
+        """
+        data = serialization.packb([bytes(p) for p in payloads])
+        self.outbox_path.write_bytes(data)
+        os.chmod(self.outbox_path, SECRET_MODE)
 
 
 class StoreError(Exception):

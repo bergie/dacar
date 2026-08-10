@@ -16,6 +16,9 @@
  *   - `aliases`     — msgpack `[{ hash, names[], note? }]`
  *   - `ledger`      — msgpack `{ tupleHashHex: { object?, relation?, wildcard?, firstSeen } }`
  *   - `identities`  — msgpack `{ hashHex: pubKeyBytes }` (durable issuer cache, doc #5)
+ *   - `outbox`      — msgpack `[payloadBytes, ...]` of locally-issued,
+ *                    not-yet-published signed Deltas (doc #8); flushed + cleared
+ *                    by `dacar publish --all`
  *
  * Secret material (the node's own identity private key) uses the adapter's
  * dedicated `loadKey`/`saveKey` slot, matching `@reticulum/core`.
@@ -324,6 +327,39 @@ export class DacarStore {
     const own = await this.loadIdentity();
     if (own) keyring.registerSingle(own.identityHash, await own.getPublicKey());
     return keyring;
+  }
+
+  // -- outbox (work doc #8) -----------------------------------------------
+
+  /**
+   * Load the outbox of locally-issued, not-yet-published signed Delta
+   * payloads, in the order they were issued. Returns an empty array when no
+   * outbox record exists yet.
+   * @returns {Promise<Uint8Array[]>}
+   */
+  async loadOutbox() {
+    const bytes = await this._adapter.get(NS, "outbox");
+    if (!bytes) return [];
+    let obj;
+    try {
+      obj = MsgPack.decode(bytes);
+    } catch {
+      return []; // corrupted -> treat as empty (do not crash the CLI)
+    }
+    if (!Array.isArray(obj)) return [];
+    return obj.filter((p) => p instanceof Uint8Array).map((p) => new Uint8Array(p));
+  }
+
+  /**
+   * Persist the outbox as a MessagePack array of signed Delta payloads.
+   * @param {Uint8Array[]} payloads
+   */
+  async saveOutbox(payloads) {
+    await this._adapter.set(
+      NS,
+      "outbox",
+      MsgPack.encode(payloads.map((p) => new Uint8Array(p))),
+    );
   }
 }
 

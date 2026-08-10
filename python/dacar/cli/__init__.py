@@ -16,6 +16,7 @@ Usage::
     dacar check bergie read sensor:wind
     dacar grants
     dacar revoke bergie read sensor:wind
+    dacar publish delta.hex          # or `dacar publish --all` to flush the outbox
 """
 
 from __future__ import annotations
@@ -172,6 +173,21 @@ def build_parser() -> argparse.ArgumentParser:
     _add_online_flags(p)
     _add_global_flags(p)
     p.set_defaults(func=_cmd_sync)
+
+    # -- publish (work doc #8) ----------------------------------------------
+    p = sub.add_parser(
+        "publish",
+        help="publish signed delta(s) to the rfed channel (online, §11.1)",
+    )
+    p.add_argument("payloads", nargs="*",
+                   help="payload file path(s) (or - for stdin); hex or binary")
+    p.add_argument("--all", action="store_true",
+                   help="publish + clear the outbox of locally-issued deltas")
+    p.add_argument("--binary", action="store_true",
+                   help="treat file input as raw binary (skip hex auto-detect)")
+    _add_online_flags(p)
+    _add_global_flags(p)
+    p.set_defaults(func=_cmd_publish)
 
     # -- apply --------------------------------------------------------------
     p = sub.add_parser("apply", help="ingest a received delta payload (verify-on-ingest)")
@@ -389,6 +405,12 @@ def _cmd_sync(args):
     from dacar.cli.commands import cmd_sync
     args.store = _store_path(args)
     return cmd_sync(args)
+
+
+def _cmd_publish(args):
+    from dacar.cli.commands import cmd_publish
+    args.store = _store_path(args)
+    return cmd_publish(args)
 
 
 def main(argv: Optional[List[str]] = None) -> int:

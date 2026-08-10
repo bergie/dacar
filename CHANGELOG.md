@@ -5,6 +5,47 @@ All notable changes to Dacar will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Standalone `dacar publish` command (work doc #8, §11.1): publish a
+  previously-signed Delta without re-signing it. `dacar publish <file>...`
+  transmits the exact bytes of one (or several) signed payloads — a single
+  Delta goes out raw, multiple are packed via `DeltaReceiver.pack_payloads`
+  / `packPayloads` into one batch payload. `dacar publish --all` flushes a
+  persisted outbox (`outbox.msgpack` / KV record, mode `0600`) of locally-issued,
+  not-yet-published deltas: every `grant`/`revoke` that is **not** given
+  `--publish` (and, in Python, `--no-apply`) enqueues the just-signed payload;
+  `--all` packs the outbox into a batch, publishes it, then clears the outbox.
+  `--all` on an empty outbox is a no-op (exit 0, no RNS boot). `prune` (§9)
+  also drops outbox entries older than the deletion horizon — receivers
+  intake-reject them anyway, so republishing is pointless. Input parsing mirrors
+  `apply`: hex is auto-detected (whitespace-trimmed), `--binary` forces raw
+  bytes, `-` reads stdin, multiple `<file>`s publish a batch. Implemented in
+  both Python (canonical) and JavaScript, with smoketests
+  (`tests/test_cli_publish.py`, `test/cli-publish.test.js`).
+- Example `dacar` CLI commands for every step of the "Using Dacar" walkthrough
+  in the top-level `README.md`.
+
+### Fixed (JavaScript)
+- `dacar` commands without positional arguments rejected `--store`,
+  `--identity`, and `--full-hashes` with `Unknown option '--store'`. `buildOptions`
+  (`src/cli/dacar.js`) gated those global flags behind `if (spec.positional &&
+  spec.positional.length)`, so `init`, `sync`, `config show`, `grants`, and the
+  new `publish` silently dropped them — `dacar init --store <dir>` crashed before
+  writing any config, which in turn made `grant`/`revoke`/`sync` unreachable in a
+  real run. The flags are now added unconditionally to every subcommand.
+- `dacar grant`/`revoke` crashed with `toHex expects a Uint8Array` when recording
+  the plaintext ledger: `ledger.set(toHex(tuple.key), …)` double-encoded the
+  key — `Tuple.key` already returns the hex preimage string (the same key the
+  CRDT maps entries by, `StateVector` line 128). The ledger now uses `tuple.key`
+  directly, so `dacar grants`' plaintext lookup matches. (Latent — unreachable
+  while `init --store` rejected `--store`.)
+- `dacar grant`/`revoke` crashed with `payload.hex is not a function`:
+  `out(payload.hex())` called a nonexistent method — `Uint8Array` exposes
+  `toHex()`, not `hex()`. Now uses the shared `toHex()` helper, consistent with
+  the rest of the CLI. (Latent — same `init --store` gating masked it.)
+
 ## [1.1.1] - 2026-08-09
 
 ### Added
