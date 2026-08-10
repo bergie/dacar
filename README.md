@@ -14,6 +14,50 @@ Dacar is a specification aiming to help with this, providing a way to grant and 
 
 See [SPEC.md](SPEC.md) for the actual specification.
 
+## Using Dacar
+
+Dacar acts as a decentralized authorization firewall for your off-grid systems. It decouples who is allowed to do what from the network transport, allowing edge nodes to make secure access decisions while completely offline.
+
+1. Bootstrap the Trust Anchor: Create a Root Trust Anchor, the public Reticulum identity of the master administrator(s). Copy this Trust Anchor to all devices where you want to utilize Dacar permissions.
+
+   ```bash
+   dacar init                    # bootstrap the node store + own identity (aliased `self`)
+   dacar identity show           # print the node's identity hash (its root trust anchor)
+   dacar anchor add 7f3a9c2b…   # trust a remote root anchor on an edge device
+   ```
+
+2. Map Identities: In your local applications, you associate external user accounts with their 16-byte Reticulum Identity hashes (for example, `lille-oe` is `bbf0ba6afee382db3c7681a4e8e74a84`)
+
+   ```bash
+   dacar alias add lille-oe bbf0ba6afee382db3c7681a4e8e74a84
+   dacar alias add bob <bob-identity-hash>
+   dacar alias list
+   ```
+
+3. Issue Grants: From your admin machine, you generate and cryptographically sign an Operation (a Delta) granting a specific identity a permission over an object (e.g., _Bob_ is allowed to `switch` the `device:anchorLight`).
+
+   ```bash
+   dacar grant bob switch device:anchorLight                  # sign + apply locally; hex payload on stdout
+   dacar grant bob switch device:anchorLight --no-apply > delta.hex   # export a signed delta only
+   ```
+
+4. Sync the State: You transmit this signed payload to the edge device over any available transport—broadcast it via RFed, send it point-to-point via LXMF over VHF/LoRa, or physically scan it as a QR code. The device merges this delta into its local CRDT state.
+
+   ```bash
+   dacar apply delta.hex                                # ingest a received delta (verify-on-ingest)
+   dacar grant bob switch device:anchorLight --publish  # …or publish directly to the rfed channel
+   dacar sync                                          # pull pending deltas from the rfed channel
+   ```
+
+5. Enforce Locally: When _Bob_ attempts to switch on the light, the local application intercepts the request and queries the local Dacar Evaluation Engine. Dacar checks its internal state and immediately approves or denies the action based on cryptographic proof—without ever needing to phone home to a central server.
+
+   ```bash
+   dacar check bob switch device:anchorLight   # local Engine.evaluate → ALLOW/DENY
+   dacar grants --effective                    # list grants with ✔/⚠ authority tracing
+   ```
+
+See the [Python](python/README.md) and [JavaScript](javascript/README.md) implementation READMEs for the full `dacar` command reference.
+
 ## Status
 
 Just getting started
