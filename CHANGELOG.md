@@ -5,6 +5,13 @@ All notable changes to Dacar will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- `dacar init` now warns when `--salt` is not provided, indicating that a unique
+  random salt was generated and grants will be opaque across nodes unless they
+  share the same salt (see README for salt sharing workflow).
+
 ## [1.1.2] - 2026-08-10
 
 ### Added

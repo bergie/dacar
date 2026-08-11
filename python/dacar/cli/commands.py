@@ -124,7 +124,8 @@ def cmd_init(args) -> int:
     if store_path.exists() and Store(store_path).exists():
         raise CliError(f"store already initialized at {store_path}")
     salt: Optional[bytes] = None
-    if args.salt is not None:
+    salt_provided = args.salt is not None
+    if salt_provided:
         salt = _parse_salt_value(args.salt)
         if salt == DEFAULT_SALT:
             _err("WARNING: --salt is the default null salt (§3.3 fail-open on privacy).")
@@ -146,6 +147,9 @@ def cmd_init(args) -> int:
     _err(f"  horizon  : {config.deletion_horizon_days} days")
     if config.primary_salt == DEFAULT_SALT:
         _err("  WARNING: primary salt is the default null (§3.3 fail-open on privacy).")
+    if not salt_provided:
+        _err("  WARNING: a unique random salt was generated. Grants will be opaque across")
+        _err("           nodes unless they share the same salt (see README).")
     return EXIT_OK
 
 

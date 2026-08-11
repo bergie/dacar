@@ -18,7 +18,30 @@ See [SPEC.md](SPEC.md) for the actual specification.
 
 Dacar acts as a decentralized authorization firewall for your off-grid systems. It decouples who is allowed to do what from the network transport, allowing edge nodes to make secure access decisions while completely offline.
 
-1. Bootstrap the Trust Anchor: Create a Root Trust Anchor, the public Reticulum identity of the master administrator(s). Copy this Trust Anchor to all devices where you want to utilize Dacar permissions.
+1. Generate & Share the Privacy Salt: All nodes in a Dacar deployment MUST share the same 32-byte Privacy Salt (§3.3). This salt is used to hash object and relation labels for privacy. Without a shared salt, grants become opaque/unusable (the CRDT still converges, but plaintext queries like `bob switch device:anchorLight` won't match the stored hashed entries).
+
+   Generate the salt **once** on your admin machine, then distribute it out-of-band to every node:
+
+   ```bash
+   # Generate a cryptographically secure salt (run ONCE)
+   openssl rand -hex 32 > dacar-salt.hex
+   # or: python3 -c "import secrets; print(secrets.token_bytes(32).hex())" > dacar-salt.hex
+
+   # View the salt (hex) for safekeeping:
+   cat dacar-salt.hex
+   ```
+
+   Copy `dacar-salt.hex` to every node via your chosen transport (USB, QR code, LXMF, etc.) and use it when initializing:
+
+   ```bash
+   # On each node: initialize with the shared salt
+   dacar init --salt dacar-salt.hex
+
+   # Verify the salt is set:
+   dacar config show --reveal
+   ```
+
+2. Bootstrap the Trust Anchor: Create a Root Trust Anchor, the public Reticulum identity of the master administrator(s). Copy this Trust Anchor to all devices where you want to utilize Dacar permissions.
 
    ```bash
    dacar init                    # bootstrap the node store + own identity (aliased `self`)
@@ -26,7 +49,7 @@ Dacar acts as a decentralized authorization firewall for your off-grid systems. 
    dacar anchor add 7f3a9c2b…    # trust a remote root anchor on an edge device
    ```
 
-2. Map Identities: In your local applications, you associate external user accounts with their 16-byte Reticulum Identity hashes (for example, `lille-oe` is `bbf0ba6afee382db3c7681a4e8e74a84`)
+3. Map Identities: In your local applications, you associate external user accounts with their 16-byte Reticulum Identity hashes (for example, `lille-oe` is `bbf0ba6afee382db3c7681a4e8e74a84`)
 
    ```bash
    dacar alias add lille-oe bbf0ba6afee382db3c7681a4e8e74a84
@@ -34,7 +57,7 @@ Dacar acts as a decentralized authorization firewall for your off-grid systems. 
    dacar alias list
    ```
 
-3. Issue Grants: From your admin machine, you generate and cryptographically sign an Operation (a Delta) granting a specific identity a permission over an object (e.g., _Bob_ is allowed to `switch` the `device:anchorLight`).
+4. Issue Grants: From your admin machine, you generate and cryptographically sign an Operation (a Delta) granting a specific identity a permission over an object (e.g., _Bob_ is allowed to `switch` the `device:anchorLight`).
 
    ```bash
    dacar grant bob switch device:anchorLight                          # sign + apply locally; hex payload on stdout
@@ -42,7 +65,7 @@ Dacar acts as a decentralized authorization firewall for your off-grid systems. 
    dacar grant bob switch device:anchorLight --publish                # …or publish directly to the rfed channel
    ```
 
-4. Sync the State: You transmit this signed payload to the edge device over any available transport—broadcast it via RFed, send it point-to-point via LXMF over VHF/LoRa, or physically scan it as a QR code. The device merges this delta into its local CRDT state.
+5. Sync the State: You transmit this signed payload to the edge device over any available transport—broadcast it via RFed, send it point-to-point via LXMF over VHF/LoRa, or physically scan it as a QR code. The device merges this delta into its local CRDT state.
 
    ```bash
    dacar publish delta.hex                              # publish a previously-exported signed delta later (work doc #8)
@@ -51,7 +74,7 @@ Dacar acts as a decentralized authorization firewall for your off-grid systems. 
    dacar sync                                           # pull pending deltas from the rfed channel
    ```
 
-5. Enforce Locally: When _Bob_ attempts to switch on the light, the local application intercepts the request and queries the local Dacar Evaluation Engine. Dacar checks its internal state and immediately approves or denies the action based on cryptographic proof—without ever needing to phone home to a central server.
+6. Enforce Locally: When _Bob_ attempts to switch on the light, the local application intercepts the request and queries the local Dacar Evaluation Engine. Dacar checks its internal state and immediately approves or denies the action based on cryptographic proof—without ever needing to phone home to a central server.
 
    ```bash
    dacar check bob switch device:anchorLight   # local Engine.evaluate → ALLOW/DENY
