@@ -23,7 +23,7 @@ Dacar acts as a decentralized authorization firewall for your off-grid systems. 
    ```bash
    dacar init                    # bootstrap the node store + own identity (aliased `self`)
    dacar identity show           # print the node's identity hash (its root trust anchor)
-   dacar anchor add 7f3a9c2b…   # trust a remote root anchor on an edge device
+   dacar anchor add 7f3a9c2b…    # trust a remote root anchor on an edge device
    ```
 
 2. Map Identities: In your local applications, you associate external user accounts with their 16-byte Reticulum Identity hashes (for example, `lille-oe` is `bbf0ba6afee382db3c7681a4e8e74a84`)
