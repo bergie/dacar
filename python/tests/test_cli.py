@@ -67,7 +67,11 @@ class CliSmoketest(unittest.TestCase):
         store = Store(self.store)
         config = store.load_config()
         self.assertNotEqual(config.primary_salt, b"\x00" * 32)
-        self.assertNotIn("WARNING", err)  # no fail-open warning on random salt
+        # A random salt is privacy-safe: no fail-open (null-salt) warning fires.
+        self.assertNotIn("fail-open", err.lower())
+        # init does, however, note that grants are opaque across nodes unless
+        # the salt is shared (see CHANGELOG / README salt-sharing workflow).
+        self.assertIn("unique random salt", err)
         # The self anchor and alias exist.
         identity = store.load_identity()
         aliases = store.load_aliases()
