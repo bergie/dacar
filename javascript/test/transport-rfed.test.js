@@ -1,12 +1,12 @@
 import { describe, it, before } from "node:test";
 import assert from "node:assert/strict";
+import { Identity } from "@reticulum/core";
+import { LXMessage } from "@reticulum/core/src/lxmf/index.js";
 import {
-  Identity,
-  LXMessage,
   deliveryHashFor,
   deriveChannel,
   wrapChannelMessage,
-} from "@reticulum/core";
+} from "@reticulum/core/src/rfed/index.js";
 import { Action, Operation } from "../src/operation.js";
 import { Tuple } from "../src/tuple.js";
 import { HASH_SIZE, NamespaceHasher } from "../src/namespace.js";

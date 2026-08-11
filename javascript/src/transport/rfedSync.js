@@ -33,12 +33,12 @@
  * ```
  */
 
+import { LXMessage } from "@reticulum/core/src/lxmf/index.js";
 import {
-  LXMessage,
   deliveryHashFor,
   deriveChannel,
   unwrapChannelMessage,
-} from "@reticulum/core";
+} from "@reticulum/core/src/rfed/index.js";
 import { LXMF_DELIVERY_TITLE, RFED_TOPIC } from "../naming.js";
 import { messageContent } from "./lxmfSync.js";
 
@@ -46,7 +46,7 @@ import { messageContent } from "./lxmfSync.js";
  * The shape of the decoded fanout callback argument from `RFedClient.listen`.
  * Only `message` is consumed here.
  * @typedef {Object} RfedDecoded
- * @property {import("@reticulum/core").LXMessage} message
+ * @property {import("@reticulum/core/src/lxmf/index.js").LXMessage} message
  * @property {unknown} [senderIdentity]
  * @property {Uint8Array} [senderPub]
  * @property {Uint8Array} [sourceHash]
@@ -61,7 +61,7 @@ import { messageContent } from "./lxmfSync.js";
  * @typedef {Object} RFedClientLike
  * @property {(nodeHash: Uint8Array, channelName: string) => Promise<unknown>} subscribe
  * @property {(nodeHash: Uint8Array, channelName: string) => Promise<unknown>} [unsubscribe]
- * @property {(nodeHash: Uint8Array, channelName: string, lxmMessage: import("@reticulum/core").LXMessage) => Promise<unknown>} publish
+ * @property {(nodeHash: Uint8Array, channelName: string, lxmMessage: import("@reticulum/core/src/lxmf/index.js").LXMessage) => Promise<unknown>} publish
  * @property {(nodeHash: Uint8Array, channelName: string) => Promise<{ items: Array<{ channelHash: Uint8Array, blob: Uint8Array }>, morePending: boolean }>} pull
  * @property {(onMessage: (decoded: RfedDecoded) => void) => Promise<Uint8Array>} listen
  */
@@ -104,7 +104,7 @@ export class RfedDeltaSync {
    * `lxmf.delivery` hashes before serialization, so the classic "source_hash
    * is the bare identity hash" bug cannot occur.
    * @param {Uint8Array} deltaPayload
-   * @returns {import("@reticulum/core").LXMessage}
+   * @returns {import("@reticulum/core/src/lxmf/index.js").LXMessage}
    */
   makeMessage(deltaPayload) {
     if (!(deltaPayload instanceof Uint8Array)) {
@@ -148,7 +148,7 @@ export class RfedDeltaSync {
    * unstamped publish may be silently dropped by a cost-enforcing node.
    * @param {Uint8Array} deltaPayload
    * @param {Uint8Array} nodeHash
-   * @returns {Promise<import("@reticulum/core").LXMessage>} The published message.
+   * @returns {Promise<import("@reticulum/core/src/lxmf/index.js").LXMessage>} The published message.
    */
   async publish(deltaPayload, nodeHash) {
     const message = this.makeMessage(deltaPayload);

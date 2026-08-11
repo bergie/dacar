@@ -18,7 +18,7 @@
  * never pulls it in. It depends only on `@reticulum/core`, which the core
  * already depends on, so no new dependency is added.
  *
- * Typical use (receiver, wired to a {@link import("@reticulum/core").LXMRouter
+ * Typical use (receiver, wired to a {@link import("@reticulum/core/src/lxmf/index.js").LXMRouter
  * LXMRouter}):
  *
  * ```js
@@ -38,7 +38,7 @@
  * await delivery.handleMessage(event.detail.message);
  */
 
-import { LXMessage as LXMFMessage } from "@reticulum/core";
+import { LXMessage as LXMFMessage } from "@reticulum/core/src/lxmf/index.js";
 import { LXMF_DELIVERY_TITLE } from "../naming.js";
 
 /**
@@ -99,13 +99,13 @@ export class LxmfDeltaDelivery {
    * @param {import("../delta.js").DeltaReceiver | null} [opts.receiver]
    *   The shared DeltaReceiver (state + key resolver). May be omitted on a
    *   send-only node (then `handleMessage` throws if called).
-   * @param {import("@reticulum/core").LXMRouter | null} [opts.router]
+   * @param {import("@reticulum/core/src/lxmf/index.js").LXMRouter | null} [opts.router]
    *   Optional bound `LXMRouter` for `deliver` / `ingestPaperUri`.
    */
   constructor({ receiver = null, router = null } = {}) {
     /** @type {import("../delta.js").DeltaReceiver | null} */
     this._receiver = receiver;
-    /** @type {import("@reticulum/core").LXMRouter | null} */
+    /** @type {import("@reticulum/core/src/lxmf/index.js").LXMRouter | null} */
     this._router = router;
   }
 
@@ -121,7 +121,7 @@ export class LxmfDeltaDelivery {
    * @param {Uint8Array} deltaPayload
    * @param {Uint8Array} destinationHash The recipient `lxmf.delivery` hash.
    * @param {Uint8Array} sourceHash The sender's `lxmf.delivery` hash.
-   * @returns {import("@reticulum/core").LXMessage}
+   * @returns {import("@reticulum/core/src/lxmf/index.js").LXMessage}
    */
   makeMessage(deltaPayload, destinationHash, sourceHash) {
     if (!(deltaPayload instanceof Uint8Array)) {
@@ -145,7 +145,7 @@ export class LxmfDeltaDelivery {
    * @param {Uint8Array} destinationHash The recipient `lxmf.delivery` hash.
    * @param {Object} [opts]
    * @param {Uint8Array | null} [opts.linkId] Reuse an existing DIRECT link id.
-   * @returns {Promise<import("@reticulum/core").LXMessage>}
+   * @returns {Promise<import("@reticulum/core/src/lxmf/index.js").LXMessage>}
    */
   async deliver(deltaPayload, destinationHash, { linkId = null } = {}) {
     if (!this._router) {
@@ -210,7 +210,7 @@ export class LxmfDeltaDelivery {
    * ingest result (the reconstructed message, or `null` if it was not for this
    * node / already ingested).
    * @param {string} uri
-   * @returns {Promise<import("@reticulum/core").LXMessage | null>}
+   * @returns {Promise<import("@reticulum/core/src/lxmf/index.js").LXMessage | null>}
    */
   async ingestPaperUri(uri) {
     if (!this._router) {

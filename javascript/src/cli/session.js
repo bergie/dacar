@@ -112,7 +112,7 @@ export async function ensureNodeIdentity(
  * @param {Uint8Array} opts.nodeHash The rfed node's `rfed.*` destination hash.
  * @param {string} [opts.topic] RFed channel name (default `dacar.policy.v1`).
  * @param {import("../transport/rfedSync.js").RFedClientLike} opts.client
- * @returns {Promise<import("@reticulum/core").LXMessage>}
+ * @returns {Promise<import("@reticulum/core/src/lxmf/index.js").LXMessage>}
  */
 export async function runPublish({ deltaPayload, nodeHash, topic, client }) {
   const sync = new RfedDeltaSync({ client, topic });

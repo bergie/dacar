@@ -6,6 +6,10 @@
     ".": "./src/index.js",
     "./transport": "./src/transport/index.js"
   },
+  "imports": {
+    "@reticulum/core": "jsr:@reticulum/core@^0.6.3",
+    "@reticulum/node": "jsr:@reticulum/node@^0.6.3"
+  },
   "exclude": [
     "scripts/",
     "node_modules/"

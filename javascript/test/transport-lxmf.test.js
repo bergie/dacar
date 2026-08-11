@@ -61,7 +61,7 @@ describe("LxmfDeltaDelivery (§11.2, §11.3)", () => {
 
   /** Build a message, round-trip it through the LXMF wire codec, and return the recovered message. */
   async function roundTrip(content, title, sender) {
-    const { LXMessage } = await import("@reticulum/core");
+    const { LXMessage } = await import("@reticulum/core/src/lxmf/index.js");
     const message = new LXMessage({ destinationHash: destHash, sourceHash: srcHash, content, title });
     const { wireData } = await message.serialize(sender);
     return { message, recovered: await LXMessage.deserialize(wireData, destHash) };
@@ -74,7 +74,7 @@ describe("LxmfDeltaDelivery (§11.2, §11.3)", () => {
     const delivery = new LxmfDeltaDelivery();
     const built = delivery.makeMessage(delta, destHash, srcHash);
     const { wireData } = await built.serialize(source);
-    const { LXMessage } = await import("@reticulum/core");
+    const { LXMessage } = await import("@reticulum/core/src/lxmf/index.js");
     const recovered = await LXMessage.deserialize(wireData, destHash);
     assert.equal(messageTitle(recovered), LxmfDeltaDelivery.TITLE);
     assert.deepEqual(messageContent(recovered), delta);
@@ -99,7 +99,7 @@ describe("LxmfDeltaDelivery (§11.2, §11.3)", () => {
 
     const built = delivery.makeMessage(op.toPayload(), destHash, srcHash);
     const { wireData } = await built.serialize(source);
-    const { LXMessage } = await import("@reticulum/core");
+    const { LXMessage } = await import("@reticulum/core/src/lxmf/index.js");
     const recovered = await LXMessage.deserialize(wireData, destHash);
 
     assert.equal(await delivery.handleMessage(recovered), true);
@@ -145,7 +145,7 @@ describe("LxmfDeltaDelivery (§11.2, §11.3)", () => {
     });
 
     assert.ok(uri.startsWith("lxm://"));
-    const { LXMessage } = await import("@reticulum/core");
+    const { LXMessage } = await import("@reticulum/core/src/lxmf/index.js");
     const paperData = LXMessage.paperDataFromUri(uri);
     assert.ok(paperData.length > 0);
     assert.equal(contains(paperData, delta), false); // encrypted — no plaintext Delta leak
