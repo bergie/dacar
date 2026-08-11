@@ -136,7 +136,7 @@ describe("DacarStore round-trip (doc #6)", () => {
     // Manually write a malformed record through the adapter.
     const { MsgPack } = await import("@reticulum/core");
     const forged = MsgPack.encode({ ["00".repeat(16)]: new Uint8Array(10) });
-    await adapter.set("dacar", "identities", forged);
+    await adapter.set("dacar", "identities.msgpack", forged);
     const keyring = await store.loadKeyring();
     assert.equal(keyring.size, 0, "malformed entry dropped, not trusted");
   });

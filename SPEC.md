@@ -37,7 +37,7 @@ To prevent label disclosure over public transports, Dacar never transmits or sto
  * **Matching Algorithm:** To evaluate a plaintext request against a hashed tuple, the node hashes the request's segments using the local Privacy Salt and sequentially compares the byte arrays. A match succeeds if all tuple hashes match and the wildcard flag is true, or if the arrays are identical.
 ## 4. Bootstrapping & Trust Anchors
 ### 4.1 Configuration
-Every Dacar-enabled service node MUST be configured out-of-band with one or more **Root Trust Anchors**.
+Every Dacar-enabled service node MUST be configured out-of-band with one or more **Root Trust Anchors**. A recommended on-disk encoding for this configuration is specified in §13.2.
  1. **Single Identity:** A standard 16-byte `RNS.Identity` hash. RNS computes this hash as `SHA-256(P)[:16]`, where `P` is the identity's 64-byte public key — the 32-byte X25519 encryption public key concatenated with the 32-byte Ed25519 signing public key (`X25519_pub ‖ Ed25519_pub`).
  2. **Threshold Group (N-of-M):** A composite authority requiring consensus, defined by a set of M specific RNS.Identity hashes and an integer N (`1 ≤ N ≤ M`; `N == M` is the unanimous-consent case). The **Group ID** is the SHA-256 hash of the following packed binary pre-image, **strictly truncated to the first 16 bytes**: the M member hashes (16 bytes each) sorted ascending by raw byte value (equivalent to hex-alphabetical order), followed by the threshold N encoded as an 8-byte big-endian unsigned integer. The Group ID is itself a 16-byte value usable wherever an Issuer hash is expected.
    > **Note on Scope:** In v1.0, Threshold Groups MAY ONLY act as Issuers. A Grantee MUST be a single Identity. Granting permissions to a Threshold Group is not currently supported.
@@ -147,3 +147,127 @@ Because targeted Deltas are LXMF messages, they natively support LXMF’s **Pape
  * **Permanent Deny Veto:** An Explicit Deny unconditionally overrides Allows until that specific Deny Tuple is revoked.
  * **Timestamp Manipulation:** Operations projecting >24 hours into the future MUST be rejected to prevent LWW bias.
  * **Partition Penalties:** A demoted administrator's stale grants remain valid on any node that has not yet synced the demotion operation, emphasizing the need for Strict Consistency Challenges on destructive actions.
+
+## 13. Local Node Store
+
+How a node persists its configuration, signing identity, HLC, CRDT state, aliases, plaintext ledger, issuer-identity cache, and outbox is an **implementation choice** — a node MAY use a relational database, a key-value store, cloud storage, or no persistence at all. This section defines a **recommended file-based layout** that implementations are **encouraged** to adopt when they persist to the local filesystem, so that independently-developed CLIs (e.g. the Python and JavaScript reference implementations) can read and write the **same** store directory interchangeably.
+
+The byte formats below are **normative for implementations that choose this file layout**: to claim compatibility with the reference store, an implementation MUST produce byte-identical files for every record except the identity private key (§13.9). The canonical Python `Store` is the reference implementation; other implementations SHOULD match its on-disk bytes. Implementations using a different persistence backend (database, cloud, etc.) need not follow this layout, but SHOULD preserve the same logical records and field semantics where applicable.
+
+### 13.1 File Layout
+
+The store directory (conventionally `~/.dacar/`, mode `0700`) contains loose files at its root — one per record, with the exact filenames below. Implementations choosing this layout SHOULD NOT use subdirectories or a key-value `.bin` layout for these records.
+
+| File | Mode | Record |
+|---|---|---|
+| `config` | `0600` | Node configuration (INI text, §13.2) |
+| `clock.msgpack` | `0644` | Persisted HLC (§5.1, §13.3) |
+| `state.msgpack` | `0600` | CRDT snapshot (§6, §13.4) |
+| `aliases` | `0644` | Human-readable name map (§13.5) |
+| `ledger.msgpack` | `0600` | Plaintext grant ledger (§13.6) |
+| `identities.msgpack` | `0600` | Issuer public-key cache (§11.2.4, §13.7) |
+| `outbox.msgpack` | `0600` | Locally-issued, unpublished Deltas (§11, §13.8) |
+| `identity` | `0600` | Node signing identity private key (§13.9) |
+
+Secret records (the salt, CRDT state, plaintext labels, and node-local signed payloads) are `0600`; the HLC and aliases are `0644` (they carry no secret material). Modes SHOULD be set explicitly (independent of umask).
+
+`identities.msgpack` and `outbox.msgpack` are **lazy**: a fresh `init` SHOULD NOT create them. They appear only when first written (first issuer remembered / first unpublished Delta queued).
+
+### 13.2 `config` — INI
+
+The node configuration is an INI text file (as written by Python's `configparser` and RNS's own config files). Option keys are lowercase. Sections appear in fixed order, each followed by a blank line:
+
+```ini
+[salt]
+primary = <64 hex chars (32-byte Privacy Salt)>
+legacy0 = <64 hex chars>   # optional, up to 2 (§10.1)
+legacy1 = <64 hex chars>   # optional
+
+[trust]
+anchors = <16-byte hex>, <16-byte hex>, ...   # Root Trust Anchors (§4.1)
+authoritative = <16-byte hex>                  # optional
+
+[policy]
+deletion_horizon_days = <int>                 # §9, default 180
+
+[rfed]
+topic = <string>            # §11.1, default dacar.policy.v1
+node = <16-byte hex>         # optional: the rfed peer to publish to
+```
+
+The `anchors` value is a comma-separated list of 16-byte RNS identity hashes (hex). `authoritative` is a single identity hash (optional). Hex values are lowercase, no `0x` prefix.
+
+### 13.3 `clock.msgpack` — HLC
+
+A MessagePack map with two integer keys (snake_case):
+
+```json
+{ "last_ms": <uint48>, "logical": <uint16> }
+```
+
+### 13.4 `state.msgpack` — CRDT Snapshot
+
+The serialized CRDT state vector (§6): a MessagePack array of rows, one per Tuple, in insertion order. Each row is a 7-element array:
+
+```json
+[ relation_hash(16), [object_hash(16), ...], wildcard_bool, grantee(16), issuer(16), add_ts|null, remove_ts|null ]
+```
+
+The Tuple Hash (§6.1) is recoverable from the first five fields and is not stored. `add_ts`/`remove_ts` are HLC integers (§5.1) or `nil`. This payload is **trusted-local-only** — it carries no signature material and MUST NOT be accepted from the network; network convergence uses signed §5.3 Operations via verify-on-ingest (§11.2.4).
+
+### 13.5 `aliases` — rnns Text
+
+A UTF-8 text file naming known identities, one entry per line:
+
+```
+<16-byte hex hash> <name> [<name2> ...] [  # note]
+```
+
+Multiple names for one hash are space-separated on the same line. An optional `# note` (preceded by two spaces) may follow. The file ends with a trailing newline; an empty registry serializes to zero bytes. The reserved name `self` always points to the node's own signing identity. Lines whose first token is not a 32-hex-char hash are ignored.
+
+### 13.6 `ledger.msgpack` — Plaintext Ledger
+
+A MessagePack map keyed by the **hex-encoded Tuple Hash** (§6.1 — `sha256(preimage).hex()`) to a row recording the plaintext annotation for grants issued locally:
+
+```json
+{ "<tuple_hash_hex>": { "object": "<string>|null", "relation": "<string>|null", "wildcard": <bool>|null, "first_seen": <uint> } }
+```
+
+Keys are snake_case (`first_seen`). Network-received Deltas have no plaintext and are absent from this ledger. `first_seen` is the physical HLC timestamp (high 48 bits) of the issuing operation.
+
+### 13.7 `identities.msgpack` — Issuer Public-Key Cache
+
+A MessagePack map from a 16-byte Issuer hash (hex key) to its **32-byte Ed25519 public key** (the signing half of the 64-byte RNS public key):
+
+```json
+{ "<16-byte hex>": <32 raw bytes> }
+```
+
+Only single-identity entries (threshold 1) are stored; Threshold Group keysets (§4.1) are not persisted here (resolved via explicit registration). Entries with a value length other than 32 bytes MUST be dropped on load (defensive: a poisoned entry causes a signature mismatch, not a trust breach).
+
+### 13.8 `outbox.msgpack` — Unpublished Deltas
+
+A MessagePack array of raw §5.3 transport payloads — signed Operations issued locally but not yet published via RFed (§11.1) or LXMF (§11.2), in issuance order:
+
+```json
+[ <payload bytes>, ... ]
+```
+
+`publish --all` flushes and clears the outbox. A corrupted or non-array record MUST be treated as empty (the CLI must not crash).
+
+### 13.9 `identity` — Node Signing Identity
+
+The node's own RNS signing identity private key, persisted library-natively. Because different Reticulum implementations own different private-key serialization formats (Python RNS writes 64 bytes — 32-byte X25519 private + 32-byte Ed25519 private; other runtimes may write 128 bytes including the public halves), this **one file is the sole intentional divergence** between implementations adopting this layout.
+
+A store directory therefore carries the signing identity of whichever implementation initialized it. All other records (§13.2–§13.8) are byte-identical across implementations, so a store created by one CLI is fully readable — and writable — by any other. An implementation that did not initialize the store cannot sign with the foreign identity file; it SHOULD re-`init` or load a format-native identity to issue Operations.
+
+### 13.10 Cross-Implementation Interoperability
+
+Implementations adopting this file layout SHOULD produce a store in which every record except `identity` is byte-identical to the canonical format above, so that two independently-developed `dacar` CLIs sharing one store directory (e.g. over a mounted volume or sneakernet) interoperate without conversion:
+
+ * `init` produces the same file set (config, clock.msgpack, state.msgpack, ledger.msgpack, aliases — the lazy records are absent).
+ * `grants` / `check` read the CRDT, ledger, and aliases written by either implementation.
+ * `grant` / `revoke` append to the ledger using the §6.1 Tuple Hash as the key, and queue to the outbox, in a format readable by either.
+ * `identity remember` writes the 32-byte Ed25519 public key to `identities.msgpack`.
+
+The canonical Python `Store` is the reference implementation; other implementations SHOULD match its on-disk bytes.

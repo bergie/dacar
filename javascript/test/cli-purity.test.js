@@ -30,7 +30,8 @@ describe("browser purity (work doc #6)", () => {
 
   it("the portable CLI helpers (session/store) never import @reticulum/node", () => {
     // These are browser-safe entry points (exposed via ./cli/session, ./cli/store).
-    // Only the Node-only bin (dacar.js) may import @reticulum/node.
+    // Only the Node-only bin (dacar.js) and its Node-only helpers (fileStore.js)
+    // may import @reticulum/node.
     for (const f of ["src/cli/session.js", "src/cli/store.js"]) {
       const text = src(f);
       assert.doesNotMatch(
@@ -41,9 +42,14 @@ describe("browser purity (work doc #6)", () => {
     }
   });
 
-  it("the Node-only CLI bin (dacar.js) is the sole importer of @reticulum/node", () => {
-    const text = src("src/cli/dacar.js");
-    assert.match(text, /from\s+["']@reticulum\/node/, "dacar.js should import @reticulum/node");
+  it("the Node-only CLI bin + file adapter import @reticulum/node", () => {
+    // dacar.js is the CLI entry; fileStore.js is the Python-parity loose-file
+    // adapter (imports node:fs + @reticulum/node's FileStorageAdapter).
+    assert.match(
+      src("src/cli/fileStore.js"),
+      /from\s+["']@reticulum\/node/,
+      "fileStore.js should import @reticulum/node (delegates identity + ratchets)",
+    );
   });
 
   it("the core index does not re-export the cli subpath", () => {

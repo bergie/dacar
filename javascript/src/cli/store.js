@@ -2,26 +2,33 @@
  * DacarStore: persistent node store over a `StorageAdapter` (work doc #6).
  *
  * Backend-neutral: built on `@reticulum/core`'s `StorageAdapter` KV contract
- * (`get`/`set`/`delete`/`keys`, namespaced). Mirrors Python's `Store` fields
- * logically, but stores each as a namespaced KV record rather than an INI +
- * loose files — JS has no `0600`-mode INI convention, and the KV contract is
- * the idiomatic, portable choice (Node `FileStorageAdapter`, in-memory for
- * tests, IndexedDB for browsers).
+ * (`get`/`set`/`delete`/`keys`, namespaced). The on-disk **record bytes are
+ * byte-for-byte identical to the canonical Python `Store`** (work doc #9), so a
+ * store directory written by one CLI is readable — and writable — by the other:
  *
- * Records:
- *   - `config`      — msgpack `{ primarySalt, legacySalts[], anchors[],
- *                      authoritative?, horizonDays, rfedTopic, rfedNode? }`
- *   - `clock`       — msgpack `{ lastMs, logical }`
- *   - `state`       — `StateVector.toPayload()` (the CRDT, trusted-local)
- *   - `aliases`     — msgpack `[{ hash, names[], note? }]`
- *   - `ledger`      — msgpack `{ tupleHashHex: { object?, relation?, wildcard?, firstSeen } }`
- *   - `identities`  — msgpack `{ hashHex: pubKeyBytes }` (durable issuer cache, doc #5)
- *   - `outbox`      — msgpack `[payloadBytes, ...]` of locally-issued,
- *                    not-yet-published signed Deltas (doc #8); flushed + cleared
- *                    by `dacar publish --all`
+ *   - `config`            — INI (`configparser` layout: `[salt]`/`[trust]`/
+ *                            `[policy]`/`[rfed]`, `key = value`, `legacy{i}`).
+ *   - `clock.msgpack`     — msgpack `{ last_ms, logical }` (snake_case).
+ *   - `state.msgpack`     — `StateVector.toPayload()` (the CRDT, trusted-local).
+ *   - `aliases`           — rnns text `hash name [# note]` (NOT msgpack).
+ *   - `ledger.msgpack`    — msgpack `{ tuple_hash_hex: { object, relation,
+ *                            wildcard, first_seen } }` (snake_case; the tuple
+ *                            hash key is `sha256(preimage).hex()`).
+ *   - `identities.msgpack`— msgpack `{ hash_hex: 32-byte Ed25519 pub }` (the
+ *                            Ed25519 half of the 64-byte RNS pub key).
+ *   - `outbox.msgpack`    — msgpack `[payload_bytes, ...]` of locally-issued,
+ *                            not-yet-published signed Deltas (doc #8).
  *
- * Secret material (the node's own identity private key) uses the adapter's
- * dedicated `loadKey`/`saveKey` slot, matching `@reticulum/core`.
+ * Record names are the exact Python filenames (with `.msgpack` where Python
+ * uses it); a Node `DacarFileAdapter` (`./fileStore.js`) writes them as loose
+ * files in the store root with Python-matching modes. `MemoryStorageAdapter`
+ * (tests) just stores the same bytes keyed by name.
+ *
+ * The node's own signing **identity private key** is the ONE intentional
+ * divergence: it stays library-native (Python RNS → 64-byte priv-only
+ * `identity`; `@reticulum/core` → 128-byte priv+pub `identity.key` via
+ * `adapter.loadKey`/`saveKey`). The two files coexist under different names; a
+ * store carries the identity of whichever CLI initialized it.
  */
 
 import { MsgPack, Identity, toHex } from "@reticulum/core";
@@ -35,15 +42,24 @@ import {
   MAX_LEGACY_SALTS,
   SALT_SIZE,
 } from "../namespace.js";
-import { Keyring, IssuerKeyset } from "../verifier.js";
+import { Keyring } from "../verifier.js";
 
 /** The alias that always names the node's own signing identity. */
 export const SELF_ALIAS = "self";
 
-/** The 64-byte RNS public key (X25519 ‖ Ed25519). */
-const RNS_PUBLIC_KEY_SIZE = 64;
+/** Ed25519 public keys are 32 raw bytes (the verify half of a 64-byte RNS key). */
+const ED25519_PUB_SIZE = 32;
 
 const NS = "dacar";
+
+// Record names mirror the canonical Python `Store` filenames exactly.
+const CONFIG_RECORD = "config";
+const CLOCK_RECORD = "clock.msgpack";
+const STATE_RECORD = "state.msgpack";
+const ALIASES_RECORD = "aliases";
+const LEDGER_RECORD = "ledger.msgpack";
+const IDENTITIES_RECORD = "identities.msgpack";
+const OUTBOX_RECORD = "outbox.msgpack";
 
 /**
  * @typedef {Object} StoreConfig
@@ -61,6 +77,14 @@ const NS = "dacar";
  * @property {Uint8Array} hash
  * @property {string[]} names
  * @property {string | null} [note]
+ */
+
+/**
+ * @typedef {Object} LedgerRow
+ * @property {string | null} [object]
+ * @property {string | null} [relation]
+ * @property {boolean | null} [wildcard]
+ * @property {number} [firstSeen]
  */
 
 /**
@@ -84,6 +108,11 @@ export class DacarStore {
 
   /**
    * Bootstrap a fresh node store (work doc #6 `init`).
+   *
+   * Produces the same file set as Python `Store.init`: `config` (INI),
+   * `state.msgpack`, `clock.msgpack`, `ledger.msgpack`, `aliases` (with the
+   * `self` alias). `identities.msgpack` / `outbox.msgpack` are NOT pre-written
+   * (Python creates them lazily on first save).
    * @param {import("@reticulum/core").StorageAdapter} adapter
    * @param {Object} [opts]
    * @param {Uint8Array} [opts.salt] 32-byte Privacy Salt (default: random).
@@ -93,7 +122,6 @@ export class DacarStore {
    */
   static async init(adapter, opts = {}) {
     const store = new DacarStore(adapter, opts);
-    // Identity: adopt the override, else generate + persist via saveKey.
     let identity;
     if (opts.identityBytes) {
       identity = await Identity.fromBytes(opts.identityBytes);
@@ -120,34 +148,24 @@ export class DacarStore {
     const aliases = new AliasRegistry();
     aliases.add(SELF_ALIAS, identity.identityHash);
     await store.saveAliases(aliases);
-    await store.saveKeyring(new Keyring());
     return store;
   }
 
   /** @returns {Promise<boolean>} */
   async exists() {
-    return (await this._adapter.get(NS, "config")) !== null;
+    return (await this._adapter.get(NS, CONFIG_RECORD)) !== null;
   }
 
   /** @returns {Promise<StoreConfig>} */
   async loadConfig() {
-    const bytes = await this._adapter.get(NS, "config");
+    const bytes = await this._adapter.get(NS, CONFIG_RECORD);
     if (!bytes) throw new Error("store not initialized (run `dacar init`)");
-    return _decodeConfig(bytes);
+    return _decodeConfigIni(bytes);
   }
 
   /** @param {StoreConfig} config */
   async saveConfig(config) {
-    const obj = [
-      config.primarySalt,
-      config.legacySalts,
-      config.anchors,
-      config.authoritative ?? null,
-      config.horizonDays,
-      config.rfedTopic,
-      config.rfedNode ?? null,
-    ];
-    await this._adapter.set(NS, "config", MsgPack.encode(obj));
+    await this._adapter.set(NS, CONFIG_RECORD, _encodeConfigIni(config));
   }
 
   /**
@@ -196,12 +214,15 @@ export class DacarStore {
   /** @returns {Promise<Clock>} */
   async loadClock() {
     const clock = new Clock();
-    const bytes = await this._adapter.get(NS, "clock");
+    const bytes = await this._adapter.get(NS, CLOCK_RECORD);
     if (bytes) {
       const obj = MsgPack.decode(bytes);
       if (obj && typeof obj === "object" && !Array.isArray(obj)) {
-        if (typeof obj.lastMs === "number" && typeof obj.logical === "number") {
-          clock.restore(obj);
+        // snake_case on disk (Python parity); Clock API is camelCase.
+        const lastMs = obj.last_ms ?? obj.lastMs;
+        const logical = obj.logical;
+        if (typeof lastMs === "number" && typeof logical === "number") {
+          clock.restore({ lastMs, logical });
         }
       }
     }
@@ -212,8 +233,8 @@ export class DacarStore {
   async saveClock(clock) {
     await this._adapter.set(
       NS,
-      "clock",
-      MsgPack.encode(clock.snapshot()),
+      CLOCK_RECORD,
+      MsgPack.encode({ last_ms: clock.lastMs, logical: clock.logical }),
     );
   }
 
@@ -222,13 +243,12 @@ export class DacarStore {
   /** @param {Config} [config] @returns {Promise<StateVector>} */
   async loadState(config) {
     const horizon = config?.deletionHorizonDays ?? (await this.loadConfig()).horizonDays;
-    const bytes = await this._adapter.get(NS, "state");
+    const bytes = await this._adapter.get(NS, STATE_RECORD);
     if (bytes && bytes.length) {
       // `trusted: true` — these are this node's own persisted CRDT snapshot
       // (written by `saveState()` → `toPayload()`), never network bytes.
       // Network Operations arrive as signed Deltas through `DeltaReceiver`
-      // (the verify-on-ingest path), not here. Asserting `trusted` silences
-      // the audible `fromPayload` footgun warning during normal CLI use.
+      // (the verify-on-ingest path), not here.
       return StateVector.fromPayload(bytes, {
         deletionHorizonDays: horizon,
         trusted: true,
@@ -239,45 +259,51 @@ export class DacarStore {
 
   /** @param {StateVector} state */
   async saveState(state) {
-    await this._adapter.set(NS, "state", state.toPayload());
+    await this._adapter.set(NS, STATE_RECORD, state.toPayload());
   }
 
   // -- aliases -------------------------------------------------------------
 
   /** @returns {Promise<AliasRegistry>} */
   async loadAliases() {
-    const bytes = await this._adapter.get(NS, "aliases");
+    const bytes = await this._adapter.get(NS, ALIASES_RECORD);
     if (!bytes) return new AliasRegistry();
     return AliasRegistry.decode(bytes);
   }
 
   /** @param {AliasRegistry} aliases */
   async saveAliases(aliases) {
-    await this._adapter.set(NS, "aliases", aliases.encode());
+    await this._adapter.set(NS, ALIASES_RECORD, aliases.encode());
   }
 
   // -- ledger --------------------------------------------------------------
 
   /**
-   * @returns {Promise<Map<string, { object?: string, relation?: string, wildcard?: boolean, firstSeen?: number }>>}
+   * Plaintext ledger: `Map<tuple_hash_hex, row>`. The on-disk key is
+   * `sha256(preimage).hex()` (Python `Tuple.key`); callers MUST set/lookup with
+   * that key (e.g. `toHex(await tuple.hash())`) for cross-CLI parity.
+   * @returns {Promise<Map<string, LedgerRow>>}
    */
   async loadLedger() {
-    const bytes = await this._adapter.get(NS, "ledger");
-    /** @type {Map<string, any>} */
+    const bytes = await this._adapter.get(NS, LEDGER_RECORD);
+    /** @type {Map<string, LedgerRow>} */
     const ledger = new Map();
     if (bytes) {
       const obj = MsgPack.decode(bytes);
       if (obj && typeof obj === "object" && !Array.isArray(obj)) {
-        for (const [k, v] of Object.entries(obj)) ledger.set(k, v);
+        for (const [k, v] of Object.entries(obj)) {
+          ledger.set(k, _decodeLedgerRow(v));
+        }
       }
     }
     return ledger;
   }
 
-  /** @param {Map<string, any>} ledger */
+  /** @param {Map<string, LedgerRow>} ledger */
   async saveLedger(ledger) {
-    const obj = Object.fromEntries(ledger);
-    await this._adapter.set(NS, "ledger", MsgPack.encode(obj));
+    const obj = {};
+    for (const [k, row] of ledger) obj[k] = _encodeLedgerRow(row);
+    await this._adapter.set(NS, LEDGER_RECORD, MsgPack.encode(obj));
   }
 
   // -- issuer identity cache (work doc #5) ---------------------------------
@@ -285,21 +311,26 @@ export class DacarStore {
   /**
    * Load the persisted issuer identity cache. Returns an empty {@link Keyring}
    * if no cache record exists yet.
+   *
+   * On disk each value is the 32-byte Ed25519 public key (Python canonical);
+   * it is padded back to a 64-byte RNS public key (zeros ‖ Ed25519) for the
+   * in-memory `IssuerKeyset`, whose verify path only uses the Ed25519 half.
    * @returns {Promise<Keyring>}
    */
   async loadKeyring() {
     const keyring = new Keyring();
-    const bytes = await this._adapter.get(NS, "identities");
+    const bytes = await this._adapter.get(NS, IDENTITIES_RECORD);
     if (bytes) {
       const obj = MsgPack.decode(bytes);
       if (obj && typeof obj === "object" && !Array.isArray(obj)) {
         for (const [hashHex, pubKey] of Object.entries(obj)) {
-          if (pubKey instanceof Uint8Array && pubKey.length === RNS_PUBLIC_KEY_SIZE) {
-            try {
-              keyring.registerSingle(_hexToBytes(hashHex), pubKey);
-            } catch {
-              // skip malformed hash
-            }
+          if (!(pubKey instanceof Uint8Array) || pubKey.length !== ED25519_PUB_SIZE) {
+            continue; // skip malformed (wrong-length) entries
+          }
+          try {
+            keyring.registerSingle(_hexToBytes(hashHex), _padToRnsPub(pubKey));
+          } catch {
+            // skip malformed hash
           }
         }
       }
@@ -312,10 +343,11 @@ export class DacarStore {
     const obj = {};
     for (const [hashHex, keyset] of keyring.entries()) {
       if (keyset.threshold === 1 && keyset.memberPublicKeys.length === 1) {
-        obj[hashHex] = keyset.memberPublicKeys[0];
+        // Store the 32-byte Ed25519 half (last 32 bytes of the 64-byte RNS key).
+        obj[hashHex] = keyset.memberPublicKeys[0].slice(32, 64);
       }
     }
-    await this._adapter.set(NS, "identities", MsgPack.encode(obj));
+    await this._adapter.set(NS, IDENTITIES_RECORD, MsgPack.encode(obj));
   }
 
   /**
@@ -338,7 +370,7 @@ export class DacarStore {
    * @returns {Promise<Uint8Array[]>}
    */
   async loadOutbox() {
-    const bytes = await this._adapter.get(NS, "outbox");
+    const bytes = await this._adapter.get(NS, OUTBOX_RECORD);
     if (!bytes) return [];
     let obj;
     try {
@@ -357,7 +389,7 @@ export class DacarStore {
   async saveOutbox(payloads) {
     await this._adapter.set(
       NS,
-      "outbox",
+      OUTBOX_RECORD,
       MsgPack.encode(payloads.map((p) => new Uint8Array(p))),
     );
   }
@@ -365,7 +397,8 @@ export class DacarStore {
 
 /**
  * In-memory alias registry: `hash → names[]` with an optional note. Mirrors
- * Python's `AliasRegistry` (rnns `hash name [# note]`).
+ * Python's `AliasRegistry` (rnns `hash name [# note]`); `encode()`/`decode()`
+ * produce the exact rnns text bytes Python does.
  */
 export class AliasRegistry {
   /** @param {AliasEntry[]} [entries] */
@@ -373,118 +406,329 @@ export class AliasRegistry {
     /** @type {AliasEntry[]} */ this.entries = entries;
   }
 
-  /** @param {Uint8Array} bytes @returns {AliasRegistry} */
+  /**
+   * Parse rnns `hash name [# note]` lines (mirrors Python `AliasRegistry.parse`).
+   * Blank lines and lines whose first token is not a 32-hex hash are skipped.
+   * @param {Uint8Array} bytes
+   * @returns {AliasRegistry}
+   */
   static decode(bytes) {
-    const obj = MsgPack.decode(bytes);
-    if (!Array.isArray(obj)) return new AliasRegistry();
-    /** @type {AliasEntry[]} */
-    const entries = [];
-    for (const row of obj) {
-      if (!Array.isArray(row)) continue;
-      const [hash, names, note] = row;
-      if (!(hash instanceof Uint8Array) || !Array.isArray(names)) continue;
-      entries.push({ hash, names, note: note ?? null });
+    const registry = new AliasRegistry();
+    const text = new TextDecoder().decode(bytes);
+    for (const raw of text.split(/\r?\n/)) {
+      const line = raw.trim();
+      if (!line) continue;
+      let head = line;
+      let note = null;
+      const hashIdx = line.indexOf("#");
+      if (hashIdx !== -1) {
+        head = line.slice(0, hashIdx);
+        note = line.slice(hashIdx + 1).trim() || null;
+      }
+      const tokens = head.trim().split(/\s+/).filter(Boolean);
+      if (tokens.length === 0) continue;
+      const hashHex = tokens[0];
+      const names = tokens.slice(1);
+      if (hashHex.length !== HASH_SIZE * 2) continue;
+      let hashBytes;
+      try {
+        hashBytes = _hexToBytes(hashHex);
+      } catch {
+        continue;
+      }
+      if (hashBytes.length !== HASH_SIZE) continue;
+      if (names.length === 0) continue;
+      const existing = registry._entryFor(hashBytes);
+      if (existing) {
+        for (const n of names) {
+          if (!existing.names.includes(n)) existing.names.push(n);
+        }
+        if (note !== null) existing.note = note;
+      } else {
+        registry.entries.push({ hash: hashBytes, names: [...names], note });
+      }
     }
-    return new AliasRegistry(entries);
+    return registry;
   }
 
-  /** @returns {Uint8Array} */
+  /** @returns {Uint8Array} rnns text bytes (`hash name [# note]` per line). */
   encode() {
-    return MsgPack.encode(this.entries.map((e) => [e.hash, e.names, e.note ?? null]));
+    if (this.entries.length === 0) return new Uint8Array(0);
+    const lines = [];
+    for (const e of this.entries) {
+      const hashHex = toHex(e.hash);
+      let field = e.names.length ? `${hashHex} ${e.names.join(" ")}` : hashHex;
+      if (e.note) field += `  # ${e.note}`;
+      lines.push(field);
+    }
+    return new TextEncoder().encode(lines.join("\n") + "\n");
   }
 
-  /** @param {string} name @returns {Uint8Array | null} */
-  resolve(name) {
-    for (const e of this.entries) {
-      if (e.names.includes(name)) return e.hash;
+  /** @param {Uint8Array} hash @returns {AliasEntry | undefined} */
+  _entryFor(hash) {
+    return this.entries.find((e) => _bytesEqual(e.hash, hash));
+  }
+
+  /**
+   * @param {string} name
+   * @param {Uint8Array} hash
+   * @param {string} [note]
+   */
+  add(name, hash, note) {
+    const existing = this._entryFor(hash);
+    if (existing) {
+      if (!existing.names.includes(name)) existing.names.push(name);
+      if (note != null) existing.note = note;
+    } else {
+      this.entries.push({ hash, names: [name], note: note ?? null });
     }
-    return null;
+  }
+
+  /**
+   * Point the `self` alias at `hash` (replacing any prior), mirroring Python
+   * `set_self`: strip `SELF_ALIAS` from every entry, prune now-empty entries,
+   * then add `SELF_ALIAS` to the new hash.
+   * @param {Uint8Array} hash
+   */
+  setSelf(hash) {
+    for (const e of this.entries) {
+      e.names = e.names.filter((n) => n !== SELF_ALIAS);
+    }
+    this.entries = this.entries.filter((e) => e.names.length > 0);
+    this.add(SELF_ALIAS, hash);
+  }
+
+  /**
+   * Remove `name` from its entry (mirrors Python `remove`). Returns `true` if
+   * the name existed; the entry is dropped when it has no names left.
+   * @param {string} name
+   * @returns {boolean}
+   */
+  remove(name) {
+    for (const e of this.entries) {
+      const idx = e.names.indexOf(name);
+      if (idx !== -1) {
+        e.names.splice(idx, 1);
+        if (e.names.length === 0) {
+          this.entries = this.entries.filter((en) => en !== e);
+        }
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** @param {string} name @returns {Uint8Array | undefined} */
+  resolve(name) {
+    const e = this.entries.find((en) => en.names.includes(name));
+    return e?.hash;
   }
 
   /** @param {Uint8Array} hash @returns {string[]} */
   namesFor(hash) {
-    for (const e of this.entries) {
-      if (_bytesEqual(e.hash, hash)) return [...e.names];
-    }
-    return [];
+    return this._entryFor(hash)?.names ?? [];
   }
 
   /** @param {Uint8Array} hash @returns {string | null} */
   primaryName(hash) {
     const names = this.namesFor(hash);
-    return names[0] ?? null;
-  }
-
-  /** @param {string} name @param {Uint8Array} hash @param {string | null} [note] */
-  add(name, hash, note) {
-    for (const e of this.entries) {
-      if (_bytesEqual(e.hash, hash)) {
-        if (!e.names.includes(name)) e.names.push(name);
-        if (note !== undefined) e.note = note;
-        return;
-      }
-    }
-    this.entries.push({ hash, names: [name], note: note ?? null });
-  }
-
-  /** @param {Uint8Array} hash */
-  setSelf(hash) {
-    for (const e of this.entries) {
-      const i = e.names.indexOf(SELF_ALIAS);
-      if (i !== -1) e.names.splice(i, 1);
-    }
-    this.entries = this.entries.filter((e) => e.names.length > 0);
-    this.add(SELF_ALIAS, hash);
+    return names.length > 0 ? names[0] : null;
   }
 }
 
-// -- decode helpers ---------------------------------------------------------
+// =========================================================================
+// Helpers — record encode/decode (Python-canonical bytes) + small utilities
+// =========================================================================
 
 /**
+ * Encode a {@link StoreConfig} as the INI text `configparser` would write
+ * (sections `[salt]`/`[trust]`/`[policy]`/`[rfed]`, `key = value`, a blank
+ * line after each section, trailing blank line). Byte-identical to Python's
+ * `Store.save_config` output.
+ * @param {StoreConfig} config
+ * @returns {Uint8Array}
+ */
+function _encodeConfigIni(config) {
+  let out = "";
+  out += "[salt]\n";
+  out += `primary = ${toHex(config.primarySalt)}\n`;
+  for (let i = 0; i < config.legacySalts.length && i < MAX_LEGACY_SALTS; i++) {
+    out += `legacy${i} = ${toHex(config.legacySalts[i])}\n`;
+  }
+  out += "\n";
+  out += "[trust]\n";
+  out += `anchors = ${config.anchors.map(toHex).join(", ")}\n`;
+  if (config.authoritative) out += `authoritative = ${toHex(config.authoritative)}\n`;
+  out += "\n";
+  out += "[policy]\n";
+  out += `deletion_horizon_days = ${config.horizonDays}\n`;
+  out += "\n";
+  out += "[rfed]\n";
+  out += `topic = ${config.rfedTopic}\n`;
+  if (config.rfedNode) out += `node = ${toHex(config.rfedNode)}\n`;
+  out += "\n";
+  return new TextEncoder().encode(out);
+}
+
+/**
+ * Decode an INI `config` blob (as written by Python `configparser`) into a
+ * {@link StoreConfig}. Mirrors Python `Store.load_config_raw`: option keys are
+ * case-insensitive (configparser lowercases them); missing fields fall back to
+ * defaults; optional sections (`authoritative`, `node`, `legacy{i}`) are
+ * omitted when absent.
  * @param {Uint8Array} bytes
  * @returns {StoreConfig}
  */
-function _decodeConfig(bytes) {
-  const arr = MsgPack.decode(bytes);
-  if (!Array.isArray(arr) || arr.length !== 7) {
-    throw new Error("config record must be a 7-element MessagePack array");
+function _decodeConfigIni(bytes) {
+  const sections = _parseIni(bytes);
+  const salt = sections.get("salt") ?? new Map();
+  const primaryHex = salt.get("primary") ?? toHex(DEFAULT_SALT);
+  const primarySalt = _expectHex("primary", primaryHex, SALT_SIZE);
+  const legacySalts = [];
+  for (let i = 0; i < MAX_LEGACY_SALTS; i++) {
+    const v = salt.get(`legacy${i}`);
+    if (v) legacySalts.push(_expectHex(`legacy${i}`, v, SALT_SIZE));
   }
-  const [primarySalt, legacySalts, anchors, authoritative, horizonDays, rfedTopic, rfedNode] = arr;
+  const trust = sections.get("trust") ?? new Map();
+  const anchorsRaw = trust.get("anchors") ?? "";
+  const anchors = anchorsRaw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((h, i) => _expectHex(`anchors[${i}]`, h, HASH_SIZE));
+  const authoritative = trust.has("authoritative")
+    ? _expectHex("authoritative", trust.get("authoritative"), HASH_SIZE)
+    : null;
+  const policy = sections.get("policy") ?? new Map();
+  const horizonDays = parseInt(policy.get("deletion_horizon_days") ?? String(DEFAULT_DELETION_HORIZON_DAYS), 10);
+  const rfed = sections.get("rfed") ?? new Map();
+  const rfedTopic = rfed.get("topic") ?? RFED_TOPIC;
+  const rfedNode = rfed.has("node") ? _expectHex("node", rfed.get("node"), HASH_SIZE) : null;
+  return { primarySalt, legacySalts, anchors, authoritative, horizonDays, rfedTopic, rfedNode };
+}
+
+/**
+ * Minimal INI parser compatible with Python `configparser` output: sections in
+ * `[brackets]`, `key = value` (or `key: value`) lines, `#`/`;` comments and
+ * blank lines ignored. Option keys are lowercased (configparser `optionxform`).
+ * @param {Uint8Array} bytes
+ * @returns {Map<string, Map<string, string>>}
+ */
+function _parseIni(bytes) {
+  const text = new TextDecoder().decode(bytes);
+  /** @type {Map<string, Map<string, string>>} */
+  const sections = new Map();
+  let cur = null;
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#") || line.startsWith(";")) continue;
+    const sec = line.match(/^\[(.+)\]$/);
+    if (sec) {
+      cur = sec[1];
+      sections.set(cur, new Map());
+      continue;
+    }
+    if (!cur) continue;
+    const idx = line.search(/[=:]/);
+    if (idx < 0) continue;
+    const key = line.slice(0, idx).trim().toLowerCase();
+    const val = line.slice(idx + 1).trim();
+    sections.get(cur).set(key, val);
+  }
+  return sections;
+}
+
+/**
+ * @param {string} name
+ * @param {string} hex
+ * @param {number} len
+ * @returns {Uint8Array}
+ */
+function _expectHex(name, hex, len) {
+  const bytes = _hexToBytes(hex);
+  if (bytes.length !== len) {
+    throw new Error(`${name} must be ${len} bytes (${len * 2} hex), got ${bytes.length}`);
+  }
+  return bytes;
+}
+
+/**
+ * @param {unknown} v
+ * @returns {LedgerRow}
+ */
+function _decodeLedgerRow(v) {
+  if (!v || typeof v !== "object" || Array.isArray(v)) {
+    return { object: null, relation: null, wildcard: null, firstSeen: 0 };
+  }
+  const o = /** @type {Record<string, unknown>} */ (v);
   return {
-    primarySalt: _expectBytes(primarySalt, SALT_SIZE, "primary_salt"),
-    legacySalts: legacySalts.map((s) => _expectBytes(s, SALT_SIZE, "legacy_salt")),
-    anchors: anchors.map((a) => _expectBytes(a, HASH_SIZE, "anchor")),
-    authoritative: authoritative instanceof Uint8Array ? authoritative : null,
-    horizonDays: Number(horizonDays),
-    rfedTopic: String(rfedTopic),
-    rfedNode: rfedNode instanceof Uint8Array ? rfedNode : null,
+    object: _optStr(o.object),
+    relation: _optStr(o.relation),
+    wildcard: _optBool(o.wildcard),
+    firstSeen: typeof o.first_seen === "number" ? o.first_seen : 0,
   };
 }
 
 /**
- * @param {unknown} value
- * @param {number} len
- * @param {string} name
+ * @param {LedgerRow} row
+ * @returns {Record<string, unknown>}
+ */
+function _encodeLedgerRow(row) {
+  return {
+    object: row.object ?? null,
+    relation: row.relation ?? null,
+    wildcard: row.wildcard ?? null,
+    first_seen: row.firstSeen ?? 0,
+  };
+}
+
+/** @param {unknown} v @returns {string | null} */
+function _optStr(v) {
+  return typeof v === "string" ? v : null;
+}
+
+/** @param {unknown} v @returns {boolean | null} */
+function _optBool(v) {
+  return typeof v === "boolean" ? v : null;
+}
+
+/**
+ * Pad a 32-byte Ed25519 public key to a 64-byte RNS public key
+ * (`X25519(pub=zeros) ‖ Ed25519(pub)`). The verifier's `IssuerKeyset` holds
+ * 64-byte RNS keys; the X25519 half is unused for signature verification.
+ * @param {Uint8Array} ed25519Pub
  * @returns {Uint8Array}
  */
-function _expectBytes(value, len, name) {
-  if (!(value instanceof Uint8Array) || value.length !== len) {
-    throw new Error(`${name} must be a ${len}-byte Uint8Array`);
-  }
-  return value;
+function _padToRnsPub(ed25519Pub) {
+  const padded = new Uint8Array(64);
+  padded.set(ed25519Pub, 32);
+  return padded;
 }
 
-/** @param {Uint8Array} a @param {Uint8Array} b @returns {boolean} */
+/**
+ * @param {Uint8Array} a
+ * @param {Uint8Array} b
+ * @returns {boolean}
+ */
 function _bytesEqual(a, b) {
   if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
-  return diff === 0;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
 }
 
-/** @param {string} hex @returns {Uint8Array} */
+/**
+ * Parse a hex string (with or without `0x`) into bytes. Lower/upper-case
+ * tolerant; matches Python's `bytes.fromhex`.
+ * @param {string} hex
+ * @returns {Uint8Array}
+ */
 function _hexToBytes(hex) {
   const clean = hex.startsWith("0x") ? hex.slice(2) : hex;
+  if (clean.length % 2 !== 0 || !/^[0-9a-fA-F]*$/.test(clean)) {
+    throw new Error(`invalid hex string (length ${clean.length})`);
+  }
   const out = new Uint8Array(clean.length / 2);
   for (let i = 0; i < out.length; i++) {
     out[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
@@ -492,9 +736,12 @@ function _hexToBytes(hex) {
   return out;
 }
 
-/** @param {number} n @returns {Uint8Array} */
-function _randomBytes(n) {
-  const out = new Uint8Array(n);
+/**
+ * @param {number} len
+ * @returns {Uint8Array}
+ */
+function _randomBytes(len) {
+  const out = new Uint8Array(len);
   crypto.getRandomValues(out);
   return out;
 }

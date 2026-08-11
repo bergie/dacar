@@ -7,10 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `SPEC.md` §13 "Local Node Store": a recommended file-based store layout
+  (normative only for implementations that choose it) so that independently-
+  developed CLIs can read and write the same store directory interchangeably.
+  Documents the exact byte format of every record: INI `config`, snake_case
+  `clock.msgpack`/`ledger.msgpack`/`identities.msgpack`, rnns-text `aliases`,
+  the CRDT `state.msgpack` snapshot, and the `outbox.msgpack` queue. The node
+  signing identity private key is the sole intentional divergence (library-
+  native format).
+
 ### Changed
 - `dacar init` now warns when `--salt` is not provided, indicating that a unique
   random salt was generated and grants will be opaque across nodes unless they
   share the same salt (see README for salt sharing workflow).
+- **Store format now matches the canonical Python `Store` byte-for-byte**
+  (work doc #9): the JS CLI writes and reads the same `~/.dacar/` directory as
+  the Python CLI. `config` is now INI (was msgpack array); `clock.msgpack` and
+  `ledger.msgpack` use snake_case keys (`last_ms`, `first_seen`); `aliases` is
+  rnns text (was msgpack); `identities.msgpack` stores 32-byte Ed25519 public
+  keys (was 64-byte RNS keys); the ledger key is `sha256(preimage).hex()` (was
+  the raw preimage hex); files are written as loose files at the store root
+  (was `<dir>/dacar/<key>.bin`) with Python-matching modes (0600/0644).
+- Bumped `@reticulum/core` and `@reticulum/node` to `^0.6.3` in both
+  `package.json` (npm) and `jsr.json` (JSR `imports` map).
+- Migrated imports of `LXMessage`/`LXMRouter` to `@reticulum/core/src/lxmf/index.js`
+  and of `RFedClient` plus the rfed helpers (`deliveryHashFor`, `deriveChannel`,
+  `unwrapChannelMessage`, `wrapChannelMessage`) to `@reticulum/core/src/rfed/index.js`.
+  `@reticulum/core` 0.6.x no longer re-exports these sizable, server-leaning
+  modules from the package root; they are now imported by subpath on both npm
+  and JSR. JSDoc `import("@reticulum/core")` type references to the moved
+  symbols were updated accordingly.
+
+### Fixed
+- The JSR package `@reticulum/dacar` resolved `@reticulum/core` and
+  `@reticulum/node` as **npm** dependencies (JSR reported `usesNpm: true` and
+  the dependency graph showed `npm:@reticulum/core`) because `jsr.json` had no
+  `imports` map, so JSR fell back to npm for the bare `@reticulum/*` specifiers
+  in the source. Added an `imports` map (`jsr:@reticulum/core@^0.6.3`,
+  `jsr:@reticulum/node@^0.6.3`) so JSR now resolves both from JSR. This also
+  required moving the `RFedClient` deep import off
+  `@reticulum/core/src/rfed/client.js` (not a JSR `exports` subpath) to the
+  `./src/rfed/index.js` barrel.
 
 ## [1.1.2] - 2026-08-10
 

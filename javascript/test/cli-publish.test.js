@@ -92,20 +92,20 @@ describe("DacarStore outbox (work doc #8)", () => {
   });
 
   it("a corrupted outbox record returns empty (does not crash the CLI)", async () => {
-    await adapter.set("dacar", "outbox", new TextEncoder().encode("not msgpack at all"));
+    await adapter.set("dacar", "outbox.msgpack", new TextEncoder().encode("not msgpack at all"));
     const store2 = new DacarStore(adapter);
     assert.deepEqual(await store2.loadOutbox(), []);
   });
 
   it("a non-array outbox record (a msgpack dict) returns empty", async () => {
-    await adapter.set("dacar", "outbox", MsgPack.encode({ a: 1 }));
+    await adapter.set("dacar", "outbox.msgpack", MsgPack.encode({ a: 1 }));
     const store2 = new DacarStore(adapter);
     assert.deepEqual(await store2.loadOutbox(), []);
   });
 
   it("non-Uint8Array elements in an array are filtered out", async () => {
     // Defensive: a malformed array of mixed types drops the non-bytes entries.
-    await adapter.set("dacar", "outbox", MsgPack.encode([Uint8Array.of(1, 2), "oops", 7]));
+    await adapter.set("dacar", "outbox.msgpack", MsgPack.encode([Uint8Array.of(1, 2), "oops", 7]));
     const store2 = new DacarStore(adapter);
     const loaded = await store2.loadOutbox();
     assert.equal(loaded.length, 1);

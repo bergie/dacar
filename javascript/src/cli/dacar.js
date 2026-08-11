@@ -5,7 +5,7 @@
  * Node/Deno-only. Declared in `package.json` `bin` and **excluded from the
  * browser `exports` map** so it never bloats a browser bundle. Composes the
  * portable {@link module:cli/session} + {@link module:cli/store} helpers with
- * `@reticulum/node`'s interfaces and `FileStorageAdapter`.
+ * `@reticulum/node`'s interfaces and `DacarFileAdapter` (Python-parity layout).
  *
  * Mirrors Python's `dacar/cli/__init__.py` + `commands.py`. Offline commands
  * never start RNS; online commands (`grant --publish`, `sync`) boot RNS, announce
@@ -34,8 +34,8 @@ import process from "node:process";
 
 import { Identity, toHex } from "@reticulum/core";
 import { MemoryStorageAdapter } from "@reticulum/core";
-import { FileStorageAdapter } from "@reticulum/node";
-import { RFedClient } from "@reticulum/core/src/rfed/client.js";
+import { DacarFileAdapter } from "./fileStore.js";
+import { RFedClient } from "@reticulum/core/src/rfed/index.js";
 import { bootRns } from "./rns_boot.js";
 
 import { Action, Operation, Tuple, Engine } from "../index.js";
@@ -79,7 +79,7 @@ function defaultStorePath() {
 
 async function openStore(args) {
   const path = args.store || defaultStorePath();
-  const adapter = new FileStorageAdapter(path);
+  const adapter = new DacarFileAdapter(path);
   return new DacarStore(adapter, { identityBytes: args.identity ? await readFile(args.identity) : null });
 }
 
@@ -101,6 +101,24 @@ function hexToBytes(hex) {
     out[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
   }
   return out;
+}
+
+/**
+ * Normalize an issuer public key to the 64-byte RNS form (X25519 ‖ Ed25519)
+ * used by `IssuerKeyset`. Accepts the canonical 32-byte Ed25519 public key
+ * (Python parity) — padding the unused X25519 half with zeros — or a full
+ * 64-byte RNS public key as-is.
+ * @param {Uint8Array} pubKey 32-byte Ed25519 or 64-byte RNS public key.
+ * @returns {Uint8Array}
+ */
+function asRnsPubKey(pubKey) {
+  if (pubKey.length === 32) {
+    const padded = new Uint8Array(64);
+    padded.set(pubKey, 32);
+    return padded;
+  }
+  if (pubKey.length === 64) return pubKey;
+  throw new CliError(`pubkey must be 32 bytes (64 hex, Ed25519) or 64 bytes (128 hex, RNS), got ${pubKey.length}`);
 }
 
 async function resolveRnsConfigDir(args) {
@@ -156,7 +174,7 @@ async function resolveTopic(args, store) {
 async function cmdInit(args) {
   const path = args.store || defaultStorePath();
   await mkdir(path, { recursive: true });
-  const adapter = new FileStorageAdapter(path);
+  const adapter = new DacarFileAdapter(path);
   const store = await DacarStore.init(adapter, {
     salt: args.salt ? hexToBytes(args.salt) : undefined,
     horizonDays: parseInt(args.horizon || "180", 10),
@@ -221,7 +239,7 @@ async function _issue(args, action) {
 
   // Record plaintext ledger.
   const ledger = await store.loadLedger();
-  ledger.set(tuple.key, { object: args.object, relation: args.relation, wildcard: args.object.endsWith("*") && args.object !== "*", firstSeen: Number(hlc >> 16n) });
+  ledger.set(toHex(await tuple.hash()), { object: args.object, relation: args.relation, wildcard: args.object.endsWith("*") && args.object !== "*", firstSeen: Number(hlc >> 16n) });
   await store.saveLedger(ledger);
 
   out(toHex(payload));
@@ -466,10 +484,8 @@ async function cmdIdentityRemember(args) {
   let pubKey;
   if (args.pubkey) {
     pubKey = hexToBytes(args.pubkey);
-    if (pubKey.length !== 64) throw new CliError(`--pubkey must be 64 bytes (128 hex), got ${pubKey.length}`);
   } else if (args.file) {
-    pubKey = await readFile(args.file);
-    if (pubKey.length !== 64) throw new CliError(`pubkey file must contain 64 bytes, got ${pubKey.length}`);
+    pubKey = new Uint8Array(await readFile(args.file));
   } else {
     // Boot RNS and try to recall.
     const configDir = await resolveRnsConfigDir(args);
@@ -486,11 +502,12 @@ async function cmdIdentityRemember(args) {
     pubKey = await recalled.getPublicKey();
   }
 
+  pubKey = asRnsPubKey(pubKey);
   const keyring = await store.loadKeyring();
   keyring.registerSingle(issuerHash, pubKey);
   await store.saveKeyring(keyring);
   err(`✔ remembered issuer ${shortHash(issuerHash, args.fullHashes)}`);
-  err(`  pubkey : ${toHex(pubKey).slice(0, SHORT_HASH)}…`);
+  err(`  pubkey : ${toHex(pubKey.slice(32)).slice(0, SHORT_HASH)}…`);
   err(`  cache  : ${keyring.size} entries`);
   return 0;
 }
@@ -537,7 +554,11 @@ async function cmdIdentityList(args) {
   }
   for (const [hashHex, keyset] of keyring.entries()) {
     const pub = keyset.memberPublicKeys[0];
-    err(`  ${shortHash(hexToBytes(hashHex), args.fullHashes)}  pubkey=${toHex(pub).slice(0, SHORT_HASH)}…`);
+    // On disk only the 32-byte Ed25519 half is stored (Python parity); in
+    // memory it's padded to a 64-byte RNS key (zeros ‖ Ed25519). Show the
+    // meaningful Ed25519 half.
+    const ed25519 = pub.length === 64 ? pub.slice(32) : pub;
+    err(`  ${shortHash(hexToBytes(hashHex), args.fullHashes)}  pubkey=${toHex(ed25519).slice(0, SHORT_HASH)}…`);
   }
   return 0;
 }
@@ -559,7 +580,7 @@ async function cmdGrants(args) {
   err(`${label} (${rows.length})`);
   for (const { entry, active } of rows) {
     const t = entry.tuple;
-    const row = ledger.get(t.key);
+    const row = ledger.get(toHex(await t.hash()));
     const rel = row?.relation || `[${shortHash(t.relationHash, args.fullHashes)}]`;
     const obj = row?.object || "[hash]";
     err(
