@@ -5,18 +5,22 @@ each node publishes its signed Operations (§5.3 Deltas) to a shared channel
 (default ``dacar.policy.v1``, deployment-overridable), and receives peers'
 Deltas via RFed fanout. Because every Delta is individually Ed25519-signed,
 RFed need not be trusted: received bytes flow through the *same* verify-on-
-ingest seam (:meth:`DeltaReceiver.apply_payload`, §11.2.4) as LXMF and optical
+ingest seam (:meth:`DeltaReceiver.apply_payload`, §11.2) as LXMF and optical
 delivery — **never** through the unauthenticated :meth:`StateVector.merge`
 path. A forged or stale Delta is simply dropped before it can mutate state.
 
 :class:`RfedDeltaSync` wraps a :class:`dacar.rfed.client.RFedClient`. A Delta
-is wrapped as the LXMF *content* of a channel message under the fixed
-``dacar/sync/delta`` title; on receipt the channel is the feed discriminator
-(every message on it is a Dacar Delta), and the content bytes are fed to the
-:class:`DeltaReceiver`.
+travels in Dacar's **compact inner format** (§11.1): the raw §5.3 payload is
+placed straight after the RTID source-identity prelude and EC-encrypted to the
+derived channel identity — no LXMF envelope, which would only duplicate the
+Delta's own destination/source/signature/timestamp and push a typical 170-byte
+Delta past the 500-byte RNS MTU. On receipt the channel is the feed
+discriminator (every message on it is a Dacar Delta), and the recovered Delta
+bytes are fed to the :class:`DeltaReceiver`.
 
-§11.3 air-gapped/optical transport is served by :mod:`dacar.transport.lxmf_sync`
-(Paper Messages); RFed is the online many-to-many path.
+§11.2 targeted delivery and §11.3 air-gapped/optical transport still use full
+LXMF framing (:mod:`dacar.transport.lxmf_sync`, Paper Messages); only the RFed
+broadcast channel uses the compact format.
 
 This module is part of the optional transport layer: importing the pure core
 never pulls it in. It depends only on ``rns`` + ``msgpack`` (both already
@@ -36,32 +40,14 @@ Typical use::
 
 from __future__ import annotations
 
-from typing import Any, Optional, Tuple
+from typing import Any, Optional
 
 from dacar.delta import DeltaReceiver
-from dacar.naming import LXMF_DELIVERY_TITLE, RFED_TOPIC
-from dacar.rfed._lxmf import LxmfMessage
-from dacar.rfed.blob import unwrap_channel_message
-from dacar.rfed.channel import delivery_hash_for, derive_channel
+from dacar.naming import RFED_TOPIC
+from dacar.rfed.blob import unwrap_dacar_delta, wrap_dacar_delta
+from dacar.rfed.channel import derive_channel
 
-__all__ = ["RfedDeltaSync", "message_content"]
-
-
-def message_content(message: Any) -> bytes:
-    """Best-effort content of an rfed-decoded LXMF message as bytes (the Delta).
-
-    The :class:`dacar.rfed._lxmf.LxmfMessage` codec keeps ``content`` as raw
-    bytes (no UTF-8 corruption), so this is the faithful recovery of what a
-    peer sent as ``content=<delta bytes>``. Tolerates a ``str`` content for
-    symmetry with the LXMF adapter. Mirrors ``messageContent`` in
-    ``javascript/src/transport/lxmfSync.js``.
-    """
-    c = getattr(message, "content", b"")
-    if isinstance(c, str):
-        return c.encode("utf-8")
-    if isinstance(c, (bytes, bytearray)):
-        return bytes(c)
-    return b""
+__all__ = ["RfedDeltaSync"]
 
 
 class RfedDeltaSync:
@@ -106,23 +92,24 @@ class RfedDeltaSync:
 
     # -- §11.1 publish -----------------------------------------------------
 
-    def make_message(self, delta_payload: bytes) -> LxmfMessage:
-        """Build the LXMF channel message wrapping one §5.3 Delta payload.
+    def make_payload(self, delta_payload: bytes) -> bytes:
+        """Wrap one §5.3 Delta payload in the Dacar compact inner format.
 
-        The message's ``destination_hash``/``source_hash`` are placeholders: the
-        rfed Phase-0 codec (:func:`dacar.rfed.blob.wrap_channel_message`)
-        overwrites them with the channel's ``lxmf.delivery`` hashes before
-        serialization, so the classic "source_hash is the bare identity hash"
-        bug cannot occur.
+        Returns the full ``rfed_payload``
+        (``channel_hash ‖ inner_blob ‖ stamp``), EC-encrypted to the derived
+        channel identity and stamped with the cost cached from the last
+        :meth:`subscribe`. The caller sends it via ``client.send_publish``.
         """
         if not isinstance(delta_payload, (bytes, bytearray)):
             raise TypeError("delta_payload must be bytes")
-        return LxmfMessage(
-            destination_hash=b"\x00" * 16,
-            source_hash=b"\x00" * 16,
-            content=bytes(delta_payload),
-            title=LXMF_DELIVERY_TITLE,
+        channel = self._client.channel(self._topic)
+        wrapped = wrap_dacar_delta(
+            channel_identity=channel["identity"],
+            sender_identity=self._client.identity,
+            delta=bytes(delta_payload),
+            stamp_cost=self._client.stamp_cost(self._topic),
         )
+        return wrapped.rfed_payload
 
     def subscribe(self, node_hash: bytes) -> Any:
         """Subscribe to the channel on a node, caching its advertised stamp cost.
@@ -135,24 +122,29 @@ class RfedDeltaSync:
         """Remove the subscription."""
         return self._client.unsubscribe(node_hash, self._topic)
 
-    def publish(self, delta_payload: bytes, node_hash: bytes) -> LxmfMessage:
+    def publish(self, delta_payload: bytes, node_hash: bytes) -> bool:
         """Publish a Delta to the channel (fire-and-forget, §11.1).
 
-        Call :meth:`subscribe` first so the channel's stamp cost is cached; an
+        Wraps the Delta in the Dacar compact inner format and sends it as a
+        fire-and-forget DATA packet via :meth:`RFedClient.send_publish`. Call
+        :meth:`subscribe` first so the channel's stamp cost is cached; an
         unstamped publish may be silently dropped by a cost-enforcing node.
+        Returns ``True`` if the transport accepted the outbound packet,
+        ``False`` otherwise (fire-and-forget: transport acceptance ≠ node
+        storage). Returns the wrapped ``rfed_payload``.
         """
-        message = self.make_message(delta_payload)
-        self._client.publish(node_hash, self._topic, message)
-        return message
+        rfed_payload = self.make_payload(delta_payload)
+        return self._client.send_publish(node_hash, rfed_payload)
 
     # -- §11.1 receive (live fanout) ---------------------------------------
 
     def listen(self) -> bytes:
         """Start listening for live fanout Deltas and route each through
-        verify-on-ingest (§11.1, §11.2.4).
+        verify-on-ingest (§11.1, §11.2).
 
-        The channel is the feed discriminator, so every received message is a
-        Dacar Delta; :meth:`DeltaReceiver.apply_payload` authenticates it by
+        Each delivered ``inner_blob`` is EC-decrypted with the derived channel
+        identity and the recovered Delta is fed to
+        :meth:`DeltaReceiver.apply_payload`, which authenticates it by
         signature and swallows any malformed/forged payload so a bad message
         can never crash the transport or mutate state.
 
@@ -162,15 +154,18 @@ class RfedDeltaSync:
             raise RuntimeError("RfedDeltaSync.listen requires a receiver")
         receiver = self._receiver
 
-        def on_message(decoded: Any) -> None:
+        def on_fanout(channel_name: str, channel_identity: Any, inner_blob: bytes) -> None:
             try:
-                receiver.apply_payload(message_content(decoded.message))
+                decoded = unwrap_dacar_delta(
+                    inner_blob=inner_blob, channel_identity=channel_identity
+                )
+                receiver.apply_payload(decoded.delta)
             except Exception:
                 # A malformed/forged fanout payload is dropped, not fatal —
                 # matches DeltaReceiver.apply_payload's own swallow contract.
                 pass
 
-        return self._client.listen(on_message)
+        return self._client.listen_raw(on_fanout)
 
     # -- §11.1 receive (offline catch-up via deferred-queue pull) ----------
 
@@ -179,14 +174,13 @@ class RfedDeltaSync:
         blob through verify-on-ingest (§11.1).
 
         Each blob is EC-decrypted with the derived channel identity and the
-        recovered LXMF message's content is applied. Foreign/undecryptable
-        blobs are dropped, not fatal. Repeats until the node reports no more
-        pending pages. Returns the count of Deltas newly applied to the CRDT.
+        recovered Dacar Delta is applied. Foreign/undecryptable blobs are
+        dropped, not fatal. Repeats until the node reports no more pending
+        pages. Returns the count of Deltas newly applied to the CRDT.
         """
         if self._receiver is None:
             raise RuntimeError("RfedDeltaSync.pull requires a receiver")
         channel_identity, _channel_hash = derive_channel(self._topic)
-        channel_delivery_hash = delivery_hash_for(channel_identity)
         receiver = self._receiver
         applied = 0
         more_pending = True
@@ -199,27 +193,13 @@ class RfedDeltaSync:
                 if blob is None:
                     continue
                 try:
-                    decoded = unwrap_channel_message(
-                        inner_blob=blob,
-                        channel_identity=channel_identity,
-                        channel_delivery_hash=channel_delivery_hash,
+                    decoded = unwrap_dacar_delta(
+                        inner_blob=blob, channel_identity=channel_identity
                     )
-                    if receiver.apply_payload(message_content(decoded.message)):
+                    if receiver.apply_payload(decoded.delta):
                         applied += 1
                 except Exception:
                     # a foreign/undecryptable blob is dropped, never fatal
                     pass
             more_pending = bool(getattr(page, "more_pending", False))
         return applied
-
-    # -- convenience: build a batch payload from signed ops -----------------
-
-    @staticmethod
-    def pack_payloads(operation_payloads: Tuple[bytes, ...]) -> bytes:
-        """Encode signed §5.3 Operation payloads as an authenticated batch.
-
-        Thin alias for :meth:`DeltaReceiver.pack_payloads` so a publisher need
-        not import the receiver just to batch. The inverse (authenticated
-        application) is :meth:`DeltaReceiver.apply_payloads`.
-        """
-        return DeltaReceiver.pack_payloads(list(operation_payloads))

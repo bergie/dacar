@@ -552,7 +552,7 @@ def _issue(args, action: Action) -> int:
     elif applied:
         _err("  (applied locally)")
     if getattr(args, "publish", False):
-        _publish_delta(args, store, identity, payload)
+        _publish_delta(args, store, identity, [payload])
     else:
         # Outbox (work doc #8): queue locally-issued deltas for ``publish --all``.
         # ``--publish`` sends immediately and never enqueues; ``--no-apply`` only
@@ -948,18 +948,25 @@ def _resolve_rns_config_dir(args) -> str:
     )
 
 
-def run_publish(
+def run_publish_many(
     identity: object,
-    payload: bytes,
+    payloads: List[bytes],
     node_hash: bytes,
     topic: str,
     client: object,
-) -> None:
-    """Publish a signed Delta to the rfed channel (§11.1, work doc #4).
+) -> int:
+    """Publish signed Deltas to the rfed channel (§11.1, §11.1.1, work doc #4/#10).
 
     Testable core: takes an explicit ``client`` (RFedClient or compatible fake)
     so tests inject doubles without booting RNS. The ``cmd_*`` wrappers handle
     RNS boot + announce + real client creation.
+
+    Subscribes **once** then publishes each Delta as its own compact inner-
+    format message (one §5.3 Operation per envelope, §11.1.1) — RNS is a
+    singleton that cannot be re-booted, and re-subscribing per Delta would be
+    wasteful. Returns the number of Deltas whose SEND was accepted by the
+    transport (fire-and-forget: transport acceptance ≠ node storage; see
+    :meth:`RFedClient.send_publish`).
     """
     from dacar.transport.rfed_sync import RfedDeltaSync
     sync = RfedDeltaSync(client=client, topic=topic)
@@ -970,7 +977,26 @@ def run_publish(
             "the node rejected the subscription (signature/channel mismatch) "
             "or returned no response — the topic will not sync with peers"
         )
-    sync.publish(payload, node_hash)
+    sent = 0
+    for payload in payloads:
+        if sync.publish(payload, node_hash):
+            sent += 1
+    return sent
+
+
+def run_publish(
+    identity: object,
+    payload: bytes,
+    node_hash: bytes,
+    topic: str,
+    client: object,
+) -> None:
+    """Publish a single signed Delta to the rfed channel (§11.1, work doc #4).
+
+    Thin convenience wrapper over :func:`run_publish_many` for the single-Delta
+    case (``grant --publish`` / ``revoke --publish``). Kept for test clarity.
+    """
+    run_publish_many(identity, [payload], node_hash, topic, client)
 
 
 def run_sync(
@@ -1003,8 +1029,14 @@ def run_sync(
     return applied
 
 
-def _publish_delta(args, store: Store, identity, payload: bytes) -> None:
-    """Online publish hook for ``grant --publish`` / ``revoke --publish``."""
+def _publish_setup(args, store: Store, identity) -> tuple:
+    """Boot RNS once, announce, and create the RFedClient (shared setup).
+
+    Returns ``(client, node_hash, topic)``. Factored out of :func:`_publish_delta`
+    so a multi-Delta publish (``dacar publish --all`` / multi-file) boots RNS and
+    announces **once** then publishes each Delta, rather than re-booting RNS per
+    Delta (RNS is a singleton and cannot be re-initialised).
+    """
     from dacar.cli.rns import announce_identity, boot, ensure_node_identity, register_announce_handler
     from dacar.rfed.client import RFedClient
 
@@ -1032,8 +1064,26 @@ def _publish_delta(args, store: Store, identity, payload: bytes) -> None:
     register_announce_handler(keyring, on_save=store.save_keyring)
 
     client = RFedClient(identity=identity, rns=rns)
-    run_publish(identity, payload, node_hash, topic, client)
-    _err(f"  published to rfed channel {topic!r} via "
+    return client, node_hash, topic
+
+
+def _publish_delta(args, store: Store, identity, payloads: List[bytes]) -> None:
+    """Online publish hook for ``grant --publish`` / ``revoke --publish`` / ``publish``.
+
+    Boots RNS **once**, subscribes once, then publishes each Delta as its own
+    compact inner-format message (§11.1.1). ``payloads`` is a list (a single
+    Delta is passed as ``[payload]``).
+    """
+    client, node_hash, topic = _publish_setup(args, store, identity)
+    sent = run_publish_many(identity, list(payloads), node_hash, topic, client)
+    total = len(payloads)
+    # Fire-and-forget: "sent" counts transport-accepted packets, not node
+    # storage. Be honest about the distinction so a silent node-side drop is not
+    # mistaken for success.
+    if sent < total:
+        _err(f"  ⚠ only {sent}/{total} delta(s) accepted by the transport "
+             f"(fire-and-forget: node storage is not confirmed)")
+    _err(f"  sent {sent}/{total} delta(s) to rfed channel {topic!r} via "
          f"{_short(node_hash, full=args.full_hashes)}")
 
 
@@ -1104,14 +1154,26 @@ def cmd_publish(args) -> int:
       * ``dacar publish <file> [<file>...]`` — publish previously-signed delta
         payload(s). Files (or ``-`` for stdin) are read with the same
         hex/binary auto-detect as ``apply`` (+ ``--binary`` to force raw).
-        Multiple files are packed into one batch payload
-        (:meth:`DeltaReceiver.pack_payloads`). The **exact signed bytes** are
-        published — no re-signing, no new HLC, no local state change — so the
-        receiver's verify-on-ingest authenticates the *original* issuer.
+        The **exact signed bytes** are published — no re-signing, no new HLC,
+        no local state change — so the receiver's verify-on-ingest
+        authenticates the *original* issuer.
 
-      * ``dacar publish --all`` — pack every locally-issued, not-yet-published
-        delta from the outbox into one batch, publish it, then clear the
-        outbox. A no-op (exit 0) on an empty outbox.
+      * ``dacar publish --all`` — publish every locally-issued delta from the
+        outbox. The outbox is **not** cleared: publish is fire-and-forget
+        (no delivery confirmation), so the signed payloads are retained for
+        retry — ``dacar prune`` bounds growth by the §9 horizon. A no-op
+        (exit 0) on an empty outbox.
+
+    Each Delta is published as its **own** rfed message (one §5.3 Operation
+    per compact inner-format envelope, §11.1.1) — exactly like ``grant
+    --publish``. This is required, not a stylistic choice: the
+    ``rfed.channel.publish`` destination is fire-and-forget (no link, so no
+    RNS Resource fragmentation) and capped by the ~500-byte path MTU, so a
+    single message cannot carry more than one Delta. It is also the only form
+    the receivers accept — every transport receiver applies Deltas one at a
+    time via :meth:`DeltaReceiver.apply_payload` (§11.2), never the batch
+    :meth:`DeltaReceiver.apply_payloads` helper (which is reserved for local
+    ``dacar apply <file>`` batch import, not the network).
 
     Both reuse the ``grant --publish`` machinery (boot RNS, announce the node
     identity, subscribe, publish) via :func:`_publish_delta`.
@@ -1143,23 +1205,22 @@ def cmd_publish(args) -> int:
                 raise CliError(f"empty payload: {path}")
             to_publish.append(data)
 
-    # Pack into a single rfed message: a batch if >1, raw bytes if exactly 1
-    # (so a single-delta publish stays a single-delta payload on the wire).
-    if len(to_publish) == 1:
-        batch = to_publish[0]
-    else:
-        batch = DeltaReceiver.pack_payloads(to_publish)
-
+    # Publish each Delta as its own rfed message (one Operation per compact
+    # inner-format envelope, §11.1.1) — never a multi-delta batch, which would
+    # overflow the ~500-byte path MTU and is not decodable by the single-delta
+    # receivers. Mirrors `grant --publish` / `revoke --publish`. RNS is a
+    # singleton, so boot + subscribe happen once for the whole batch.
     label = "outbox" if use_all else f"{len(to_publish)} file(s)"
-    kind = "a batch" if len(to_publish) > 1 else "a single delta"
-    _err(f"  publishing {len(to_publish)} delta(s) ({label}) as {kind}")
+    _err(f"  publishing {len(to_publish)} delta(s) ({label})")
+    _publish_delta(args, store, identity, to_publish)
 
-    # Reuse the grant --publish machinery (boot RNS, announce, subscribe, publish).
-    _publish_delta(args, store, identity, batch)
-
+    # The outbox is NOT cleared: publish is fire-and-forget (no delivery
+    # confirmation), so the signed payloads must be retained for retry. The
+    # CRDT merge is idempotent, so re-publishing already-delivered deltas is a
+    # no-op on peers. `dacar prune` bounds growth by the §9 horizon (entries
+    # older than the horizon are intake-rejected anyway).
     if use_all:
-        store.save_outbox([])
-        _err("  outbox cleared")
+        _err("  (outbox retained for retry: fire-and-forget; `dacar prune` to drop stale)")
     return EXIT_OK
 
 

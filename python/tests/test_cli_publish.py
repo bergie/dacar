@@ -68,15 +68,27 @@ def _signed_delta_payload(store: Store, *, relation: str = "read",
 
 
 class _Capture:
-    """Patches ``_publish_delta`` and records the last payload handed to it."""
+    """Patches ``_publish_delta`` and records the payloads handed to it.
+
+    ``cmd_publish`` now hands the full list of Deltas to a single
+    ``_publish_delta`` call (boot RNS once, subscribe once, then publish each
+    as its own compact inner-format envelope, §11.1.1). ``payloads`` preserves
+    publish order; ``payload`` is the single payload when exactly one was
+    published (``None`` otherwise), for the single-delta tests.
+    """
 
     def __init__(self) -> None:
-        self.payload: bytes | None = None
+        self.payloads: list[bytes] = []
         self.calls = 0
 
-    def __call__(self, args, store, identity, payload) -> None:
-        self.payload = payload
+    def __call__(self, args, store, identity, payloads) -> None:
+        self.payloads = list(payloads)
         self.calls += 1
+
+    @property
+    def payload(self) -> bytes | None:
+        """The single payload when exactly one was published, else ``None``."""
+        return self.payloads[0] if len(self.payloads) == 1 else None
 
 
 # ===========================================================================
@@ -181,34 +193,39 @@ class EnqueueBehaviorTest(unittest.TestCase):
 
 
 class PublishAllTest(unittest.TestCase):
-    """``publish --all`` packs + publishes + clears the outbox (doc #8)."""
+    """``publish --all`` publishes every outbox delta (retained for retry)."""
 
     def setUp(self) -> None:
         self.store_dir = Path(tempfile.mkdtemp(prefix="dacar-puball-"))
         run(self.store_dir, "init")
         run(self.store_dir, "alias", "add", "bergie", BERGIE_HASH)
 
-    def test_publishes_batch_and_clears_outbox(self):
-        """Two enqueued deltas are packed into one batch, published, then cleared."""
+    def test_publishes_all_outbox_deltas_and_retains_for_retry(self):
+        """Every outbox Delta is published (exact bytes); the outbox is kept.
+
+        Publish is fire-and-forget (no delivery confirmation), so the signed
+        payloads are retained for retry — the outbox is NOT cleared. Each Delta
+        travels in its own compact inner-format envelope (§11.1.1). The CRDT
+        merge is idempotent, so re-publishing already-delivered deltas is a
+        no-op on peers."""
         run(self.store_dir, "grant", "bergie", "read", "sensor:wind")
         run(self.store_dir, "grant", "bergie", "read", "sensor:temp")
-        self.assertEqual(len(Store(self.store_dir).load_outbox()), 2)
+        outbox = Store(self.store_dir).load_outbox()
+        self.assertEqual(len(outbox), 2)
 
         cap = _Capture()
         with patch("dacar.cli.commands._publish_delta", side_effect=cap):
             code, _, err = run(self.store_dir, "publish", "--all", "--node", NODE_HEX)
         self.assertEqual(code, 0, err)
+        # One _publish_delta call with the full list, exact bytes verbatim.
         self.assertEqual(cap.calls, 1)
-        # The published payload is a msgpack array of the two deltas.
-        items = serialization.unpackb(cap.payload)
-        self.assertIsInstance(items, list)
-        self.assertEqual(len(items), 2)
-        # Outbox was cleared.
-        self.assertEqual(len(Store(self.store_dir).load_outbox()), 0)
-        self.assertIn("outbox cleared", err)
+        self.assertEqual(cap.payloads, outbox)
+        # Outbox NOT cleared — retained for retry (fire-and-forget).
+        self.assertEqual(len(Store(self.store_dir).load_outbox()), 2)
+        self.assertIn("retained for retry", err)
 
     def test_single_outbox_entry_published_as_single_delta(self):
-        """One enqueued delta is published as raw bytes (not a 1-element batch)."""
+        """One enqueued delta is published verbatim, and retained for retry."""
         run(self.store_dir, "grant", "bergie", "read", "sensor:wind")
         single = Store(self.store_dir).load_outbox()[0]
 
@@ -216,7 +233,10 @@ class PublishAllTest(unittest.TestCase):
         with patch("dacar.cli.commands._publish_delta", side_effect=cap):
             run(self.store_dir, "publish", "--all", "--node", NODE_HEX)
         # Exactly the original payload bytes — no wrapping.
+        self.assertEqual(cap.calls, 1)
         self.assertEqual(cap.payload, single)
+        # Outbox retained (fire-and-forget).
+        self.assertEqual(len(Store(self.store_dir).load_outbox()), 1)
 
     def test_empty_outbox_is_noop(self):
         """``publish --all`` on an empty outbox exits 0 without publishing."""
@@ -232,7 +252,7 @@ class PublishAllTest(unittest.TestCase):
         run(self.store_dir, "grant", "bergie", "read", "sensor:wind")
         self.assertEqual(len(Store(self.store_dir).load_outbox()), 1)
 
-        def boom(args, store, identity, payload):
+        def boom(args, store, identity, payloads):
             raise RuntimeError("network down")
 
         with patch("dacar.cli.commands._publish_delta", side_effect=boom):
@@ -293,8 +313,11 @@ class PublishFileTest(unittest.TestCase):
             sys.stdin = real_stdin
         self.assertEqual(cap.payload, payload)
 
-    def test_multiple_files_packed_into_batch(self):
-        """Two files are packed into one batch payload (one publish call)."""
+    def test_multiple_files_published_individually(self):
+        """Two files are published as two rfed messages (one per Delta).
+
+        Each file's exact signed bytes are published verbatim, in argument
+        order — no batch wrapping (§11.1.1: one Operation per envelope)."""
         p1 = _signed_delta_payload(Store(self.store_dir), object_id="sensor:wind")
         p2 = _signed_delta_payload(Store(self.store_dir), object_id="sensor:temp")
         f1 = self.store_dir / "d1.hex"
@@ -305,9 +328,9 @@ class PublishFileTest(unittest.TestCase):
         cap = _Capture()
         with patch("dacar.cli.commands._publish_delta", side_effect=cap):
             run(self.store_dir, "publish", str(f1), str(f2), "--node", NODE_HEX)
+        # One _publish_delta call with the full list, exact bytes verbatim.
         self.assertEqual(cap.calls, 1)
-        items = serialization.unpackb(cap.payload)
-        self.assertEqual([bytes(i) for i in items], [p1, p2])
+        self.assertEqual(cap.payloads, [p1, p2])
 
     def test_publish_file_does_not_touch_outbox(self):
         """``publish <file>`` publishes an external payload, not the outbox."""

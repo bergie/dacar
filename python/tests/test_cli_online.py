@@ -24,11 +24,10 @@ import RNS
 
 from dacar import Action, DeltaReceiver, Engine, Keyring, Operation, StateVector, Tuple
 from dacar.hlc import pack, physical_now_ms
-from dacar.naming import LXMF_DELIVERY_TITLE, RFED_TOPIC
+from dacar.naming import RFED_TOPIC
 from dacar.namespace import HASH_SIZE, NamespaceHasher, SALT_SIZE
-from dacar.rfed._lxmf import LxmfMessage
-from dacar.rfed.blob import wrap_channel_message
-from dacar.rfed.channel import delivery_hash_for, derive_channel
+from dacar.rfed.blob import wrap_dacar_delta
+from dacar.rfed.channel import derive_channel
 from dacar.rfed.client import PullItem, PullPage, SubscribeResult
 from dacar.transport.rns_identity import RnsIdentityResolver
 
@@ -57,13 +56,31 @@ def _remember(identity: RNS.Identity) -> None:
 
 
 class _FakeRFedClient:
-    """A minimal RFedClient double — records publishes, replays pull."""
+    """A minimal RFedClient double — records publishes, replays pull.
 
-    def __init__(self):
-        self.published = []
+    Mirrors the application-specific inner-format surface the real
+    :class:`RFedClient` exposes (§11.1): ``channel``/``stamp_cost``/
+    ``send_publish``/``listen_raw``.
+    """
+
+    def __init__(self, identity=None):
+        self.identity = identity if identity is not None else RNS.Identity()
+        self.sent = []  # list of (node_hash, rfed_payload)
         self.subscribed = None
         self.deferred = []
         self.delivery_hash = b"\x09" * 16
+        self._channels = {}
+
+    def channel(self, name):
+        if name not in self._channels:
+            ident, chash = derive_channel(name)
+            self._channels[name] = {
+                "identity": ident, "channel_hash": chash, "delivery_hash": b"\x00" * 16,
+            }
+        return self._channels[name]
+
+    def stamp_cost(self, name):
+        return None
 
     def subscribe(self, node_hash, channel_name, **_kw):
         self.subscribed = (node_hash, channel_name)
@@ -72,10 +89,11 @@ class _FakeRFedClient:
     def unsubscribe(self, node_hash, channel_name, **_kw):
         return SubscribeResult(ok=True)
 
-    def publish(self, node_hash, channel_name, lxm_message):
-        self.published.append((node_hash, channel_name, lxm_message))
+    def send_publish(self, node_hash, rfed_payload):
+        self.sent.append((node_hash, bytes(rfed_payload)))
+        return True
 
-    def listen(self, on_message):
+    def listen_raw(self, on_fanout):
         return self.delivery_hash
 
     def pull(self, node_hash, channel_name, **_kw):
@@ -85,28 +103,31 @@ class _FakeRFedClient:
 
 
 def _wrap_delta(delta: bytes, identity: RNS.Identity) -> PullItem:
-    """Wrap a Delta payload as a real rfed channel blob."""
-    lxm = LxmfMessage(content=delta, title=LXMF_DELIVERY_TITLE)
-    return _wrap_message(lxm, identity)
+    """Wrap a Delta payload as a real rfed channel blob (Dacar compact format).
 
-
-def _wrap_message(lxm: LxmfMessage, sender_identity: RNS.Identity) -> PullItem:
-    """Wrap an already-built LxmfMessage as a real rfed channel blob.
-
-    This mirrors what a rfed federation node does on receipt of a publish: it
-    stores the Phase-0-wrapped ``inner_blob`` that ``pull`` later returns. Used
-    to bridge A's ``run_publish`` output into B's ``run_sync`` input in the
-    two-node round-trip test.
+    Mirrors what a rfed federation node stores after a publish: the
+    ``inner_blob`` (EC-encrypted to the derived channel) that ``pull`` later
+    returns. Used to seed a fake client's deferred queue for B-side sync.
     """
-    channel_identity, channel_hash = derive_channel(RFED_TOPIC)
-    sender_delivery_hash = delivery_hash_for(sender_identity)
-    wrapped = wrap_channel_message(
+    channel_identity, _channel_hash = derive_channel(RFED_TOPIC)
+    wrapped = wrap_dacar_delta(
         channel_identity=channel_identity,
-        sender_identity=sender_identity,
-        sender_lxm_delivery_hash=sender_delivery_hash,
-        lxm_message=lxm,
+        sender_identity=identity,
+        delta=delta,
     )
     return PullItem(channel_hash=wrapped.channel_hash, blob=wrapped.inner_blob)
+
+
+def _defer_from_published(rfed_payload: bytes) -> PullItem:
+    """Split a published ``rfed_payload`` into the deferred-queue form B pulls.
+
+    A publish sends ``channel_hash(16) ‖ inner_blob``; ``pull`` returns
+    ``PullItem(channel_hash, inner_blob)``. This bridges A's ``run_publish``
+    output into B's ``run_sync`` input in the two-node round-trip tests, just
+    as a real rfed federation node would relay a stored blob.
+    """
+    rfed_payload = bytes(rfed_payload)
+    return PullItem(channel_hash=rfed_payload[:16], blob=rfed_payload[16:])
 
 
 def _signed_delta(issuer_hash: bytes, signer: RNS.Identity,
@@ -216,21 +237,20 @@ class RunPublishTest(unittest.TestCase):
     """``run_publish`` wires subscribe → publish through RfedDeltaSync."""
 
     def test_subscribes_then_publishes(self):
-        client = _FakeRFedClient()
         identity = RNS.Identity()
+        client = _FakeRFedClient(identity=identity)
         delta = _signed_delta(identity.hash, identity)
 
         run_publish(identity, delta, NODE, RFED_TOPIC, client)
 
         self.assertEqual(client.subscribed, (NODE, RFED_TOPIC))
-        self.assertEqual(len(client.published), 1)
-        node_hash, channel_name, _msg = client.published[0]
+        self.assertEqual(len(client.sent), 1)
+        node_hash, _rfed_payload = client.sent[0]
         self.assertEqual(node_hash, NODE)
-        self.assertEqual(channel_name, RFED_TOPIC)
 
     def test_uses_custom_topic(self):
-        client = _FakeRFedClient()
         identity = RNS.Identity()
+        client = _FakeRFedClient(identity=identity)
         delta = _signed_delta(identity.hash, identity)
 
         run_publish(identity, delta, NODE, "custom.topic", client)
@@ -251,14 +271,14 @@ class RunPublishTest(unittest.TestCase):
                 super().subscribe(node_hash, channel_name, **_kw)
                 return SubscribeResult(ok=False)
 
-        client = _FailingClient()
         identity = RNS.Identity()
+        client = _FailingClient(identity=identity)
         delta = _signed_delta(identity.hash, identity)
         with self.assertRaises(CliError) as ctx:
             run_publish(identity, delta, NODE, RFED_TOPIC, client)
         self.assertIn("subscribe", str(ctx.exception))
         # Publish never happened — the failed subscribe short-circuits.
-        self.assertEqual(client.published, [])
+        self.assertEqual(client.sent, [])
 
 
 # ---------------------------------------------------------------------------
@@ -434,8 +454,8 @@ class TwoNodeRoundTripTest(unittest.TestCase):
     real adapter code on both sides.
 
     The rfed federation node is simulated by bridging A's ``run_publish``
-    output (the LxmfMessage a real ``RFedClient.publish`` would wrap) into B's
-    ``run_sync`` input (the wrapped ``inner_blob`` a real ``pull`` returns).
+    output (the ``rfed_payload`` a real ``RFedClient.send_publish`` would send)
+    into B's ``run_sync`` input (the ``inner_blob`` a real ``pull`` returns).
     This exercises the genuine publish→wrap→pull→unwrap→verify-on-ingest path
     end-to-end, just without a live rfed binary in between.
     """
@@ -476,17 +496,17 @@ class TwoNodeRoundTripTest(unittest.TestCase):
         _remember(a_identity)  # B intercepts A's announce
         self._trust(a_identity.hash)
 
-        # A signs + publishes (run_publish records the LxmfMessage).
+        # A signs + publishes (run_publish records the rfed_payload).
         delta = _signed_delta(a_identity.hash, a_identity)
-        client_a = _FakeRFedClient()
+        client_a = _FakeRFedClient(identity=a_identity)
         run_publish(a_identity, delta, NODE, RFED_TOPIC, client_a)
-        self.assertEqual(len(client_a.published), 1)
-        published_lxm = client_a.published[0][2]
+        self.assertEqual(len(client_a.sent), 1)
+        published_payload = client_a.sent[0][1]
 
         # Bridge: the rfed node stores the wrapped blob; B pulls it.
         config, state, rx = self._b_receiver()
         client_b = _FakeRFedClient()
-        client_b.deferred.append(_wrap_message(published_lxm, a_identity))
+        client_b.deferred.append(_defer_from_published(published_payload))
 
         applied = run_sync(self.b_store, state, NODE, RFED_TOPIC, client_b, rx)
         self.assertEqual(applied, 1)
@@ -506,7 +526,7 @@ class TwoNodeRoundTripTest(unittest.TestCase):
         run_publish(a_identity, grant_delta, NODE, RFED_TOPIC, client_a1)
         config, state, rx = self._b_receiver()
         client_b1 = _FakeRFedClient()
-        client_b1.deferred.append(_wrap_message(client_a1.published[0][2], a_identity))
+        client_b1.deferred.append(_defer_from_published(client_a1.sent[0][1]))
         run_sync(self.b_store, state, NODE, RFED_TOPIC, client_b1, rx)
         engine = Engine(config, state)
         self.assertTrue(engine.evaluate("sensor:wind", "read", GRANTEE))
@@ -521,7 +541,7 @@ class TwoNodeRoundTripTest(unittest.TestCase):
         state2 = self.b_store.load_state(config2)  # reload grant on top
         rx2 = DeltaReceiver(state2, RnsIdentityResolver(fallback=self.b_store.keyring_for_verify()))
         client_b2 = _FakeRFedClient()
-        client_b2.deferred.append(_wrap_message(client_a2.published[0][2], a_identity))
+        client_b2.deferred.append(_defer_from_published(client_a2.sent[0][1]))
         applied = run_sync(self.b_store, state2, NODE, RFED_TOPIC, client_b2, rx2)
         self.assertEqual(applied, 1)
 
@@ -548,7 +568,7 @@ class TwoNodeRoundTripTest(unittest.TestCase):
 
         config, state, rx = self._b_receiver()
         client_b = _FakeRFedClient()
-        client_b.deferred.append(_wrap_message(client_a.published[0][2], a_identity))
+        client_b.deferred.append(_defer_from_published(client_a.sent[0][1]))
         applied = run_sync(self.b_store, state, NODE, RFED_TOPIC, client_b, rx)
         self.assertEqual(applied, 0)
         self.assertEqual(len(state), 0)
@@ -855,7 +875,7 @@ class AnnounceHandlerTest(unittest.TestCase):
 class DurableFallbackTest(unittest.TestCase):
     """cmd_sync resolves an issuer that is ONLY in the dacar cache (doc #5 #3).
 
-    The issuer ≠ sender: the rfed sender is remembered by unwrap_channel_message,
+    The issuer ≠ sender: the rfed sender is recovered from the RTID prelude,
     but the issuer (a different identity) is not in RNS recall — it is only in
     the dacar-owned persisted keyring. The RnsIdentityResolver fallback resolves
     it, so the Delta applies.

@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`SPEC.md` §11.1.1 "Inner Format — Compact Dacar Envelope"**: documents
+  the Dacar-specific RFed `inner_blob` (work doc #10). A §5.3 Delta is already
+  self-addressed, self-timed, and self-signed, so wrapping it in a full LXMF
+  message inside the RFed `inner_blob` only duplicates the
+  destination/source/signature/timestamp and pushes a typical 170-byte Delta
+  past the 500-byte RNS MTU (the `rfed.channel.publish` destination is
+  fire-and-forget, no links/fragmentation). The compact envelope reuses the
+  RTID prelude (`"RTID" ‖ sender_identity_pub(64) ‖ delta`) EC-encrypted to the
+  derived channel identity; the Delta's own Ed25519 signature remains the sole
+  authenticity check at verify-on-ingest (§11.2). Measured ~499 bytes on the
+  wire for a typical Delta (multi-hop, with stamp). LXMF framing is retained
+  for §11.2 targeted delivery and §11.3 Paper Messages — only the RFed
+  broadcast channel uses the compact format.
 - `SPEC.md` §13 "Local Node Store": a recommended file-based store layout
   (normative only for implementations that choose it) so that independently-
   developed CLIs can read and write the same store directory interchangeably.
@@ -18,6 +31,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   native format).
 
 ### Changed
+- **Python RFed transport now publishes/receives Deltas in the compact
+  Dacar inner format (§11.1.1, work doc #10)** instead of wrapping each Delta
+  in a full LXMF message inside the RFed `inner_blob`. This fixes the
+  `OSError: Packet size of 595 exceeds MTU of 500 bytes` failure on
+  `dacar publish --all` (a 170-byte Delta now fits the 500-byte RNS MTU).
+  `dacar.rfed.blob` gains `wrap_dacar_delta()` / `unwrap_dacar_delta()`
+  (alongside the LXMF `wrap_channel_message` / `unwrap_channel_message`, kept
+  for general RFed usage and LXMF/Paper-Message transport). `RFedClient` gains
+  general raw-publish primitives — `send_publish()`, `channel()`,
+  `stamp_cost()`, `listen_raw()` — so application-specific inner formats can be
+  sent/received without assuming an LXMF envelope; `publish()`/`listen()`
+  (LXMF path) are preserved for normal RFed usage. The `RfedDeltaSync`
+  adapter now wraps/receives via the compact format and the obsolete
+  `message_content` helper is removed. The JavaScript transport still uses
+  LXMF-over-RFed pending an upstream `@reticulum/core` raw-publish API.
+- **`dacar publish` now sends each Delta as its own rfed message** (one §5.3
+  Operation per compact inner-format envelope, §11.1.1) instead of packing
+  multiple Deltas into one msgpack batch. This is required by the ~500-byte
+  RNS path MTU (the `rfed.channel.publish` destination is fire-and-forget,
+  no link/fragmentation), and it also fixes a latent receive-side bug: every
+  transport receiver applies Deltas one at a time via
+  `DeltaReceiver.apply_payload` (single), so a multi-delta msgpack batch was
+  silently dropped as malformed on receive. `publish --all` and multi-file
+  `publish <f1> <f2>` now boot RNS + subscribe **once**, then publish each
+  Delta via the shared `_publish_delta`/`run_publish_many` path (RNS is a
+  singleton and cannot be re-booted per Delta). The now-dead
+  `RfedDeltaSync.pack_payloads` alias is removed (`DeltaReceiver`'s
+  `pack_payloads`/`apply_payloads` are retained for local `dacar apply <file>`
+  batch import, §11.2).
+- **`dacar publish --all` no longer clears the outbox.** Publish is
+  fire-and-forget (no delivery confirmation), so clearing the outbox on send
+  destroyed the only signed-bytes copy of each Delta — a Delta dropped by the
+  node (under-stamped, TTL-expired, or never delivered to a node that joined
+  later) was irrecoverable. The outbox is now retained so `publish --all` can
+  be re-run to retry/re-deliver; `dacar prune` bounds growth by the §9 horizon.
+  (CRDT merge is idempotent, so re-publishing already-delivered deltas is a
+  no-op on peers.) This is an interim; a proper outbox + sent-box + re-send
+  design is proposed separately.
+- `send_publish` now returns whether the transport accepted the outbound
+  packet (`Packet.send()` result), and `dacar publish` reports the sent/total
+  count honestly instead of implying node-side storage was confirmed.
 - `dacar init` now warns when `--salt` is not provided, indicating that a unique
   random salt was generated and grants will be opaque across nodes unless they
   share the same salt (see README for salt sharing workflow).

@@ -134,7 +134,32 @@ During the Hypothesis Generation phase (§7.1), the Evaluation Engine generates 
 ## 11. Synchronization & Transport Plane
 Dacar delegates transport responsibilities to established Reticulum protocols.
 ### 11.1 Eventual Consistency via RFed (Many-to-Many)
-Global convergence of the CRDT State Vector is handled via **RFed**. The default topic is `dacar.policy.v1`, but it is **configurable per deployment**: because RFed is a broadcast (many-to-many) medium, nodes that must isolate their policy feed from other Dacar deployments sharing an RNS network SHOULD set a deployment-specific topic. (By contrast, §11.2 LXMF delivery and the §8 Challenge destination are addressed point-to-point to a specific Identity, so they derive isolation from RNS addressing rather than from a configurable name.) Nodes rely on RFed's native store-and-forward to asynchronously retrieve new Operations and merge them into the local LWW-Element-Set.
+Global convergence of the CRDT State Vector is handled via **RFed**. The default topic is `dacar.policy.v1`, but it is **configurable per deployment**: because RFed is a broadcast (many-to-many) medium, nodes that must isolate their policy feed from other Dacar deployments sharing an RNS network SHOULD set a deployment-specific topic. (By contrast, §11.2 LXMF delivery and the §8 Challenge destination are addressed point-to-point to a specific Identity, so they derive isolation from RNS addressing rather than from a configurable name.) Nodes rely on RFed's native store-and-forward to asynchronously retrieve new Operations and merge them into the local LWW-Element-Set, each one authenticated via verify-on-ingest (§11.2) before it may mutate the CRDT.
+
+#### 11.1.1 Inner Format — Compact Dacar Envelope
+A Dacar Delta is **not** wrapped in an LXMF message inside the RFed `inner_blob`. A §5.3 Delta is already self-describing — self-addressed (Issuer Hash, field [0]), self-timed (HLC, field [3]), and self-signed (Ed25519, field [7]) — so an LXMF envelope would only duplicate the destination hash (RFed's `channel_hash` already routes it), the source hash (field [0]), the signature (field [7]), and the timestamp (field [3]), while adding ~111 bytes that push a typical 170-byte Delta past the 500-byte RNS path MTU (the `rfed.channel.publish` destination is fire-and-forget and does not accept links, so it cannot rely on RNS Resource fragmentation).
+
+Instead, the channel `inner_blob` for a Dacar Delta reuses the RFed RTID source-identity prelude but carries the raw Delta in place of the LXMF tail:
+
+```
+plaintext    = "RTID"(4) ‖ sender_identity_pub(64) ‖ delta
+inner_blob   = EC_encrypt(channel_identity.X25519_pub, plaintext)
+rfed_payload = channel_hash(16) ‖ inner_blob ‖ stamp(32)?
+```
+
+* `sender_identity_pub` is the publishing node's 64-byte RNS Identity public-key bundle (32-byte X25519 ‖ 32-byte Ed25519); it identifies the transport sender only.
+* `delta` is the raw §5.3 transport payload (already signed by the Issuer).
+* `stamp` is the standard RFed channel proof-of-work stamp, appended when the node advertises a non-zero `stamp_cost` (omitted otherwise).
+
+RFed treats `inner_blob` **opaquely** — it never decrypts, parses, or modifies it, only validates the stamp, stores it, and fans `channel_hash ‖ inner_blob` out to subscribers — so this is a private agreement between Dacar publishers and subscribers, invisible to the Rust or JavaScript RFed nodes and to other RFed channel applications (which are keyed by `channel_hash` and may still use full LXMF `inner_blob`s of their own).
+
+On receipt, the subscriber EC-decrypts `inner_blob` with the derived channel identity, verifies the `"RTID"` magic, recovers `sender_identity_pub`, and feeds the remaining `delta` bytes through the **same** verify-on-ingest seam as every other transport (§11.2): the Delta's own Ed25519 signature is the sole authenticity check, so a forged or stale Delta is dropped before it can mutate the CRDT, exactly as for LXMF or optical delivery. No envelope signature is added — and none is needed, since reaching the EC-decrypt step already required the channel private key (i.e. an authorised subscriber).
+
+This compact format keeps a typical 170-byte Delta within the 500-byte RNS MTU (multi-hop, with stamp): ~499 bytes on the wire (467 without a stamp).
+
+**One Delta per message.** A node MUST publish each §5.3 Operation as its own `rfed_payload` (one envelope per Delta), never a batch of Deltas in a single `inner_blob`. The `rfed.channel.publish` destination is fire-and-forget (it does not accept link requests, so it cannot rely on RNS Resource fragmentation), so a single message cannot exceed the ~500-byte path MTU — and a multi-Delta msgpack array would not fit anyway. Receivers correspondingly apply Deltas one at a time through verify-on-ingest (`apply_payload`, single); there is no multi-Delta batch decode on the RFed path. A node that has accumulated several Deltas (e.g. an outbox being flushed) simply performs one publish per Delta in order.
+
+> **Note — LXMF framing retained.** Only the RFed broadcast channel uses the compact envelope. §11.2 targeted delivery and §11.3 Paper Messages still embed Deltas in full LXMF messages (title `dacar/sync/delta`); that path is unaffected.
 ### 11.2 Targeted Asynchronous Delivery (LXMF Store-and-Forward)
 For forward-secret, point-to-point delivery to offline nodes (bypassing the public RFed broadcast):
  1. **LXMF & Ratchets:** The target node configures an LXMF destination and calls enable_ratchets() (or enforce_ratchets()).

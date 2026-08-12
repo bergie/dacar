@@ -33,6 +33,7 @@ import RNS
 from dacar.rfed.blob import (
     DecodedChannelMessage,
     parse_fanout_payload,
+    unwrap_channel_message,
     wrap_channel_message,
 )
 from dacar.rfed.channel import delivery_hash_for, derive_channel
@@ -170,10 +171,35 @@ class RFedClient:
         self.stamp_costs: Dict[str, Optional[int]] = {}
         #: The inbound ``rfed.delivery`` destination, once :meth:`listen` is called.
         self.delivery_dest: Optional[RNS.Destination] = None
-        #: Callback invoked for each decoded fanout message.
+        #: Callback invoked for each decoded fanout message (LXMF path).
         self.on_message: Optional[Callable[[DecodedChannelMessage], None]] = None
+        #: Callback invoked for each raw fanout delivery (compact inner format
+        #: path); receives ``(channel_name, channel_identity, inner_blob)``.
+        self.on_fanout: Optional[Callable[[str, RNS.Identity, bytes], None]] = None
+        #: The active delivery dispatcher (set by :meth:`listen` / :meth:`listen_raw`).
+        self._dispatch: Optional[Callable[[Dict[str, Any], bytes], None]] = None
 
     # -- channel cache -----------------------------------------------------
+
+    def channel(self, name: str) -> Dict[str, Any]:
+        """A channel's derived identity, channel hash, and delivery hash.
+
+        Public, cached view of :meth:`_channel` for callers that build their
+        own ``inner_blob`` (e.g. Dacar's compact Delta format, §11.1) and send it
+        via :meth:`send_publish`. The returned dict holds ``identity`` (the
+        derived channel :class:`RNS.Identity`), ``channel_hash`` (16 bytes),
+        and ``delivery_hash`` (the channel's ``lxmf.delivery`` hash).
+        """
+        return self._channel(name)
+
+    def stamp_cost(self, name: str) -> Optional[int]:
+        """The cached PoW stamp cost advertised by the node for ``name``.
+
+        ``None`` means stamping is disabled (or :meth:`subscribe` has not yet
+        been called for the channel this session).
+        """
+        entry = self._channel(name)
+        return self.stamp_costs.get(_hex(entry["channel_hash"]))
 
     def _channel(self, name: str) -> Dict[str, Any]:
         """Resolve (and cache) a channel's derived identity and hashes."""
@@ -353,7 +379,7 @@ class RFedClient:
     def publish(
         self, node_hash: bytes, channel_name: str, lxm_message: Any
     ) -> None:
-        """Publish a message to a channel (fire-and-forget SEND).
+        """Publish an LXMF message to a channel (fire-and-forget SEND).
 
         Wraps the LXMF message with the Phase-0 codec using the cached stamp
         cost (from the last :meth:`subscribe`) and sends it as an encrypted DATA
@@ -362,10 +388,14 @@ class RFedClient:
 
         SEND is fire-and-forget — there is no acceptance response. Call
         :meth:`subscribe` again to refresh the stamp cost if publishes seem
-        dropped (the node silently rejects under-stamped blobs).
+        dropped (the node silently rejects under-stamped blobs). The publish
+        destination does NOT accept link requests, so the payload must fit
+        within the RNS MTU (default 500 bytes). For application-specific inner
+        formats that skip the LXMF envelope (e.g. Dacar's compact Delta
+        format, §11.1), build the ``rfed_payload`` yourself and send it via
+        :meth:`send_publish`.
         """
         channel = self._channel(channel_name)
-        node_identity = self._node_identity(node_hash)
         sender_delivery_hash = delivery_hash_for(self.identity)
 
         stamp_cost = self.stamp_costs.get(_hex(channel["channel_hash"]))
@@ -376,12 +406,37 @@ class RFedClient:
             lxm_message=lxm_message,
             stamp_cost=stamp_cost,
         )
+        self.send_publish(node_hash, wrapped.rfed_payload)
 
+    def send_publish(self, node_hash: bytes, rfed_payload: bytes) -> bool:
+        """Fire-and-forget SEND of a pre-wrapped ``rfed_payload``.
+
+        The general publish primitive, independent of the inner format:
+        ``rfed_payload`` must already be fully wrapped
+        (``channel_hash ‖ inner_blob ‖ stamp``) and fit within the RNS MTU.
+        Use this for application-specific inner formats that don't use the LXMF
+        message envelope (e.g. Dacar's compact Delta format, §11.1) — build
+        the payload with the channel codec (e.g.
+        :func:`dacar.rfed.blob.wrap_dacar_delta`) and send it here.
+
+        SEND is fire-and-forget — there is no acceptance response, and the
+        ``rfed.channel.publish`` destination does NOT accept link requests
+        (per the Rust reference implementation), so oversized payloads are
+        silently dropped (RNS raises ``IOError`` if the *packet* exceeds the
+        MTU, but a within-MTU packet may still be dropped by the node, e.g. an
+        under-stamped blob). Returns ``True`` if the transport accepted the
+        outbound packet (a path was known and an interface could process it),
+        ``False`` otherwise — this is transport acceptance, **not** confirmation
+        that the node stored the blob.
+        """
+        node_identity = self._node_identity(node_hash)
         dest = self._out_destination(CHANNEL_PUBLISH_NAME, node_identity)
-        # Establish a link so Reticulum can fragment larger payloads (exceeds MTU)
-        link = self._establish_link(dest)
-        link.identify(self.identity)
-        RNS.Packet(link, wrapped.rfed_payload).send()
+        # Ensure path to destination before sending. The publish destination
+        # accepts DATA packets but does NOT accept link requests, so payloads
+        # must be <= RNS MTU.
+        self._ensure_path(dest.hash)
+        receipt = RNS.Packet(dest, bytes(rfed_payload)).send()
+        return receipt is not False
 
     # -- pull --------------------------------------------------------------
 
@@ -428,10 +483,38 @@ class RFedClient:
 
         Creates and announces the inbound ``rfed.delivery`` destination. Each
         incoming fanout payload ``[ channel_hash ‖ inner_blob ]`` is matched to a
-        subscribed channel, EC-decrypted, and passed to ``on_message`` along with
-        the verified LXMF message. Returns the ``rfed.delivery`` destination hash.
+        subscribed channel, EC-decrypted, LXMF-decoded, and passed to
+        ``on_message`` along with the verified LXMF message. Returns the
+        ``rfed.delivery`` destination hash.
+
+        For application-specific inner formats that don't use the LXMF
+        envelope (e.g. Dacar's compact Delta format, §11.1), use
+        :meth:`listen_raw` instead.
         """
         self.on_message = on_message
+        self.on_fanout = None
+        self._dispatch = self._dispatch_lxmf
+        return self._start_delivery()
+
+    def listen_raw(
+        self, on_fanout: Callable[[str, RNS.Identity, bytes], None]
+    ) -> bytes:
+        """Start listening for raw fanout deliveries (no LXMF decode).
+
+        Like :meth:`listen`, but the ``inner_blob`` is handed to ``on_fanout``
+        **undecoded** — ``on_fanout(channel_name, channel_identity, inner_blob)``
+        performs the application-specific decrypt/decode (e.g.
+        :func:`dacar.rfed.blob.unwrap_dacar_delta` for Dacar Deltas, §11.1).
+        Use this when the channel carries a non-LXMF inner format. Returns the
+        ``rfed.delivery`` destination hash.
+        """
+        self.on_fanout = on_fanout
+        self.on_message = None
+        self._dispatch = self._dispatch_raw
+        return self._start_delivery()
+
+    def _start_delivery(self) -> bytes:
+        """Create/announce the inbound ``rfed.delivery`` destination once."""
         if self.delivery_dest is None:
             dest = RNS.Destination(
                 self.identity,
@@ -444,8 +527,21 @@ class RFedClient:
         self.delivery_dest.announce()
         return self.delivery_dest.hash
 
+    def _dispatch_lxmf(self, channel: Dict[str, Any], inner_blob: bytes) -> None:
+        decoded = unwrap_channel_message(
+            inner_blob=inner_blob,
+            channel_identity=channel["identity"],
+            channel_delivery_hash=channel["delivery_hash"],
+        )
+        if self.on_message:
+            self.on_message(decoded)
+
+    def _dispatch_raw(self, channel: Dict[str, Any], inner_blob: bytes) -> None:
+        if self.on_fanout:
+            self.on_fanout(channel["name"], channel["identity"], inner_blob)
+
     def _handle_delivery(self, data: bytes, packet: Any) -> None:
-        """Split and decode a fanout delivery plaintext.
+        """Split a fanout delivery plaintext and dispatch it.
 
         A foreign/unparsable fanout packet is dropped, not fatal.
         """
@@ -454,13 +550,9 @@ class RFedClient:
             channel = self._channel_by_hash(channel_hash)
             if channel is None:
                 return  # not subscribed to this channel
-            decoded = unwrap_channel_message(
-                inner_blob=inner_blob,
-                channel_identity=channel["identity"],
-                channel_delivery_hash=channel["delivery_hash"],
-            )
-            if self.on_message:
-                self.on_message(decoded)
+            dispatch = self._dispatch
+            if dispatch is not None:
+                dispatch(channel, inner_blob)
         except Exception:
             # A foreign/unparsable fanout packet is dropped, not fatal.
             pass
