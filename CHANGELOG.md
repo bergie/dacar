@@ -49,6 +49,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   required moving the `RFedClient` deep import off
   `@reticulum/core/src/rfed/client.js` (not a JSR `exports` subpath) to the
   `./src/rfed/index.js` barrel.
+- **`dacar sync`/`dacar publish` no longer time out with "rfed link to
+  <derived-hash> not established"** when the rfed node's identity is known but
+  no transport path to the specific `rfed.channel.*` destination is. RNS's
+  `RNS.Link` (Python) and `@reticulum/core`'s `Link` (JS) do not proactively
+  request a path before the first `LINKREQUEST`, so a request addressed to a
+  destination with no known route is silently dropped by multi-hop peers and
+  the link times out. Both clients now request a `path?` for the *specific*
+  derived channel destination and wait for the node's path-response announce
+  before linking/sending — mirroring rngit's `RNS.Transport.await_path` and the
+  LXMF router's `_requestAndAwaitPath`:
+  - **Python**: `RFedClient._ensure_path` (via `RNS.Transport.await_path`) is
+    called by `_establish_link` (subscribe/unsubscribe/pull) and by `publish`
+    before the fire-and-forget `Packet.send()`.
+  - **JS**: `ensureRfedPath` in `src/cli/session.js` computes the derived
+    `rfed.channel.*` destination hash and requests + awaits a path to it;
+    `runPublish`/`runSync` (now taking an optional `rns`) call it for the
+    `subscribe`+`publish`/`pull` destinations before delegating to `RFedClient`.
+- **``dacar sync``/``grant --publish`` no longer fail to create an rfed
+  subscription** (the node's subscription count did not increase). The Python
+  ``RFedClient`` pre-msgpack-packed the ``/rfed/subscribe`` payload
+  (``[channel_hash, pubkey, sig]``) into ``bytes`` before passing it to
+  ``RNS.Link.request`` — but ``Link.request`` msgpack-encodes its ``data``
+  argument itself, so the node received an opaque ``bin`` blob instead of an
+  array, failed ``Array.isArray(data)`` in ``_verifySignedPayload``, and
+  replied ``[false, null]``. ``run_sync``/``run_publish`` discarded that
+  failure and proceeded to pull/publish anyway, so the topic had no subscription
+  on the node and would not sync with peers. ``_signed_channel_payload`` now
+  returns the **list** (matching the JS ``signedChannelPayload``), and
+  ``run_sync``/``run_publish`` (Python) and ``runPublish``/``runSync`` (JS)
+  now **raise** on a rejected subscribe instead of swallowing it, so this class
+  of silent failure is caught. (JS was already encoding the payload correctly.)
 
 ## [1.1.2] - 2026-08-10
 

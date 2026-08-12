@@ -28,7 +28,6 @@ from __future__ import annotations
 import threading
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-import msgpack
 import RNS
 
 from dacar.rfed.blob import (
@@ -61,6 +60,11 @@ __all__ = [
 DEFAULT_REQUEST_TIMEOUT = 15.0
 #: Default link establishment timeout in seconds.
 DEFAULT_ESTABLISH_TIMEOUT = 15.0
+#: Default path-request wait timeout in seconds. Mirrors rngit's ``PATH_TIMEOUT``
+#: and ``@reticulum/core``'s ``PATH_REQUEST_WAIT_MS`` (7 s): long enough for a
+#: path-response announce to traverse a few hops, short enough that a one-shot
+#: CLI isn't stuck when no node is reachable.
+DEFAULT_PATH_TIMEOUT = 15.0
 
 
 class SubscribeResult:
@@ -110,15 +114,24 @@ def _hex(b: bytes) -> str:
 
 def _signed_channel_payload(
     identity: RNS.Identity, channel_hash: bytes
-) -> bytes:
-    """Build the msgpack ``[channel_hash, pubkey, sig]`` subscribe payload.
+) -> list:
+    """Build the ``[channel_hash, pubkey, sig]`` subscribe payload.
 
     Signs the channel hash with the subscriber identity. Matches the Rust
-    ``verify_signed_payload`` contract.
+    ``verify_signed_payload`` contract and ``@reticulum/core``'s JS
+    ``signedChannelPayload``.
+
+    Returns the **list** (not pre-packed bytes): RNS's ``Link.request`` msgpack-
+    encodes its ``data`` argument as part of the outer ``[time, path_hash, data]``
+    request envelope, so a pre-packed ``bytes`` payload would arrive at the node
+    as an opaque ``bin`` blob — failing the node's ``Array.isArray(data)`` check
+    in ``_verifySignedPayload`` and silently yielding ``[false, null]`` (no
+    subscription created). Returning the list lets RNS embed it as a nested
+    array, which the node unpacks and verifies.
     """
     pubkey = identity.get_public_key()
     sig = identity.sign(bytes(channel_hash))
-    return msgpack.packb([bytes(channel_hash), pubkey, sig], use_bin_type=True)
+    return [bytes(channel_hash), pubkey, sig]
 
 
 def _decode_subscribe_response(response: Any) -> SubscribeResult:
@@ -200,10 +213,38 @@ class RFedClient:
 
     # -- RNS link/request helpers (blocking) -------------------------------
 
+    def _ensure_path(
+        self, destination_hash: bytes, *, timeout: float = DEFAULT_PATH_TIMEOUT
+    ) -> None:
+        """Ensure a transport path to ``destination_hash`` before linking/sending.
+
+        RNS's :class:`RNS.Link` does **not** automatically request a path when
+        none is known (unlike ``@reticulum/core``'s JS ``Link``): a
+        ``LINKREQUEST`` addressed to a destination with no route is broadcast
+        and silently dropped by multi-hop peers, so the link times out. This
+        mirrors rngit's ``connect_server`` (``RNS.Transport.await_path``) and
+        the JS reference's ``_requestAndAwaitPath``: send a ``path?`` request
+        for the *specific* derived channel destination and wait for the node's
+        path-response announce to populate the path table.
+
+        No-op when a path is already known (the destination announced recently).
+        Raises :class:`TimeoutError` if none is found within ``timeout`` — a
+        clearer error than the subsequent link-establishment timeout, and the
+        same wording rngit uses. The rfed node announces every ``rfed.*``
+        destination under one shared identity, so a path request for any of
+        them is answered with that destination's path-response announce.
+        """
+        if not RNS.Transport.await_path(bytes(destination_hash), timeout=timeout):
+            raise TimeoutError(
+                f"no path to {_hex(destination_hash)} could be resolved "
+                f"within {timeout:.0f}s (is the rfed node announcing and reachable?)"
+            )
+
     def _establish_link(
         self, destination: RNS.Destination, *, timeout: float = DEFAULT_ESTABLISH_TIMEOUT
     ) -> RNS.Link:
         """Open an RNS Link to ``destination`` and block until ACTIVE."""
+        self._ensure_path(destination.hash)
         ready = threading.Event()
         result: Dict[str, Any] = {}
 
@@ -337,8 +378,10 @@ class RFedClient:
         )
 
         dest = self._out_destination(CHANNEL_PUBLISH_NAME, node_identity)
-        packet = RNS.Packet(dest, wrapped.rfed_payload)
-        packet.send()
+        # Establish a link so Reticulum can fragment larger payloads (exceeds MTU)
+        link = self._establish_link(dest)
+        link.identify(self.identity)
+        RNS.Packet(link, wrapped.rfed_payload).send()
 
     # -- pull --------------------------------------------------------------
 

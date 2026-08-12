@@ -287,7 +287,7 @@ async function publishDelta(args, store, identity, payload) {
   await registerAnnounceHandler({ rns, keyring, onSave: (kr) => store.saveKeyring(kr) });
 
   const client = new RFedClient({ identity, rns });
-  await runPublish({ deltaPayload: payload, nodeHash, topic, client });
+  await runPublish({ deltaPayload: payload, nodeHash, topic, client, rns });
   await store.saveKeyring(keyring);
   err(`  published to rfed channel ${JSON.stringify(topic)} via ${shortHash(nodeHash, args.fullHashes)}`);
 }
@@ -325,7 +325,7 @@ async function cmdSync(args) {
   const rx = new DeltaReceiver(state, resolver);
 
   const client = new RFedClient({ identity, rns });
-  const applied = await runSync({ nodeHash, topic, client, receiver: rx });
+  const applied = await runSync({ nodeHash, topic, client, receiver: rx, rns });
   await store.saveState(state);
   await store.saveKeyring(keyring);
 

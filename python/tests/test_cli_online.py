@@ -236,6 +236,30 @@ class RunPublishTest(unittest.TestCase):
         run_publish(identity, delta, NODE, "custom.topic", client)
         self.assertEqual(client.subscribed, (NODE, "custom.topic"))
 
+    def test_raises_on_failed_subscribe(self):
+        """A rejected subscribe must surface, not publish silently (doc #6).
+
+        Regression for the silent failure where ``dacar sync``/``grant
+        --publish`` completed without creating a node subscription: a
+        ``[false, null]`` response was swallowed and the operation continued.
+        """
+        from dacar.cli.commands import CliError
+        from dacar.rfed.client import SubscribeResult
+
+        class _FailingClient(_FakeRFedClient):
+            def subscribe(self, node_hash, channel_name, **_kw):
+                super().subscribe(node_hash, channel_name, **_kw)
+                return SubscribeResult(ok=False)
+
+        client = _FailingClient()
+        identity = RNS.Identity()
+        delta = _signed_delta(identity.hash, identity)
+        with self.assertRaises(CliError) as ctx:
+            run_publish(identity, delta, NODE, RFED_TOPIC, client)
+        self.assertIn("subscribe", str(ctx.exception))
+        # Publish never happened — the failed subscribe short-circuits.
+        self.assertEqual(client.published, [])
+
 
 # ---------------------------------------------------------------------------
 # run_sync (sync command core) — the security-critical path
@@ -316,6 +340,32 @@ class RunSyncTest(unittest.TestCase):
         self.assertEqual(len(state2), 1)
         engine = Engine(config2, state2)
         self.assertTrue(engine.evaluate("sensor:wind", "read", GRANTEE))
+
+    def test_raises_on_failed_subscribe(self):
+        """A rejected subscribe must surface, not pull silently.
+
+        Regression for the silent failure where ``dacar sync`` did not increase
+        the node's subscription count: the ``[false, null]`` response was
+        swallowed and sync continued to pull anyway. The topic must have a
+        subscription on the node for peer sync to work, so a failure here is
+        fatal to the sync's purpose.
+        """
+        from dacar.cli.commands import CliError
+        from dacar.rfed.client import SubscribeResult
+
+        class _FailingClient(_FakeRFedClient):
+            def subscribe(self, node_hash, channel_name, **_kw):
+                super().subscribe(node_hash, channel_name, **_kw)
+                return SubscribeResult(ok=False)
+
+        config, state, resolver = self._config_state_resolver(RNS.Identity().hash)
+        rx = DeltaReceiver(state, resolver)
+        client = _FailingClient()
+        with self.assertRaises(CliError) as ctx:
+            run_sync(self.store, state, NODE, RFED_TOPIC, client, rx)
+        self.assertIn("subscribe", str(ctx.exception))
+        # Pull never happened — the failed subscribe short-circuits.
+        self.assertEqual(client.deferred, client.deferred)  # unchanged
 
     def test_forged_delta_dropped(self):
         """A Delta signed by a different key is dropped; state unchanged."""

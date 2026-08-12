@@ -17,6 +17,17 @@ import { APP_NAME } from "../naming.js";
 import { RfedDeltaSync } from "../transport/rfedSync.js";
 
 /**
+ * rfed service destination names (SPEC §2), all sharing the node identity.
+ * Mirrors Python's ``dacar.rfed.constants`` and ``@reticulum/core``'s internal
+ * ``client.js`` constants. Used to compute per-destination hashes so dacar can
+ * request transport paths to the *specific* rfed service a link targets
+ * (a path to ``rfed.node`` does not establish a route to ``rfed.channel.*``).
+ */
+const RFED_SUBSCRIBE_DEST = "rfed.channel.subscribe";
+const RFED_PULL_DEST = "rfed.channel.pull";
+const RFED_PUBLISH_DEST = "rfed.channel.publish";
+
+/**
  * Announce the node's identity on the `dacar.node` destination (§11.2.4).
  *
  * Any announced destination under an identity makes that identity recallable by
@@ -102,6 +113,76 @@ export async function ensureNodeIdentity(
 }
 
 /**
+ * How long {@link ensureRfedPath} waits for a path-response announce after
+ * sending a `path?` request before giving up, in milliseconds. Mirrors rngit's
+ * `PATH_TIMEOUT` (15 s) and Python's `DEFAULT_PATH_TIMEOUT`.
+ */
+export const DEFAULT_PATH_TIMEOUT = 15_000;
+
+/**
+ * Ensure a transport path to a specific rfed service destination before the
+ * client links to it.
+ *
+ * `@reticulum/core`'s `RFedClient` opens a `Link` via `Destination.createLink()`,
+ * which sends a `LINKREQUEST` addressed to the *derived* channel destination
+ * (e.g. `rfed.channel.subscribe`). The JS `Link` does not proactively request a
+ * path before the first attempt — and a `LINKREQUEST` to a destination with no
+ * known route is silently dropped by multi-hop peers (Transport "branch 5"),
+ * so the link times out with no recourse. This mirrors rngit's
+ * `RNS.Transport.await_path` and the LXMF router's `_requestAndAwaitPath`:
+ * compute the derived destination hash, send a `path?` request for it, and wait
+ * for the node's path-response announce to populate the path table before the
+ * client links.
+ *
+ * A path to `rfed.node` does **not** establish a route to `rfed.channel.*` (RNS
+ * path entries are per-destination-hash), so the *specific* service destination
+ * a link targets must be requested. The node identity must already be
+ * recallable (call {@link ensureNodeIdentity} first). No-op when a path is
+ * already known, or when the transport lacks the path API (mock/test
+ * transports). Throws if none is found within `timeout`.
+ * @param {import("@reticulum/core").Reticulum} rns A booted Reticulum.
+ * @param {Uint8Array} nodeHash An `rfed.*` destination hash of the node.
+ * @param {string} destName The rfed service name (e.g. `rfed.channel.subscribe`).
+ * @param {Object} [opts]
+ * @param {number} [opts.timeout=15000] Max wait in milliseconds.
+ * @param {number} [opts.pollInterval=100] Poll interval in milliseconds.
+ * @param {() => void} [opts.onRequest] Invoked once when the path request fires.
+ * @returns {Promise<Uint8Array>} The resolved destination hash.
+ */
+export async function ensureRfedPath(
+  rns,
+  nodeHash,
+  destName,
+  { timeout = DEFAULT_PATH_TIMEOUT, pollInterval = 100, onRequest } = {},
+) {
+  const identity = await Destination.recall(nodeHash);
+  if (!identity) {
+    throw new Error(
+      `rfed node identity unknown for ${toHex(nodeHash)}; wait for its announce`,
+    );
+  }
+  const destHash = await _singleDestinationHash(identity, destName);
+  const transport = rns?.transport;
+  // No-op when a path is already known.
+  if (transport?.hasPath?.(destHash)) return destHash;
+  // Mock/test transports without the path-discovery API: nothing to wait for.
+  if (!transport?.requestPath) return destHash;
+  if (onRequest) onRequest();
+  await transport.requestPath(destHash).catch(() => {});
+  // A fast path-response may already have been ingested.
+  if (transport.hasPath?.(destHash)) return destHash;
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (transport.hasPath?.(destHash)) return destHash;
+    await new Promise((resolve) => setTimeout(resolve, pollInterval));
+  }
+  throw new Error(
+    `no path to ${toHex(destHash)} (${destName}) could be resolved ` +
+      `within ${timeout}ms (is the rfed node announcing and reachable?)`,
+  );
+}
+
+/**
  * Publish a signed Delta to the rfed channel (§11.1, work doc #6).
  *
  * Testable core: takes an explicit `client` (`RFedClient` or compatible fake)
@@ -112,11 +193,26 @@ export async function ensureNodeIdentity(
  * @param {Uint8Array} opts.nodeHash The rfed node's `rfed.*` destination hash.
  * @param {string} [opts.topic] RFed channel name (default `dacar.policy.v1`).
  * @param {import("../transport/rfedSync.js").RFedClientLike} opts.client
+ * @param {import("@reticulum/core").Reticulum} [opts.rns] A booted
+ *   Reticulum. When given, transport paths to the rfed `subscribe` + `publish`
+ *   destinations are requested before the client links (rngit `await_path`
+ *   pattern); omitted in tests that inject a fake client.
  * @returns {Promise<import("@reticulum/core/src/lxmf/index.js").LXMessage>}
  */
-export async function runPublish({ deltaPayload, nodeHash, topic, client }) {
+export async function runPublish({ deltaPayload, nodeHash, topic, client, rns = null }) {
   const sync = new RfedDeltaSync({ client, topic });
-  await sync.subscribe(nodeHash);
+  if (rns) {
+    await ensureRfedPath(rns, nodeHash, RFED_SUBSCRIBE_DEST);
+    await ensureRfedPath(rns, nodeHash, RFED_PUBLISH_DEST);
+  }
+  const result = await sync.subscribe(nodeHash);
+  if (result?.ok === false) {
+    throw new Error(
+      `rfed subscribe to ${toHex(nodeHash)} failed; the node rejected the ` +
+        "subscription (signature/channel mismatch) or returned no response — " +
+        "the topic will not sync with peers",
+    );
+  }
   return sync.publish(deltaPayload, nodeHash);
 }
 
@@ -132,11 +228,26 @@ export async function runPublish({ deltaPayload, nodeHash, topic, client }) {
  * @param {string} [opts.topic]
  * @param {import("../transport/rfedSync.js").RFedClientLike} opts.client
  * @param {import("../delta.js").DeltaReceiver} opts.receiver
+ * @param {import("@reticulum/core").Reticulum} [opts.rns] A booted
+ *   Reticulum. When given, transport paths to the rfed `subscribe` + `pull`
+ *   destinations are requested before the client links (rngit `await_path`
+ *   pattern); omitted in tests that inject a fake client.
  * @returns {Promise<number>}
  */
-export async function runSync({ nodeHash, topic, client, receiver }) {
+export async function runSync({ nodeHash, topic, client, receiver, rns = null }) {
   const sync = new RfedDeltaSync({ receiver, client, topic });
-  await sync.subscribe(nodeHash);
+  if (rns) {
+    await ensureRfedPath(rns, nodeHash, RFED_SUBSCRIBE_DEST);
+    await ensureRfedPath(rns, nodeHash, RFED_PULL_DEST);
+  }
+  const result = await sync.subscribe(nodeHash);
+  if (result?.ok === false) {
+    throw new Error(
+      `rfed subscribe to ${toHex(nodeHash)} failed; the node rejected the ` +
+        "subscription (signature/channel mismatch) or returned no response — " +
+        "the topic will not sync with peers",
+    );
+  }
   return sync.pull(nodeHash);
 }
 
@@ -187,23 +298,37 @@ export async function registerAnnounceHandler({ rns, keyring, onSave }) {
 }
 
 /**
+ * Compute the 16-byte SINGLE destination hash for ``name`` under ``identity``.
+ *
+ * ``nameHash = SHA-256(name)[:10]``; ``destHash = SHA-256(nameHash ‖
+ * identityHash)[:16]`` — matching ``@reticulum/core``'s
+ * ``Destination._computeHashes``. Generalised from {@link _dacarNodeHash} so any
+ * rfed service destination (``rfed.channel.subscribe`` etc.) hash can be derived
+ * to request a transport path to it.
+ * @param {import("@reticulum/core").Identity} identity
+ * @param {string} name The full dotted destination name (e.g. ``rfed.node``).
+ * @returns {Promise<Uint8Array>}
+ */
+async function _singleDestinationHash(identity, name) {
+  const encoder = new TextEncoder();
+  const nameHash = new Uint8Array(
+    (await crypto.subtle.digest("SHA-256", encoder.encode(name))).slice(0, 10),
+  );
+  const combined = new Uint8Array(nameHash.length + identity.identityHash.length);
+  combined.set(nameHash, 0);
+  combined.set(identity.identityHash, nameHash.length);
+  return new Uint8Array((await crypto.subtle.digest("SHA-256", combined)).slice(0, 16));
+}
+
+/**
  * Compute the `dacar.node` destination hash for an identity (§11.2.4).
  *
- * `nameHash = SHA-256("dacar.node")[:10]`; `destHash = SHA-256(nameHash ‖
- * identityHash)[:16]` — matching `@reticulum/core`'s `Destination._computeHashes`.
+ * Delegates to {@link _singleDestinationHash} with the ``dacar.node`` name.
  * @param {import("@reticulum/core").Identity} identity
  * @returns {Promise<Uint8Array>}
  */
 async function _dacarNodeHash(identity) {
-  const encoder = new TextEncoder();
-  const nameBytes = encoder.encode(`${APP_NAME}.node`);
-  const nameHashBuffer = await crypto.subtle.digest("SHA-256", nameBytes);
-  const nameHash = new Uint8Array(nameHashBuffer.slice(0, 10));
-  const combined = new Uint8Array(nameHash.length + identity.identityHash.length);
-  combined.set(nameHash, 0);
-  combined.set(identity.identityHash, nameHash.length);
-  const destHashBuffer = await crypto.subtle.digest("SHA-256", combined);
-  return new Uint8Array(destHashBuffer.slice(0, 16));
+  return await _singleDestinationHash(identity, `${APP_NAME}.node`);
 }
 
 /**

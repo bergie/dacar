@@ -963,7 +963,13 @@ def run_publish(
     """
     from dacar.transport.rfed_sync import RfedDeltaSync
     sync = RfedDeltaSync(client=client, topic=topic)
-    sync.subscribe(node_hash)
+    result = sync.subscribe(node_hash)
+    if getattr(result, "ok", True) is False:
+        raise CliError(
+            f"rfed subscribe to {_short(node_hash, full=False)} failed; "
+            "the node rejected the subscription (signature/channel mismatch) "
+            "or returned no response — the topic will not sync with peers"
+        )
     sync.publish(payload, node_hash)
 
 
@@ -984,7 +990,13 @@ def run_sync(
     """
     from dacar.transport.rfed_sync import RfedDeltaSync
     sync = RfedDeltaSync(receiver=receiver, client=client, topic=topic)
-    sync.subscribe(node_hash)
+    result = sync.subscribe(node_hash)
+    if getattr(result, "ok", True) is False:
+        raise CliError(
+            f"rfed subscribe to {_short(node_hash, full=False)} failed; "
+            "the node rejected the subscription (signature/channel mismatch) "
+            "or returned no response — the topic will not sync with peers"
+        )
     applied = sync.pull(node_hash)
     if applied > 0:
         store.save_state(state)
