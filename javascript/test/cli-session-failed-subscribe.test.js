@@ -28,15 +28,15 @@ class FailingSubscribeClient {
     this.subscribed = null;
     this.pulled = false;
   }
-  async subscribe(nodeHash, channelName) {
+  async subscribeRaw(nodeHash, channelName) {
     this.subscribed = [nodeHash, channelName];
     return { ok: false, stampCost: null };
   }
   async unsubscribe() {
     return { ok: true };
   }
-  async publish(nodeHash, channelName, lxm) {
-    this.published.push([nodeHash, channelName, lxm]);
+  async publishRaw(nodeHash, channelName, payload) {
+    this.published.push([nodeHash, channelName, payload]);
   }
   async pull() {
     this.pulled = true;

@@ -552,15 +552,27 @@ def _issue(args, action: Action) -> int:
     elif applied:
         _err("  (applied locally)")
     if getattr(args, "publish", False):
-        _publish_delta(args, store, identity, [payload])
-    else:
-        # Outbox (work doc #8): queue locally-issued deltas for ``publish --all``.
-        # ``--publish`` sends immediately and never enqueues; ``--no-apply`` only
-        # governs local CRDT apply, not whether the delta was issued.
+        # Durability (work doc #11): enqueue the signed payload to the outbox
+        # *before* the risky network send, so it survives a crash or failed
+        # transport and can be retried via ``publish --outbox``. On send it
+        # moves outbox → sent box (the durable replay log), so every issued
+        # Delta lands in the durable log and can be re-sent to new peers.
         outbox = store.load_outbox()
         outbox.append(payload)
         store.save_outbox(outbox)
-        _err("  (queued in outbox: `dacar publish --all` to flush)")
+        accepted = _publish_delta(args, store, identity, [payload])
+        _record_publish(store, [payload], accepted, record_to_sent=True)
+        if accepted and accepted[0]:
+            _err("  (published + logged to sent box)")
+        else:
+            _err("  (send failed; retained in outbox for retry)")
+    else:
+        # Outbox (work doc #8): queue locally-issued deltas for ``publish --outbox``.
+        # ``--no-apply`` only governs local CRDT apply, not whether the delta was issued.
+        outbox = store.load_outbox()
+        outbox.append(payload)
+        store.save_outbox(outbox)
+        _err("  (queued in outbox: `dacar publish --outbox` to flush)")
     return EXIT_OK
 
 
@@ -824,6 +836,11 @@ def cmd_prune(args) -> int:
     dropped = _prune_outbox(store, state.deletion_horizon_ms)
     if dropped:
         _err(f"  outbox: pruned {dropped} stale delta(s) (older than horizon)")
+    # And the sent box: stale entries would be intake-rejected on re-send, so
+    # the durable replay log is bounded the same way (work doc #11).
+    sent_dropped = _prune_sent(store, state.deletion_horizon_ms)
+    if sent_dropped:
+        _err(f"  sent: pruned {sent_dropped} stale delta(s) (older than horizon)")
     return EXIT_OK
 
 
@@ -954,8 +971,8 @@ def run_publish_many(
     node_hash: bytes,
     topic: str,
     client: object,
-) -> int:
-    """Publish signed Deltas to the rfed channel (§11.1, §11.1.1, work doc #4/#10).
+) -> List[bool]:
+    """Publish signed Deltas to the rfed channel (§11.1, §11.1.1, work doc #4/#10/#11).
 
     Testable core: takes an explicit ``client`` (RFedClient or compatible fake)
     so tests inject doubles without booting RNS. The ``cmd_*`` wrappers handle
@@ -964,9 +981,10 @@ def run_publish_many(
     Subscribes **once** then publishes each Delta as its own compact inner-
     format message (one §5.3 Operation per envelope, §11.1.1) — RNS is a
     singleton that cannot be re-booted, and re-subscribing per Delta would be
-    wasteful. Returns the number of Deltas whose SEND was accepted by the
-    transport (fire-and-forget: transport acceptance ≠ node storage; see
-    :meth:`RFedClient.send_publish`).
+    wasteful. Returns a per-Delta list of transport-acceptance flags
+    (fire-and-forget: transport acceptance ≠ node storage; see
+    :meth:`RFedClient.send_publish`). The caller records accepted deltas in
+    the sent box and removes them from the outbox (work doc #11).
     """
     from dacar.transport.rfed_sync import RfedDeltaSync
     sync = RfedDeltaSync(client=client, topic=topic)
@@ -977,11 +995,10 @@ def run_publish_many(
             "the node rejected the subscription (signature/channel mismatch) "
             "or returned no response — the topic will not sync with peers"
         )
-    sent = 0
-    for payload in payloads:
-        if sync.publish(payload, node_hash):
-            sent += 1
-    return sent
+    # Per-Delta transport acceptance (fire-and-forget: transport acceptance ≠
+    # node storage; see :meth:`RFedClient.send_publish`). The caller records
+    # accepted deltas in the sent box / removes them from the outbox (doc #11).
+    return [sync.publish(payload, node_hash) for payload in payloads]
 
 
 def run_publish(
@@ -990,13 +1007,14 @@ def run_publish(
     node_hash: bytes,
     topic: str,
     client: object,
-) -> None:
+) -> bool:
     """Publish a single signed Delta to the rfed channel (§11.1, work doc #4).
 
     Thin convenience wrapper over :func:`run_publish_many` for the single-Delta
-    case (``grant --publish`` / ``revoke --publish``). Kept for test clarity.
+    case (``grant --publish`` / ``revoke --publish``). Returns the per-Delta
+    transport acceptance. Kept for test clarity.
     """
-    run_publish_many(identity, [payload], node_hash, topic, client)
+    return run_publish_many(identity, [payload], node_hash, topic, client)[0]
 
 
 def run_sync(
@@ -1033,7 +1051,7 @@ def _publish_setup(args, store: Store, identity) -> tuple:
     """Boot RNS once, announce, and create the RFedClient (shared setup).
 
     Returns ``(client, node_hash, topic)``. Factored out of :func:`_publish_delta`
-    so a multi-Delta publish (``dacar publish --all`` / multi-file) boots RNS and
+    so a multi-Delta publish (``dacar publish --all``/``--outbox`` / multi-file) boots RNS and
     announces **once** then publishes each Delta, rather than re-booting RNS per
     Delta (RNS is a singleton and cannot be re-initialised).
     """
@@ -1067,16 +1085,20 @@ def _publish_setup(args, store: Store, identity) -> tuple:
     return client, node_hash, topic
 
 
-def _publish_delta(args, store: Store, identity, payloads: List[bytes]) -> None:
+def _publish_delta(args, store: Store, identity, payloads: List[bytes]) -> List[bool]:
     """Online publish hook for ``grant --publish`` / ``revoke --publish`` / ``publish``.
 
     Boots RNS **once**, subscribes once, then publishes each Delta as its own
     compact inner-format message (§11.1.1). ``payloads`` is a list (a single
-    Delta is passed as ``[payload]``).
+    Delta is passed as ``[payload]``). Returns a per-Delta list of transport-
+    acceptance flags; the caller records accepted deltas in the sent box /
+    removes them from the outbox (work doc #11). This is the RNS boot seam that
+    tests patch with a fake client.
     """
     client, node_hash, topic = _publish_setup(args, store, identity)
-    sent = run_publish_many(identity, list(payloads), node_hash, topic, client)
+    accepted = run_publish_many(identity, list(payloads), node_hash, topic, client)
     total = len(payloads)
+    sent = sum(1 for ok in accepted if ok)
     # Fire-and-forget: "sent" counts transport-accepted packets, not node
     # storage. Be honest about the distinction so a silent node-side drop is not
     # mistaken for success.
@@ -1085,6 +1107,51 @@ def _publish_delta(args, store: Store, identity, payloads: List[bytes]) -> None:
              f"(fire-and-forget: node storage is not confirmed)")
     _err(f"  sent {sent}/{total} delta(s) to rfed channel {topic!r} via "
          f"{_short(node_hash, full=args.full_hashes)}")
+    return accepted
+
+
+def _record_publish(
+    store: Store,
+    payloads: List[bytes],
+    accepted: List[bool],
+    *,
+    record_to_sent: bool,
+) -> int:
+    """Update the outbox + sent box after a publish attempt (work doc #11).
+
+    - Remove every transport-accepted payload from the **outbox** (it has been
+      sent, so it leaves the unsent queue).
+    - If ``record_to_sent``, append transport-accepted payloads to the **sent
+      box** (the durable replay log), deduplicating by exact bytes. Re-sends
+      from the sent box (``publish --sent``) are already present, so this is a
+      no-op for them.
+
+    Returns the number of accepted deltas. Pure store logic (no RNS) so it runs
+    even when :func:`_publish_delta` is patched in tests.
+    """
+    accepted_bytes = [bytes(p) for p, ok in zip(payloads, accepted) if ok]
+    if not accepted_bytes:
+        return 0
+    # Drain accepted deltas from the outbox (they've been sent).
+    outbox = store.load_outbox()
+    if outbox:
+        acc_set = set(accepted_bytes)
+        new_outbox = [p for p in outbox if bytes(p) not in acc_set]
+        if len(new_outbox) != len(outbox):
+            store.save_outbox(new_outbox)
+    # Append to the sent box (dedup by exact bytes, preserve order).
+    if record_to_sent:
+        sent = store.load_sent()
+        existing = {bytes(p) for p in sent}
+        changed = False
+        for p in accepted_bytes:
+            if p not in existing:
+                sent.append(p)
+                existing.add(p)
+                changed = True
+        if changed:
+            store.save_sent(sent)
+    return len(accepted_bytes)
 
 
 def cmd_sync(args) -> int:
@@ -1147,22 +1214,32 @@ def cmd_sync(args) -> int:
 
 
 def cmd_publish(args) -> int:
-    """``dacar publish`` — push signed delta(s) to the rfed channel (§11.1, doc #8).
+    """``dacar publish`` — push signed delta(s) to the rfed channel (§11.1, doc #8/#11).
 
-    Two modes:
+    Two source families (mutually exclusive):
 
       * ``dacar publish <file> [<file>...]`` — publish previously-signed delta
         payload(s). Files (or ``-`` for stdin) are read with the same
         hex/binary auto-detect as ``apply`` (+ ``--binary`` to force raw).
         The **exact signed bytes** are published — no re-signing, no new HLC,
         no local state change — so the receiver's verify-on-ingest
-        authenticates the *original* issuer.
+        authenticates the *original* issuer. These are external payloads and
+        are **not** added to the sent box (they are not this node's issuance).
 
-      * ``dacar publish --all`` — publish every locally-issued delta from the
-        outbox. The outbox is **not** cleared: publish is fire-and-forget
-        (no delivery confirmation), so the signed payloads are retained for
-        retry — ``dacar prune`` bounds growth by the §9 horizon. A no-op
-        (exit 0) on an empty outbox.
+      * ``dacar publish [--outbox] [--sent] [--all]`` — publish this node's
+        own issuance from its durable stores (work doc #11):
+
+          - ``--outbox`` flushes the unsent queue; each Delta **moves** to the
+            sent box (the durable replay log) once the transport accepts it.
+          - ``--sent`` re-sends every Delta in the sent box (idempotent: CRDT
+            merge is a no-op for already-delivered deltas). The sent box is
+            not modified.
+          - ``--all`` is ``--outbox`` + ``--sent`` (everything this node has
+            issued).
+
+        With no source flag and no files, ``--outbox`` is implied (the common
+        "flush what I've issued" case). Bare ``publish`` on an empty outbox is
+        a no-op (exit 0).
 
     Each Delta is published as its **own** rfed message (one §5.3 Operation
     per compact inner-format envelope, §11.1.1) — exactly like ``grant
@@ -1175,8 +1252,9 @@ def cmd_publish(args) -> int:
     :meth:`DeltaReceiver.apply_payloads` helper (which is reserved for local
     ``dacar apply <file>`` batch import, not the network).
 
-    Both reuse the ``grant --publish`` machinery (boot RNS, announce the node
-    identity, subscribe, publish) via :func:`_publish_delta`.
+    All sources reuse the ``grant --publish`` machinery (boot RNS, announce the
+    node identity, subscribe, publish) via :func:`_publish_delta`, then record
+    accepted deltas via :func:`_record_publish` (sent box append + outbox drain).
     """
     store = Store(args.store, identity_override=args.identity)
     store.ensure()
@@ -1184,62 +1262,92 @@ def cmd_publish(args) -> int:
     if identity is None:
         raise CliError("no signing identity (run `dacar init` or `dacar identity new`)")
 
-    use_all = getattr(args, "all", False)
-    payloads = list(args.payloads or [])
+    use_outbox = getattr(args, "outbox", False) or getattr(args, "all", False)
+    use_sent = getattr(args, "sent", False) or getattr(args, "all", False)
+    files = list(args.payloads or [])
+    from_stores = use_outbox or use_sent
 
-    if use_all and payloads:
-        raise CliError("publish: use either <file>... or --all, not both")
-    if not use_all and not payloads:
-        raise CliError("publish: provide <file>... (one or more) or --all")
+    if files and from_stores:
+        raise CliError(
+            "publish: use either <file>... or a source flag (--outbox/--sent/--all), not both"
+        )
+    # With no files and no source flag, ``--outbox`` is implied (doc #11): the
+    # common case is "flush what I've issued".
+    if not files and not from_stores:
+        use_outbox = True
 
-    if use_all:
-        to_publish = store.load_outbox()
-        if not to_publish:
-            _err("outbox empty (nothing to publish)")
-            return EXIT_OK
-    else:
-        to_publish = []
-        for path in payloads:
-            data = _read_payload_input(path, args.binary)
-            if not data:
-                raise CliError(f"empty payload: {path}")
-            to_publish.append(data)
+    to_publish: List[bytes] = []
+    if use_outbox:
+        to_publish.extend(store.load_outbox())
+    if use_sent:
+        to_publish.extend(store.load_sent())
+    for path in files:
+        data = _read_payload_input(path, args.binary)
+        if not data:
+            raise CliError(f"empty payload: {path}")
+        to_publish.append(data)
 
-    # Publish each Delta as its own rfed message (one Operation per compact
-    # inner-format envelope, §11.1.1) — never a multi-delta batch, which would
-    # overflow the ~500-byte path MTU and is not decodable by the single-delta
-    # receivers. Mirrors `grant --publish` / `revoke --publish`. RNS is a
-    # singleton, so boot + subscribe happen once for the whole batch.
-    label = "outbox" if use_all else f"{len(to_publish)} file(s)"
-    _err(f"  publishing {len(to_publish)} delta(s) ({label})")
-    _publish_delta(args, store, identity, to_publish)
+    if not to_publish:
+        which = " + ".join(
+            name for name, on in (("outbox", use_outbox), ("sent", use_sent)) if on
+        ) or "outbox"
+        _err(f"nothing to publish ({which} empty)")
+        return EXIT_OK
 
-    # The outbox is NOT cleared: publish is fire-and-forget (no delivery
-    # confirmation), so the signed payloads must be retained for retry. The
-    # CRDT merge is idempotent, so re-publishing already-delivered deltas is a
-    # no-op on peers. `dacar prune` bounds growth by the §9 horizon (entries
-    # older than the horizon are intake-rejected anyway).
-    if use_all:
-        _err("  (outbox retained for retry: fire-and-forget; `dacar prune` to drop stale)")
+    # Dedup the send list by exact bytes, preserving first-seen order (a delta
+    # could appear in both the outbox and the sent box after a partial-failure
+    # recovery; sending it once is sufficient — CRDT merge is idempotent).
+    seen: set = set()
+    deduped: List[bytes] = []
+    for payload in to_publish:
+        b = bytes(payload)
+        if b not in seen:
+            seen.add(b)
+            deduped.append(b)
+    to_publish = deduped
+
+    # External file payloads are not this node's issuance -> not logged to the
+    # sent box. Anything sourced from a store (outbox/sent/--all) is recorded.
+    record_to_sent = not bool(files)
+
+    label_parts: List[str] = []
+    if use_outbox:
+        label_parts.append("outbox")
+    if use_sent:
+        label_parts.append("sent")
+    if files:
+        label_parts.append(f"{len(files)} file(s)")
+    _err(f"  publishing {len(to_publish)} delta(s) ({' + '.join(label_parts)})")
+
+    accepted = _publish_delta(args, store, identity, to_publish)
+    n_sent = _record_publish(store, to_publish, accepted, record_to_sent=record_to_sent)
+
+    if use_outbox and not files:
+        # Outbox deltas move to the sent box on send (the durable replay log).
+        _err(
+            f"  ({n_sent} moved outbox → sent box; "
+            "`dacar publish --sent` to re-send, `dacar prune` to bound growth)"
+        )
+    elif use_sent and not use_outbox and not files:
+        _err("  (sent box re-sent; not modified — idempotent)")
     return EXIT_OK
 
 
-def _prune_outbox(store: Store, horizon_ms: int, *, now_ms: Optional[int] = None) -> int:
-    """Drop outbox entries whose HLC physical time is older than the §9 horizon.
+def _prune_payload_list(
+    payloads: List[bytes], horizon_ms: int, *, now_ms: Optional[int] = None
+) -> tuple:
+    """Split ``payloads`` by the §9 horizon.
 
-    Such deltas are intake-rejected by receivers (§9), so publishing them is
-    pointless; pruning keeps the outbox bounded for long-lived offline nodes.
-    Entries that fail to decode are left intact (do not destroy on a decode
-    error). Returns the number dropped.
+    Returns ``(kept, dropped)``. Entries whose HLC physical time is older than
+    the horizon are intake-rejected by receivers (§9), so keeping/re-publishing
+    them is pointless; entries that fail to decode are kept (do not destroy on a
+    decode error).
     """
-    outbox = store.load_outbox()
-    if not outbox:
-        return 0
     now = now_ms if now_ms is not None else physical_now_ms()
     cutoff = now - horizon_ms
     kept: List[bytes] = []
     dropped = 0
-    for payload in outbox:
+    for payload in payloads:
         try:
             op = Operation.from_payload(payload)
             phys, _ = unpack(op.hlc)
@@ -1250,6 +1358,36 @@ def _prune_outbox(store: Store, horizon_ms: int, *, now_ms: Optional[int] = None
             dropped += 1
         else:
             kept.append(payload)
+    return kept, dropped
+
+
+def _prune_outbox(store: Store, horizon_ms: int, *, now_ms: Optional[int] = None) -> int:
+    """Drop outbox entries older than the §9 horizon (work doc #8).
+
+    Such deltas are intake-rejected by receivers (§9), so publishing them is
+    pointless; pruning keeps the outbox bounded for long-lived offline nodes.
+    Returns the number dropped.
+    """
+    outbox = store.load_outbox()
+    if not outbox:
+        return 0
+    kept, dropped = _prune_payload_list(outbox, horizon_ms, now_ms=now_ms)
     if dropped:
         store.save_outbox(kept)
+    return dropped
+
+
+def _prune_sent(store: Store, horizon_ms: int, *, now_ms: Optional[int] = None) -> int:
+    """Drop sent-box entries older than the §9 horizon (work doc #11).
+
+    The sent box is the durable replay log; entries older than the horizon are
+    intake-rejected by receivers (§9) on re-send, so retaining them only grows
+    the log. Mirrors :func:`_prune_outbox`. Returns the number dropped.
+    """
+    sent = store.load_sent()
+    if not sent:
+        return 0
+    kept, dropped = _prune_payload_list(sent, horizon_ms, now_ms=now_ms)
+    if dropped:
+        store.save_sent(kept)
     return dropped

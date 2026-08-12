@@ -191,12 +191,13 @@ The store directory (conventionally `~/.dacar/`, mode `0700`) contains loose fil
 | `aliases` | `0644` | Human-readable name map (§13.5) |
 | `ledger.msgpack` | `0600` | Plaintext grant ledger (§13.6) |
 | `identities.msgpack` | `0600` | Issuer public-key cache (§11.2.4, §13.7) |
-| `outbox.msgpack` | `0600` | Locally-issued, unpublished Deltas (§11, §13.8) |
+| `outbox.msgpack` | `0600` | Locally-issued, not-yet-published Deltas (§11, §13.8) |
+| `sent.msgpack` | `0600` | Durable replay log of published Deltas (§11, §13.9) |
 | `identity` | `0600` | Node signing identity private key (§13.9) |
 
 Secret records (the salt, CRDT state, plaintext labels, and node-local signed payloads) are `0600`; the HLC and aliases are `0644` (they carry no secret material). Modes SHOULD be set explicitly (independent of umask).
 
-`identities.msgpack` and `outbox.msgpack` are **lazy**: a fresh `init` SHOULD NOT create them. They appear only when first written (first issuer remembered / first unpublished Delta queued).
+`identities.msgpack`, `outbox.msgpack`, and `sent.msgpack` are **lazy**: a fresh `init` SHOULD NOT create them. They appear only when first written (first issuer remembered / first Delta queued or published).
 
 ### 13.2 `config` — INI
 
@@ -278,21 +279,32 @@ A MessagePack array of raw §5.3 transport payloads — signed Operations issued
 [ <payload bytes>, ... ]
 ```
 
-`publish --all` flushes and clears the outbox. A corrupted or non-array record MUST be treated as empty (the CLI must not crash).
+`publish --outbox` flushes the outbox: each Delta is published and, once the transport accepts it, **moves** to `sent.msgpack` (§13.9) — it is not cleared in place. Publish is fire-and-forget (no delivery confirmation), so the signed bytes are retained (now in the sent box) for re-delivery to peers that join later. A corrupted or non-array record MUST be treated as empty (the CLI must not crash).
 
-### 13.9 `identity` — Node Signing Identity
+### 13.9 `sent.msgpack` — Published Deltas (Durable Replay Log)
+
+A MessagePack array of raw §5.3 transport payloads — signed Operations this node has published (own issuance), as exact signed bytes, in publication order:
+
+```json
+[ <payload bytes>, ... ]
+```
+
+A Delta moves **outbox → sent box** on send (deduplicating by payload bytes). `publish --sent` re-publishes every entry without modifying the log; the CRDT merge is idempotent, so re-publishing an already-delivered Delta is a no-op on peers. `publish --all` is `--outbox` + `--sent` (everything this node has issued). The sent box does **not** include deltas received from peers (those are reconstructed from converged state, §6) nor external payloads published via `publish <file>` (those are not this node's issuance). `prune` bounds both the outbox and the sent box by the §9 horizon. A corrupted or non-array record MUST be treated as empty (the CLI must not crash).
+
+### 13.10 `identity` — Node Signing Identity
 
 The node's own RNS signing identity private key, persisted library-natively. Because different Reticulum implementations own different private-key serialization formats (Python RNS writes 64 bytes — 32-byte X25519 private + 32-byte Ed25519 private; other runtimes may write 128 bytes including the public halves), this **one file is the sole intentional divergence** between implementations adopting this layout.
 
 A store directory therefore carries the signing identity of whichever implementation initialized it. All other records (§13.2–§13.8) are byte-identical across implementations, so a store created by one CLI is fully readable — and writable — by any other. An implementation that did not initialize the store cannot sign with the foreign identity file; it SHOULD re-`init` or load a format-native identity to issue Operations.
 
-### 13.10 Cross-Implementation Interoperability
+### 13.11 Cross-Implementation Interoperability
 
 Implementations adopting this file layout SHOULD produce a store in which every record except `identity` is byte-identical to the canonical format above, so that two independently-developed `dacar` CLIs sharing one store directory (e.g. over a mounted volume or sneakernet) interoperate without conversion:
 
  * `init` produces the same file set (config, clock.msgpack, state.msgpack, ledger.msgpack, aliases — the lazy records are absent).
  * `grants` / `check` read the CRDT, ledger, and aliases written by either implementation.
  * `grant` / `revoke` append to the ledger using the §6.1 Tuple Hash as the key, and queue to the outbox, in a format readable by either.
+ * `publish --outbox` moves published Deltas from the outbox to `sent.msgpack`; `publish --sent` / `publish --all` re-send from it, in a format readable by either.
  * `identity remember` writes the 32-byte Ed25519 public key to `identities.msgpack`.
 
 The canonical Python `Store` is the reference implementation; other implementations SHOULD match its on-disk bytes.

@@ -26,9 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   developed CLIs can read and write the same store directory interchangeably.
   Documents the exact byte format of every record: INI `config`, snake_case
   `clock.msgpack`/`ledger.msgpack`/`identities.msgpack`, rnns-text `aliases`,
-  the CRDT `state.msgpack` snapshot, and the `outbox.msgpack` queue. The node
-  signing identity private key is the sole intentional divergence (library-
-  native format).
+  the CRDT `state.msgpack` snapshot, the `outbox.msgpack` unsent queue, and
+  the `sent.msgpack` durable replay log of published Deltas (work doc #11).
+  The node signing identity private key is the sole intentional divergence
+  (library-native format).
 
 ### Changed
 - **Python RFed transport now publishes/receives Deltas in the compact
@@ -44,8 +45,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sent/received without assuming an LXMF envelope; `publish()`/`listen()`
   (LXMF path) are preserved for normal RFed usage. The `RfedDeltaSync`
   adapter now wraps/receives via the compact format and the obsolete
-  `message_content` helper is removed. The JavaScript transport still uses
-  LXMF-over-RFed pending an upstream `@reticulum/core` raw-publish API.
+  `message_content` helper is removed. The JavaScript transport is migrated
+  in the same change (see the JS entry below).
 - **`dacar publish` now sends each Delta as its own rfed message** (one §5.3
   Operation per compact inner-format envelope, §11.1.1) instead of packing
   multiple Deltas into one msgpack batch. This is required by the ~500-byte
@@ -60,15 +61,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RfedDeltaSync.pack_payloads` alias is removed (`DeltaReceiver`'s
   `pack_payloads`/`apply_payloads` are retained for local `dacar apply <file>`
   batch import, §11.2).
-- **`dacar publish --all` no longer clears the outbox.** Publish is
-  fire-and-forget (no delivery confirmation), so clearing the outbox on send
-  destroyed the only signed-bytes copy of each Delta — a Delta dropped by the
-  node (under-stamped, TTL-expired, or never delivered to a node that joined
-  later) was irrecoverable. The outbox is now retained so `publish --all` can
-  be re-run to retry/re-deliver; `dacar prune` bounds growth by the §9 horizon.
-  (CRDT merge is idempotent, so re-publishing already-delivered deltas is a
-  no-op on peers.) This is an interim; a proper outbox + sent-box + re-send
-  design is proposed separately.
+- **Durable issuance log: outbox + sent box + re-send (work doc #11).** The
+  outbox is split into two durable stores: the **outbox** (`outbox.msgpack`,
+  the unsent queue — `grant`/`revoke` append here unless `--publish`) and the
+  **sent box** (`sent.msgpack`, the durable replay log of every Delta this
+  node has published, as exact signed bytes). A Delta moves **outbox → sent
+  box** on send (deduplicating by payload bytes), so a dropped Delta is
+  retryable and re-deliverable to peers that join later. Publish is
+  fire-and-forget (no delivery confirmation), so the signed bytes must be
+  retained — the sent box is that retention. `dacar publish` gains three
+  explicit, orthogonal source flags: `--outbox` (flush the unsent queue,
+  moving each to the sent box; the default when no flag is given), `--sent`
+  (re-send every Delta in the sent box, idempotent — CRDT merge is a no-op
+  for already-delivered deltas; the sent box is not modified), and `--all`
+  (outbox + sent box). `grant --publish` / `revoke --publish` now enqueue to
+  the outbox *before* sending (durability against a crash or failed
+  transport) so the sent box is a complete issuance log. `dacar prune` bounds
+  both the outbox and the sent box by the §9 horizon. External payloads
+  published via `publish <file>` are not logged to the sent box (they are
+  not this node's own issuance).
+- **JavaScript port: durable issuance log + raw RFed transport (work doc #11,
+  docs #8/#10).** The JS CLI now matches the Python reference for both the
+  durable-log semantics and the compact-inner-format RFed transport, with
+  store-level + wire-format interoperability verified cross-implementation
+  (a Python-written `sent.msgpack` reads back in JS and vice versa; a
+  Python-wrapped RFed `inner_blob` unwraps in JS and vice versa):
+  - **Store**: `src/cli/store.js` gains `loadSent()` / `saveSent()` (the
+    `sent.msgpack` durable replay log), mirroring `loadOutbox()` /
+    `saveOutbox()`; `src/cli/fileStore.js` maps `sent.msgpack` to mode 0600.
+    The format is byte-for-byte the Python record (msgpack array of bin
+    payloads; corrupted/non-array → empty).
+  - **Commands**: `src/cli/dacar.js` `cmdPublish` is rewritten for the
+    `--outbox` / `--sent` / `--all` source flags (bare `publish` defaults to
+    `--outbox`; empty is a no-op exit 0; `--all` = outbox + sent; files are
+    exclusive with flags; dedup by exact bytes; external files are not logged
+    to the sent box). A new pure-store `recordPublish(store, payloads,
+    accepted, { recordToSent })` helper drains accepted deltas from the
+    outbox and appends them to the sent box (dedup by bytes). `grant
+    --publish` / `revoke --publish` enqueue to the outbox *before* sending
+    (durability), then `recordPublish` moves outbox → sent on success.
+  - **Transport**: `src/transport/rfedSync.js` is migrated off legacy
+    LXMF-over-RFed onto `@reticulum/core`'s raw-publish primitives —
+    `subscribeRaw()` (marks the channel for raw decode), `publishRaw()`
+    (carries the Delta as the RTID-prelude application payload, no LXMF
+    envelope), and `listen()` with `kind: "raw"` dispatch (the payload is
+    the carried §5.3 Delta, routed through `DeltaReceiver.applyPayload`).
+    `pull()` unwraps deferred `inner_blob`s via `unwrapRawChannelMessage`.
+    `src/cli/session.js` gains `runPublishMany({ deltaPayloads, … })` (per-
+    Delta transport acceptance, one Delta per message) with `runPublish` as a
+    thin single-Delta wrapper. The obsolete LXMF-path `wrapChannelMessage` /
+    `unwrapChannelMessage` / `LXMessage` imports are removed from `rfedSync.js`.
+  - **Tests**: `test/transport-rfed.test.js` is rewritten for the raw API;
+    `test/cli-publish.test.js` gains sent-box store tests + `recordPublish`
+    tests (move-to-sent, partial-failure keeps unsent, idempotent re-send,
+    external files not logged).
 - `send_publish` now returns whether the transport accepted the outbound
   packet (`Packet.send()` result), and `dacar publish` reports the sent/total
   count honestly instead of implying node-side storage was confirmed.
@@ -83,8 +129,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keys (was 64-byte RNS keys); the ledger key is `sha256(preimage).hex()` (was
   the raw preimage hex); files are written as loose files at the store root
   (was `<dir>/dacar/<key>.bin`) with Python-matching modes (0600/0644).
-- Bumped `@reticulum/core` and `@reticulum/node` to `^0.6.3` in both
-  `package.json` (npm) and `jsr.json` (JSR `imports` map).
+- Bumped `@reticulum/core` and `@reticulum/node` to `^0.6.5` in both
+  `package.json` (npm) and `jsr.json` (JSR `imports` map). This release of
+  `@reticulum/core` exposes the raw-publish primitives (`subscribeRaw`,
+  `publishRaw`, `wrapRawChannelMessage`, `unwrapRawChannelMessage`, `listen`
+  with `kind: "raw"` dispatch) used by the JS RFed transport migration above.
 - Migrated imports of `LXMessage`/`LXMRouter` to `@reticulum/core/src/lxmf/index.js`
   and of `RFedClient` plus the rfed helpers (`deliveryHashFor`, `deriveChannel`,
   `unwrapChannelMessage`, `wrapChannelMessage`) to `@reticulum/core/src/rfed/index.js`.
@@ -98,8 +147,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `@reticulum/node` as **npm** dependencies (JSR reported `usesNpm: true` and
   the dependency graph showed `npm:@reticulum/core`) because `jsr.json` had no
   `imports` map, so JSR fell back to npm for the bare `@reticulum/*` specifiers
-  in the source. Added an `imports` map (`jsr:@reticulum/core@^0.6.3`,
-  `jsr:@reticulum/node@^0.6.3`) so JSR now resolves both from JSR. This also
+  in the source. Added an `imports` map (`jsr:@reticulum/core@^0.6.5`,
+  `jsr:@reticulum/node@^0.6.5`) so JSR now resolves both from JSR. This also
   required moving the `RFedClient` deep import off
   `@reticulum/core/src/rfed/client.js` (not a JSR `exports` subpath) to the
   `./src/rfed/index.js` barrel.

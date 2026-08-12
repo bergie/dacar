@@ -52,6 +52,7 @@ const FILE_MODES = {
   "ledger.msgpack": 0o600,
   "identities.msgpack": 0o600,
   "outbox.msgpack": 0o600,
+  "sent.msgpack": 0o600,
 };
 
 export class DacarFileAdapter {

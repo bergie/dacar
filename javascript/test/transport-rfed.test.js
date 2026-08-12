@@ -1,11 +1,9 @@
 import { describe, it, before } from "node:test";
 import assert from "node:assert/strict";
 import { Identity } from "@reticulum/core";
-import { LXMessage } from "@reticulum/core/src/lxmf/index.js";
 import {
-  deliveryHashFor,
   deriveChannel,
-  wrapChannelMessage,
+  wrapRawChannelMessage,
 } from "@reticulum/core/src/rfed/index.js";
 import { Action, Operation } from "../src/operation.js";
 import { Tuple } from "../src/tuple.js";
@@ -16,7 +14,6 @@ import { StateVector } from "../src/crdt.js";
 import { Keyring } from "../src/verifier.js";
 import { DeltaReceiver } from "../src/delta.js";
 import { RfedDeltaSync } from "../src/transport/rfedSync.js";
-import { messageContent } from "../src/transport/lxmfSync.js";
 
 const HASHER = new NamespaceHasher(Uint8Array.from({ length: 32 }, (_, i) => i));
 const GRANTEE = Uint8Array.from({ length: HASH_SIZE }, (_, i) => i + HASH_SIZE);
@@ -34,25 +31,34 @@ async function makeOp(issuer, signers = []) {
   return signers.length ? base.sign(...signers) : base;
 }
 
-/** A minimal RFedClient double that records publishes and replays listen/pull. */
+/**
+ * A minimal RFedClient double for the raw (compact inner format) API.
+ *
+ * `subscribeRaw` records the call; `publishRaw` records each payload;
+ * `listen` stashes the callback so a test can invoke it with a decoded raw
+ * fanout object (`{ kind: "raw", payload }`); `pull` drains enqueued blobs
+ * (which a test builds with `wrapRawChannelMessage` so the EC-decrypt unwrap is
+ * exercised).
+ */
 class FakeRFedClient {
   constructor() {
-    /** @type {Array<{ nodeHash: Uint8Array, channelName: string, message: LXMessage }>} */
+    /** @type {Array<{ nodeHash: Uint8Array, channelName: string, payload: Uint8Array }>} */
     this.published = [];
     /** @type {((decoded: any) => void) | null} */ this.listener = null;
     /** @type {Array<{ channelHash: Uint8Array, blob: Uint8Array }>} */ this.deferred = [];
     this.deliveryHash = new Uint8Array(16).fill(9);
+    this.subscribed = null;
   }
-  async subscribe(nodeHash, channelName) {
+  async subscribeRaw(nodeHash, channelName) {
     this.subscribed = { nodeHash, channelName };
     return { ok: true, stampCost: null };
   }
   async unsubscribe(nodeHash, channelName) {
     return { ok: true };
   }
-  /** @param {Uint8Array} nodeHash @param {string} channelName @param {LXMessage} lxmMessage */
-  async publish(nodeHash, channelName, lxmMessage) {
-    this.published.push({ nodeHash, channelName, message: lxmMessage });
+  /** @param {Uint8Array} nodeHash @param {string} channelName @param {Uint8Array} payload */
+  async publishRaw(nodeHash, channelName, payload) {
+    this.published.push({ nodeHash, channelName, payload });
   }
   /** @param {(decoded: any) => void} onMessage */
   async listen(onMessage) {
@@ -65,7 +71,7 @@ class FakeRFedClient {
   }
 }
 
-describe("RfedDeltaSync (§11.1)", () => {
+describe("RfedDeltaSync (§11.1, compact inner format)", () => {
   /** @type {Identity} */ let sender;
   /** @type {Uint8Array} */ let issuer;
   /** @type {Uint8Array} */ let publicKey;
@@ -83,44 +89,37 @@ describe("RfedDeltaSync (§11.1)", () => {
     return { state, rx: new DeltaReceiver(state, keyring) };
   }
 
-  it("publish wraps the Delta as LXMF content under the dacar title", async () => {
-    const client = new FakeRFedClient();
-    const sync = new RfedDeltaSync({ client });
-    const delta = (await makeOp(issuer, [sender])).toPayload();
-
-    const message = await sync.publish(delta, NODE);
-    assert.equal(client.published.length, 1);
-    assert.equal(client.published[0].channelName, RFED_TOPIC);
-    assert.deepEqual(messageContent(message), delta);
-    // The rfed codec overwrites these; placeholders are fine pre-publish.
-    assert.deepEqual(message.destinationHash, new Uint8Array(16));
-  });
-
-  it("subscribe caches the channel and topic", async () => {
+  it("subscribe uses subscribeRaw (marks the channel for raw decode)", async () => {
     const client = new FakeRFedClient();
     const sync = new RfedDeltaSync({ client, topic: "dacar.policy.v1" });
     await sync.subscribe(NODE);
     assert.equal(client.subscribed.channelName, "dacar.policy.v1");
   });
 
-  it("listen routes a received Delta through verify-on-ingest", async () => {
+  it("publish sends the Delta as the raw payload (no LXMF envelope)", async () => {
+    const client = new FakeRFedClient();
+    const sync = new RfedDeltaSync({ client });
+    const delta = (await makeOp(issuer, [sender])).toPayload();
+
+    const accepted = await sync.publish(delta, NODE);
+    assert.equal(accepted, true); // fire-and-forget: no throw ⇒ accepted
+    assert.equal(client.published.length, 1);
+    assert.equal(client.published[0].channelName, RFED_TOPIC);
+    // The raw Delta bytes are published verbatim — the client wraps them in
+    // the RTID prelude + EC-encrypts; no LXMF serialisation.
+    assert.deepEqual(client.published[0].payload, new Uint8Array(delta));
+  });
+
+  it("listen routes a received raw Delta through verify-on-ingest", async () => {
     const { state, rx } = receiver();
     const client = new FakeRFedClient();
     const sync = new RfedDeltaSync({ receiver: rx, client });
     await sync.listen();
 
     const delta = (await makeOp(issuer, [sender])).toPayload();
-    const message = new LXMessage({
-      destinationHash: new Uint8Array(16),
-      sourceHash: new Uint8Array(16),
-      content: delta,
-    });
-    const { wireData } = await message.serialize(sender);
-    const recovered = await LXMessage.deserialize(wireData, new Uint8Array(16));
-
-    // RFedClient.invoke does not await the callback; applyPayload is async
-    // (Ed25519 verify over Web Crypto), so poll for it to settle.
-    /** @type {any} */ (client.listener)({ message: recovered, signatureValid: true });
+    // The real client would EC-decrypt + unwrap the RTID prelude and deliver
+    // `{ kind: "raw", payload }`; the fake hands the payload straight through.
+    /** @type {any} */ (client.listener)({ kind: "raw", payload: new Uint8Array(delta) });
     for (let i = 0; i < 50 && state.size === 0; i++) {
       await new Promise((r) => setTimeout(r, 5));
     }
@@ -134,14 +133,10 @@ describe("RfedDeltaSync (§11.1)", () => {
     const sync = new RfedDeltaSync({ receiver: rx, client });
     await sync.listen();
 
-    const message = new LXMessage({
-      destinationHash: new Uint8Array(16),
-      sourceHash: new Uint8Array(16),
-      content: new TextEncoder().encode("not a dacar delta"),
+    /** @type {any} */ (client.listener)({
+      kind: "raw",
+      payload: new TextEncoder().encode("not a dacar delta"),
     });
-    const { wireData } = await message.serialize(sender);
-    const recovered = await LXMessage.deserialize(wireData, new Uint8Array(16));
-    /** @type {any} */ (client.listener)({ message: recovered });
     for (let i = 0; i < 20 && state.size !== 0; i++) {
       await new Promise((r) => setTimeout(r, 5));
     }
@@ -149,32 +144,60 @@ describe("RfedDeltaSync (§11.1)", () => {
     assert.equal(state.size, 0);
   });
 
-  it("pull unwraps deferred blobs and applies their Deltas (verify-on-ingest)", async () => {
+  it("listen ignores non-raw deliveries (defensive — not a raw channel)", async () => {
+    const { state, rx } = receiver();
+    const client = new FakeRFedClient();
+    const sync = new RfedDeltaSync({ receiver: rx, client });
+    await sync.listen();
+
+    // A stray lxmf-kind delivery (shouldn't happen on a raw channel, but the
+    // guard must not crash or apply it).
+    /** @type {any} */ (client.listener)({ kind: "lxmf" });
+    for (let i = 0; i < 10 && state.size !== 0; i++) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    assert.equal(state.size, 0);
+  });
+
+  it("pull unwraps deferred raw blobs and applies their Deltas (verify-on-ingest)", async () => {
     const { state, rx } = receiver();
     const client = new FakeRFedClient();
     const sync = new RfedDeltaSync({ receiver: rx, client });
 
-    // Produce a REAL rfed inner_blob so the EC-decrypt unwrap is exercised:
-    // derive the channel, wrap a Delta-bearing LXMF message, enqueue the blob.
-    const { identity: channelIdentity } = await deriveChannel(RFED_TOPIC);
-    const senderDeliveryHash = await deliveryHashFor(sender);
+    // Produce a REAL rfed raw inner_blob so the EC-decrypt unwrap is exercised:
+    // derive the channel, wrap a Delta with the raw codec, enqueue the blob.
+    const { identity: channelIdentity, channelHash } = await deriveChannel(RFED_TOPIC);
     const delta = (await makeOp(issuer, [sender])).toPayload();
-    const lxmMessage = new LXMessage({
-      destinationHash: new Uint8Array(16),
-      sourceHash: new Uint8Array(16),
-      content: delta,
-    });
-    const { innerBlob, channelHash } = await wrapChannelMessage({
+    const { innerBlob } = await wrapRawChannelMessage({
       channelIdentity,
       senderIdentity: sender,
-      senderLxmDeliveryHash: senderDeliveryHash,
-      lxmMessage,
+      payload: delta,
     });
     client.deferred.push({ channelHash, blob: innerBlob });
 
     const applied = await sync.pull(NODE);
     assert.equal(applied, 1);
     assert.equal(state.size, 1);
+  });
+
+  it("pull drops a foreign/undecryptable blob (never fatal)", async () => {
+    const { state, rx } = receiver();
+    const client = new FakeRFedClient();
+    const sync = new RfedDeltaSync({ receiver: rx, client });
+
+    // A blob encrypted to a *different* channel identity: unwrapRawChannelMessage
+    // fails to decrypt, and the adapter drops it rather than throwing.
+    const { identity: otherIdentity, channelHash } = await deriveChannel("other.channel");
+    const { innerBlob } = await wrapRawChannelMessage({
+      channelIdentity: otherIdentity,
+      senderIdentity: sender,
+      payload: new Uint8Array([1, 2, 3]),
+    });
+    client.deferred.push({ channelHash, blob: innerBlob });
+
+    const applied = await sync.pull(NODE);
+    assert.equal(applied, 0);
+    assert.equal(state.size, 0);
   });
 
   it("listen/pull throw without a receiver", async () => {

@@ -183,23 +183,30 @@ export async function ensureRfedPath(
 }
 
 /**
- * Publish a signed Delta to the rfed channel (§11.1, work doc #6).
+ * Publish signed Deltas to the rfed channel (§11.1, work doc #4/#10/#11).
  *
- * Testable core: takes an explicit `client` (`RFedClient` or compatible fake)
- * so tests inject doubles without booting RNS. The `cmd_*` wrappers handle RNS
- * boot + announce + real client creation.
+ * Testable core: takes an explicit `client` (`RFedClient` or compatible
+ * fake) so tests inject doubles without booting RNS. The `cmd_*` wrappers
+ * handle RNS boot + announce + real client creation.
+ *
+ * Subscribes **once** then publishes each Delta as its own compact inner-format
+ * message (one §5.3 Operation per envelope, §11.1.1) — RNS is a singleton that
+ * cannot be re-booted, and re-subscribing per Delta would be wasteful. Returns
+ * a per-Delta list of transport-acceptance flags (fire-and-forget: transport
+ * acceptance ≠ node storage). The caller records accepted deltas in the sent
+ * box / removes them from the outbox (work doc #11).
  * @param {Object} opts
- * @param {Uint8Array} opts.deltaPayload Signed §5.3 Operation payload.
+ * @param {Uint8Array[]} opts.deltaPayloads Signed §5.3 Operation payloads.
  * @param {Uint8Array} opts.nodeHash The rfed node's `rfed.*` destination hash.
  * @param {string} [opts.topic] RFed channel name (default `dacar.policy.v1`).
  * @param {import("../transport/rfedSync.js").RFedClientLike} opts.client
  * @param {import("@reticulum/core").Reticulum} [opts.rns] A booted
- *   Reticulum. When given, transport paths to the rfed `subscribe` + `publish`
- *   destinations are requested before the client links (rngit `await_path`
- *   pattern); omitted in tests that inject a fake client.
- * @returns {Promise<import("@reticulum/core/src/lxmf/index.js").LXMessage>}
+ *   Reticulum. When given, transport paths to the rfed `subscribe` +
+ *   `publish` destinations are requested before the client links (rngit
+ *   `await_path` pattern); omitted in tests that inject a fake client.
+ * @returns {Promise<boolean[]>}
  */
-export async function runPublish({ deltaPayload, nodeHash, topic, client, rns = null }) {
+export async function runPublishMany({ deltaPayloads, nodeHash, topic, client, rns = null }) {
   const sync = new RfedDeltaSync({ client, topic });
   if (rns) {
     await ensureRfedPath(rns, nodeHash, RFED_SUBSCRIBE_DEST);
@@ -213,7 +220,42 @@ export async function runPublish({ deltaPayload, nodeHash, topic, client, rns = 
         "the topic will not sync with peers",
     );
   }
-  return sync.publish(deltaPayload, nodeHash);
+  // Per-Delta transport acceptance (fire-and-forget: transport acceptance ≠
+  // node storage). The caller records accepted deltas in the sent box /
+  // removes them from the outbox (doc #11).
+  const accepted = [];
+  for (const payload of deltaPayloads) {
+    accepted.push(await sync.publish(payload, nodeHash));
+  }
+  return accepted;
+}
+
+/**
+ * Publish a single signed Delta to the rfed channel (§11.1, work doc #4).
+ *
+ * Thin convenience wrapper over {@link runPublishMany} for the single-Delta
+ * case (`grant --publish` / `revoke --publish`). Returns the per-Delta
+ * transport acceptance.
+ * @param {Object} opts
+ * @param {Uint8Array} opts.deltaPayload Signed §5.3 Operation payload.
+ * @param {Uint8Array} opts.nodeHash The rfed node's `rfed.*` destination hash.
+ * @param {string} [opts.topic] RFed channel name (default `dacar.policy.v1`).
+ * @param {import("../transport/rfedSync.js").RFedClientLike} opts.client
+ * @param {import("@reticulum/core").Reticulum} [opts.rns] A booted
+ *   Reticulum. When given, transport paths to the rfed `subscribe` +
+ *   `publish` destinations are requested before the client links (rngit
+ *   `await_path` pattern); omitted in tests that inject a fake client.
+ * @returns {Promise<boolean>}
+ */
+export async function runPublish({ deltaPayload, nodeHash, topic, client, rns = null }) {
+  const [accepted] = await runPublishMany({
+    deltaPayloads: [deltaPayload],
+    nodeHash,
+    topic,
+    client,
+    rns,
+  });
+  return accepted;
 }
 
 /**

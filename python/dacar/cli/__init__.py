@@ -16,7 +16,7 @@ Usage::
     dacar check bergie read sensor:wind
     dacar grants
     dacar revoke bergie read sensor:wind
-    dacar publish delta.hex          # or `dacar publish --all` to flush the outbox
+    dacar publish delta.hex          # or `dacar publish --outbox` to flush the outbox
 """
 
 from __future__ import annotations
@@ -181,8 +181,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("payloads", nargs="*",
                    help="payload file path(s) (or - for stdin); hex or binary")
+    p.add_argument("--outbox", action="store_true",
+                   help="publish + move the outbox (unsent deltas) to the sent box (§11.1)")
+    p.add_argument("--sent", action="store_true",
+                   help="re-send every Delta in the sent box (durable replay log; idempotent)")
     p.add_argument("--all", action="store_true",
-                   help="publish + clear the outbox of locally-issued deltas")
+                   help="publish outbox + sent box (everything this node has issued)")
     p.add_argument("--binary", action="store_true",
                    help="treat file input as raw binary (skip hex auto-detect)")
     _add_online_flags(p)

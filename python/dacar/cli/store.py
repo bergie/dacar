@@ -10,7 +10,10 @@ Manages the on-disk store directory and its Reticulum-native file formats
   * ``aliases``        — rnns ``hash name [# note]`` format
   * ``ledger.msgpack`` — ``{ tuple_hash_hex: { object, relation, wildcard, first_seen } }``
   * ``outbox.msgpack`` — outbox of locally-issued, not-yet-published signed
-    Delta payloads (work doc #8); flushed + cleared by ``dacar publish --all``
+    Delta payloads (work doc #8); moved to ``sent.msgpack`` on publish.
+  * ``sent.msgpack`` — durable replay log of every Delta this node has
+    published (exact signed bytes); re-sent by ``dacar publish --sent``
+    (work doc #11).
 
 The store dir is mode ``0700``; the config, identity, state, ledger, and outbox
 files are mode ``0600`` (they hold the salt, the private key, CRDT state,
@@ -51,6 +54,7 @@ ALIASES_NAME = "aliases"
 LEDGER_NAME = "ledger.msgpack"
 IDENTITIES_NAME = "identities.msgpack"
 OUTBOX_NAME = "outbox.msgpack"
+SENT_NAME = "sent.msgpack"
 
 
 def _generate_salt() -> bytes:
@@ -332,6 +336,10 @@ class Store:
     @property
     def outbox_path(self) -> Path:
         return self.path / OUTBOX_NAME
+
+    @property
+    def sent_path(self) -> Path:
+        return self.path / SENT_NAME
 
     def exists(self) -> bool:
         return self.config_path.exists()
@@ -726,6 +734,40 @@ class Store:
         data = serialization.packb([bytes(p) for p in payloads])
         self.outbox_path.write_bytes(data)
         os.chmod(self.outbox_path, SECRET_MODE)
+
+    # -- sent box (work doc #11) -------------------------------------------
+    def load_sent(self) -> List[bytes]:
+        """Load the sent box: the durable replay log of published Deltas.
+
+        Returns the list of raw §5.3 Operation payloads this node has already
+        published, as exact signed bytes, in publication order. Re-publishing
+        them (``dacar publish --sent``) is a no-op on peers (CRDT merge is
+        idempotent). Returns an empty list when no sent file exists yet.
+        """
+        if not self.sent_path.exists():
+            return []
+        data = self.sent_path.read_bytes()
+        if not data:
+            return []
+        try:
+            obj = serialization.unpackb(data)
+        except (ValueError, TypeError):
+            return []  # corrupted -> treat as empty (do not crash the CLI)
+        if not isinstance(obj, list):
+            return []
+        return [bytes(item) for item in obj if isinstance(item, (bytes, bytearray))]
+
+    def save_sent(self, payloads: List[bytes]) -> None:
+        """Persist the sent box as a MessagePack array of signed Delta payloads.
+
+        Mode ``0600``: the file is the node's own issuance log — signed
+        payloads this node has published (carries only hashed tuples +
+        signatures, no plaintext). Kept owner-only for consistency with the
+        other state files.
+        """
+        data = serialization.packb([bytes(p) for p in payloads])
+        self.sent_path.write_bytes(data)
+        os.chmod(self.sent_path, SECRET_MODE)
 
 
 class StoreError(Exception):

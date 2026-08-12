@@ -18,6 +18,8 @@
  *                            Ed25519 half of the 64-byte RNS pub key).
  *   - `outbox.msgpack`    — msgpack `[payload_bytes, ...]` of locally-issued,
  *                            not-yet-published signed Deltas (doc #8).
+ *   - `sent.msgpack`      — msgpack `[payload_bytes, ...]` durable replay log
+ *                            of published Deltas (doc #11).
  *
  * Record names are the exact Python filenames (with `.msgpack` where Python
  * uses it); a Node `DacarFileAdapter` (`./fileStore.js`) writes them as loose
@@ -60,6 +62,7 @@ const ALIASES_RECORD = "aliases";
 const LEDGER_RECORD = "ledger.msgpack";
 const IDENTITIES_RECORD = "identities.msgpack";
 const OUTBOX_RECORD = "outbox.msgpack";
+const SENT_RECORD = "sent.msgpack";
 
 /**
  * @typedef {Object} StoreConfig
@@ -111,8 +114,8 @@ export class DacarStore {
    *
    * Produces the same file set as Python `Store.init`: `config` (INI),
    * `state.msgpack`, `clock.msgpack`, `ledger.msgpack`, `aliases` (with the
-   * `self` alias). `identities.msgpack` / `outbox.msgpack` are NOT pre-written
-   * (Python creates them lazily on first save).
+   * `self` alias). `identities.msgpack` / `outbox.msgpack` / `sent.msgpack`
+   * are NOT pre-written (Python creates them lazily on first save).
    * @param {import("@reticulum/core").StorageAdapter} adapter
    * @param {Object} [opts]
    * @param {Uint8Array} [opts.salt] 32-byte Privacy Salt (default: random).
@@ -390,6 +393,40 @@ export class DacarStore {
     await this._adapter.set(
       NS,
       OUTBOX_RECORD,
+      MsgPack.encode(payloads.map((p) => new Uint8Array(p))),
+    );
+  }
+
+  // -- sent box (work doc #11) -------------------------------------------
+
+  /**
+   * Load the sent box: the durable replay log of published Deltas (own
+   * issuance), as exact signed bytes, in publication order. Re-publishing them
+   * (`publish --sent`) is a no-op on peers (CRDT merge is idempotent). Returns
+   * an empty array when no sent record exists yet.
+   * @returns {Promise<Uint8Array[]>}
+   */
+  async loadSent() {
+    const bytes = await this._adapter.get(NS, SENT_RECORD);
+    if (!bytes) return [];
+    let obj;
+    try {
+      obj = MsgPack.decode(bytes);
+    } catch {
+      return []; // corrupted -> treat as empty (do not crash the CLI)
+    }
+    if (!Array.isArray(obj)) return [];
+    return obj.filter((p) => p instanceof Uint8Array).map((p) => new Uint8Array(p));
+  }
+
+  /**
+   * Persist the sent box as a MessagePack array of signed Delta payloads.
+   * @param {Uint8Array[]} payloads
+   */
+  async saveSent(payloads) {
+    await this._adapter.set(
+      NS,
+      SENT_RECORD,
       MsgPack.encode(payloads.map((p) => new Uint8Array(p))),
     );
   }

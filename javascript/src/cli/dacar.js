@@ -18,7 +18,7 @@
  *   dacar check <grantee> <relation> <object>
  *   dacar grants
  *   dacar revoke <grantee> <relation> <object> [--publish]
- *   dacar publish <file> [<file>...] | --all   (work doc #8)
+ *   dacar publish <file> [<file>...] | --outbox | --sent | --all   (docs #8/#11)
  *   dacar identity remember|forget|list ...
  *
  * Online flags: --node <hash>, --topic <topic>, --interface shared|auto|tcp,
@@ -46,7 +46,7 @@ import { NamespaceHasher, DEFAULT_SALT, SALT_SIZE, HASH_SIZE } from "../namespac
 import { Keyring, IssuerKeyset } from "../verifier.js";
 
 import { DacarStore, SELF_ALIAS, AliasRegistry } from "./store.js";
-import { announceIdentity, discoverRfedNode, ensureNodeIdentity, runPublish, runSync, registerAnnounceHandler } from "./session.js";
+import { announceIdentity, discoverRfedNode, ensureNodeIdentity, runPublishMany, runSync, registerAnnounceHandler } from "./session.js";
 
 const SHORT_HASH = 7;
 
@@ -248,21 +248,34 @@ async function _issue(args, action) {
   err(`  payload : hex on stdout (${payload.length} bytes)`);
 
   if (args.publish) {
-    await publishDelta(args, store, identity, payload);
+    // Durability (work doc #11): enqueue the signed payload to the outbox
+    // *before* the risky network send, so it survives a crash or failed
+    // transport and can be retried via `publish --outbox`. On send it moves
+    // outbox → sent box (the durable replay log), so every issued Delta lands
+    // in the durable log and can be re-sent to new peers.
+    const ob = await store.loadOutbox();
+    ob.push(payload);
+    await store.saveOutbox(ob);
+    const accepted = await publishDelta(args, store, identity, [payload]);
+    await recordPublish(store, [payload], accepted, { recordToSent: true });
+    if (accepted[0]) {
+      err("  (published + logged to sent box)");
+    } else {
+      err("  (send failed; retained in outbox for retry)");
+    }
   } else {
-    // Outbox (work doc #8): queue locally-issued deltas for `publish --all`.
-    // `--publish` sends immediately and never enqueues. (JS `grant` always
-    // applies locally — there is no `--no-apply` — so every non-publish grant
-    // is a candidate for later batch publish.)
+    // Outbox (work doc #8): queue locally-issued deltas for `publish --outbox`.
+    // (JS `grant` always applies locally — there is no `--no-apply` — so every
+    // non-publish grant is a candidate for later batch publish.)
     const outbox = await store.loadOutbox();
     outbox.push(payload);
     await store.saveOutbox(outbox);
-    err("  (queued in outbox: `dacar publish --all` to flush)");
+    err("  (queued in outbox: `dacar publish --outbox` to flush)");
   }
   return 0;
 }
 
-async function publishDelta(args, store, identity, payload) {
+async function publishDelta(args, store, identity, payloads) {
   const aliases = await store.loadAliases();
   const topic = await resolveTopic(args, store);
   const configDir = await resolveRnsConfigDir(args);
@@ -287,9 +300,74 @@ async function publishDelta(args, store, identity, payload) {
   await registerAnnounceHandler({ rns, keyring, onSave: (kr) => store.saveKeyring(kr) });
 
   const client = new RFedClient({ identity, rns });
-  await runPublish({ deltaPayload: payload, nodeHash, topic, client, rns });
+  // Publish each Delta as its own compact inner-format message (§11.1.1) —
+  // one §5.3 Operation per envelope, never a multi-delta batch (the publish
+  // destination is fire-and-forget and capped by the ~500-byte path MTU).
+  // RNS is a singleton, so boot + subscribe happen once for the whole batch.
+  const accepted = await runPublishMany({
+    deltaPayloads: payloads, nodeHash, topic, client, rns,
+  });
   await store.saveKeyring(keyring);
-  err(`  published to rfed channel ${JSON.stringify(topic)} via ${shortHash(nodeHash, args.fullHashes)}`);
+  const total = payloads.length;
+  const sent = accepted.filter((ok) => ok).length;
+  if (sent < total) {
+    err(`  ⚠ only ${sent}/${total} delta(s) accepted by the transport ` +
+      "(fire-and-forget: node storage is not confirmed)");
+  }
+  err(`  sent ${sent}/${total} delta(s) to rfed channel ${JSON.stringify(topic)} via ${shortHash(nodeHash, args.fullHashes)}`);
+  return accepted;
+}
+
+/**
+ * Update the outbox + sent box after a publish attempt (work doc #11).
+ *
+ * - Remove every transport-accepted payload from the **outbox** (it has been
+ *   sent, so it leaves the unsent queue).
+ * - If `recordToSent`, append transport-accepted payloads to the **sent box**
+ *   (the durable replay log), deduplicating by exact bytes. Re-sends from the
+ *   sent box (`publish --sent`) are already present, so this is a no-op for them.
+ *
+ * Returns the number of accepted deltas. Pure store logic (no RNS) so it runs
+ * even when `publishDelta` is patched in tests.
+ * @param {import("./store.js").DacarStore} store
+ * @param {Uint8Array[]} payloads
+ * @param {boolean[]} accepted Per-delta transport acceptance.
+ * @param {Object} opts
+ * @param {boolean} opts.recordToSent
+ * @returns {Promise<number>}
+ */
+async function recordPublish(store, payloads, accepted, { recordToSent }) {
+  /** @type {Uint8Array[]} */
+  const acceptedBytes = [];
+  for (let i = 0; i < payloads.length; i++) {
+    if (accepted[i]) acceptedBytes.push(new Uint8Array(payloads[i]));
+  }
+  if (!acceptedBytes.length) return 0;
+  // Drain accepted deltas from the outbox (they've been sent).
+  const outbox = await store.loadOutbox();
+  if (outbox.length) {
+    const accSet = new Set(acceptedBytes.map((p) => toHex(p)));
+    const newOutbox = outbox.filter((p) => !accSet.has(toHex(p)));
+    if (newOutbox.length !== outbox.length) {
+      await store.saveOutbox(newOutbox);
+    }
+  }
+  // Append to the sent box (dedup by exact bytes, preserve order).
+  if (recordToSent) {
+    const sent = await store.loadSent();
+    const existing = new Set(sent.map((p) => toHex(p)));
+    let changed = false;
+    for (const p of acceptedBytes) {
+      const h = toHex(p);
+      if (!existing.has(h)) {
+        sent.push(p);
+        existing.add(h);
+        changed = true;
+      }
+    }
+    if (changed) await store.saveSent(sent);
+  }
+  return acceptedBytes.length;
 }
 
 async function cmdSync(args) {
@@ -401,19 +479,34 @@ function coercePayload(data, forceBinary) {
   return hexToBytes(trimmed);
 }
 
-export { coercePayload };
+export { coercePayload, recordPublish };
 
 /**
- * `dacar publish` — push signed delta(s) to the rfed channel (§11.1, doc #8).
+ * `dacar publish` — push signed delta(s) to the rfed channel (§11.1, docs #8/#11).
  *
- * Two modes:
+ * Two source families (mutually exclusive):
  *   - `dacar publish <file> [<file>...]` — publish previously-signed delta
- *     payload(s) (exact bytes, no re-sign; multiple files → one batch).
- *   - `dacar publish --all` — pack + publish the outbox of locally-issued
- *     deltas, then clear it. A no-op (exit 0) on an empty outbox.
+ *     payload(s) (exact bytes, no re-sign). The **exact signed bytes** are
+ *     published — no re-signing, no new HLC, no local state change — so the
+ *     receiver's verify-on-ingest authenticates the *original* issuer. These
+ *     are external payloads and are **not** added to the sent box (they are
+ *     not this node's issuance).
+ *   - `dacar publish [--outbox] [--sent] [--all]` — publish this node's own
+ *     issuance from its durable stores (work doc #11):
+ *     - `--outbox` flushes the unsent queue; each Delta **moves** to the sent
+ *       box (the durable replay log) once the transport accepts it.
+ *     - `--sent` re-sends every Delta in the sent box (idempotent: CRDT merge
+ *       is a no-op for already-delivered deltas). The sent box is not modified.
+ *     - `--all` is `--outbox` + `--sent` (everything this node has issued).
  *
- * Reuses the `grant --publish` machinery (`publishDelta`: boot RNS, announce,
- * subscribe, publish).
+ * With no source flag and no files, `--outbox` is implied (the common "flush
+ * what I've issued" case). Bare `publish` on an empty outbox is a no-op (0).
+ *
+ * Each Delta is published as its **own** rfed message (one §5.3 Operation per
+ * compact inner-format envelope, §11.1.1) — exactly like `grant --publish`.
+ * All sources reuse the `grant --publish` machinery (`publishDelta`: boot RNS,
+ * announce, subscribe, publish), then record accepted deltas via
+ * `recordPublish` (sent box append + outbox drain).
  */
 async function cmdPublish(args) {
   const store = await openStore(args);
@@ -421,47 +514,75 @@ async function cmdPublish(args) {
   if (!identity) throw new CliError("no signing identity (run `dacar init`)");
 
   const useAll = !!args.all;
+  let useOutbox = !!args.outbox || useAll;
+  let useSent = !!args.sent || useAll;
   const files = args._positionals ?? [];
+  let fromStores = useOutbox || useSent;
 
-  if (useAll && files.length) {
-    throw new CliError("publish: use either <file>... or --all, not both");
+  if (files.length && fromStores) {
+    throw new CliError(
+      "publish: use either <file>... or a source flag (--outbox/--sent/--all), not both",
+    );
   }
-  if (!useAll && !files.length) {
-    throw new CliError("publish: provide <file>... (one or more) or --all");
+  // With no files and no source flag, `--outbox` is implied (doc #11): the
+  // common case is "flush what I've issued".
+  if (!files.length && !fromStores) {
+    useOutbox = true;
+    fromStores = true;
   }
 
   /** @type {Uint8Array[]} */
-  let toPublish;
-  if (useAll) {
-    toPublish = await store.loadOutbox();
-    if (!toPublish.length) {
-      err("outbox empty (nothing to publish)");
-      return 0;
-    }
-  } else {
-    toPublish = [];
-    for (const path of files) {
-      const data = await readPayloadInput(path, !!args.binary);
-      if (!data.length) throw new CliError(`empty payload: ${path}`);
-      toPublish.push(data);
+  const toPublish = [];
+  if (useOutbox) toPublish.push(...(await store.loadOutbox()));
+  if (useSent) toPublish.push(...(await store.loadSent()));
+  for (const path of files) {
+    const data = await readPayloadInput(path, !!args.binary);
+    if (!data.length) throw new CliError(`empty payload: ${path}`);
+    toPublish.push(data);
+  }
+
+  if (!toPublish.length) {
+    const which = [
+      ["outbox", useOutbox],
+      ["sent", useSent],
+    ].filter(([, on]) => on).map(([n]) => n).join(" + ") || "outbox";
+    err(`nothing to publish (${which} empty)`);
+    return 0;
+  }
+
+  // Dedup the send list by exact bytes, preserving first-seen order (a delta
+  // could appear in both the outbox and the sent box after a partial-failure
+  // recovery; sending it once is sufficient — CRDT merge is idempotent).
+  const seen = new Set();
+  const deduped = [];
+  for (const payload of toPublish) {
+    const h = toHex(payload);
+    if (!seen.has(h)) {
+      seen.add(h);
+      deduped.push(new Uint8Array(payload));
     }
   }
 
-  // Pack: a single delta as raw bytes, multiple as a batch payload.
-  const batch = toPublish.length === 1
-    ? toPublish[0]
-    : DeltaReceiver.packPayloads(toPublish);
+  // External file payloads are not this node's issuance -> not logged to the
+  // sent box. Anything sourced from a store (outbox/sent/--all) is recorded.
+  const recordToSent = files.length === 0;
 
-  const label = useAll ? "outbox" : `${toPublish.length} file(s)`;
-  const kind = toPublish.length > 1 ? "a batch" : "a single delta";
-  err(`  publishing ${toPublish.length} delta(s) (${label}) as ${kind}`);
+  const labelParts = [];
+  if (useOutbox) labelParts.push("outbox");
+  if (useSent) labelParts.push("sent");
+  if (files.length) labelParts.push(`${files.length} file(s)`);
+  err(`  publishing ${deduped.length} delta(s) (${labelParts.join(" + ")})`);
 
-  // Reuse the grant --publish machinery (boot RNS, announce, subscribe, publish).
-  await publishDelta(args, store, identity, batch);
+  const accepted = await publishDelta(args, store, identity, deduped);
+  const nSent = await recordPublish(store, deduped, accepted, { recordToSent });
 
-  if (useAll) {
-    await store.saveOutbox([]);
-    err("  outbox cleared");
+  if (useOutbox && !files.length) {
+    err(
+      `  (${nSent} moved outbox → sent box; ` +
+        "`dacar publish --sent` to re-send)",
+    );
+  } else if (useSent && !useOutbox && !files.length) {
+    err("  (sent box re-sent; not modified — idempotent)");
   }
   return 0;
 }
@@ -621,7 +742,7 @@ const SUBCOMMANDS = {
   },
   publish: {
     run: cmdPublish,
-    opts: { all: "boolean", binary: "boolean", node: "string", discover: "boolean", topic: "string", "rns-dir": "string", interface: "string" },
+    opts: { all: "boolean", outbox: "boolean", sent: "boolean", binary: "boolean", node: "string", discover: "boolean", topic: "string", "rns-dir": "string", interface: "string" },
     // variable file list (0..N) accessed via args._positionals
     online: true,
   },

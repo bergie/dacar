@@ -602,9 +602,11 @@ class GrantPublishLocalApplyTest(unittest.TestCase):
         from dacar.cli import main
         captured = {}
 
-        def fake_publish(args, store, identity, payload):
+        def fake_publish(args, store, identity, payloads):
             captured["called"] = True
-            captured["payload"] = payload
+            captured["payload"] = payloads[0] if len(payloads) == 1 else payloads
+            # Per-delta transport acceptance so _record_publish (outbox→sent) runs.
+            return [True] * len(payloads)
 
         grantee_hex = "aabbccdd00112233445566778899aabb"
         argv = ["grant", grantee_hex, "read", "sensor:wind", "--publish",
