@@ -7,7 +7,7 @@
     "./transport": "./src/transport/index.js"
   },
   "imports": {
-    "@reticulum/core": "jsr:@reticulum/core@^0.6.3"
+    "@reticulum/core": "jsr:@reticulum/core@^0.6.4"
   },
   "exclude": [
     "scripts/",
