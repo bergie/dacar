@@ -225,6 +225,12 @@ def build_parser() -> argparse.ArgumentParser:
     _add_global_flags(p)
     p.set_defaults(func=_cmd_show)
 
+    # -- validate -----------------------------------------------------------
+    p = sub.add_parser("validate", help="validate state integrity and detect corruption")
+    p.add_argument("--fix", action="store_true", help="remove corrupted tuples (WARNING: cannot be undone)")
+    _add_global_flags(p)
+    p.set_defaults(func=_cmd_validate)
+
     # -- prune --------------------------------------------------------------
     p = sub.add_parser("prune", help="run §9 Time-Horizon Tombstone Pruning")
     _add_global_flags(p)
@@ -373,6 +379,12 @@ def _cmd_prune(args):
     from dacar.cli.commands import cmd_prune
     args.store = _store_path(args)
     return cmd_prune(args)
+
+
+def _cmd_validate(args):
+    from dacar.cli.commands import cmd_validate
+    args.store = _store_path(args)
+    return cmd_validate(args)
 
 
 def _cmd_alias_add(args):

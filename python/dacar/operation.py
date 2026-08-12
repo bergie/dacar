@@ -24,6 +24,28 @@ from dacar import serialization
 from dacar.hlc import MAX_HLC
 from dacar.tuple import Tuple
 
+
+def _expect_bytes(value: Any, length: int, name: str) -> bytes:
+    """Validate that value is exactly `length` bytes and return it.
+
+    Mirrors JavaScript's expectBytes() helper. Raises ValueError if invalid.
+    """
+    if not isinstance(value, (bytes, bytearray)):
+        raise ValueError(f"{name} must be a {length}-byte binary blob, got {type(value).__name__}")
+    if len(value) != length:
+        raise ValueError(f"{name} must be {length} bytes, got {len(value)} bytes")
+    return bytes(value)
+
+
+def _expect_bool(value: Any, name: str) -> bool:
+    """Validate that value is a bool and return it.
+
+    Mirrors JavaScript's expectBool() helper. Raises ValueError if invalid.
+    """
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be a boolean, got {type(value).__name__}")
+    return value
+
 #: Ed25519 signatures are always 64 bytes.
 SIGNATURE_SIZE = 64
 #: HLC timestamps travel as 64-bit big-endian unsigned integers.
@@ -204,32 +226,41 @@ class Operation:
         if not isinstance(fields, (list, tuple)) or len(fields) != 8:
             raise ValueError("payload must be an 8-element MessagePack array")
         issuer, grantee, action, hlc, relation_hash, object_hashes, wildcard, signatures = fields
-        for name, blob in (("issuer", issuer), ("grantee", grantee), ("relation_hash", relation_hash)):
-            if not isinstance(blob, (bytes, bytearray)) or len(blob) != 16:
-                raise ValueError(f"{name} must be a 16-byte binary blob")
+
+        # Strict type validation using helpers (mirrors JavaScript implementation)
+        issuer = _expect_bytes(issuer, 16, "issuer")
+        grantee = _expect_bytes(grantee, 16, "grantee")
+        relation_hash = _expect_bytes(relation_hash, 16, "relation_hash")
+        wildcard = _expect_bool(wildcard, "wildcard")
+
         if action not in (int(Action.GRANT), int(Action.REVOKE)):
             raise ValueError(f"unknown action byte {action!r}")
         if not isinstance(hlc, int) or not 0 <= hlc <= MAX_HLC:
             raise ValueError("hlc must be a uint64 integer")
         if not isinstance(object_hashes, (list, tuple)):
             raise ValueError("object_hashes must be an array of 16-byte blobs")
-        for h in object_hashes:
+        for i, h in enumerate(object_hashes):
             if not isinstance(h, (bytes, bytearray)) or len(h) != 16:
-                raise ValueError("each object segment hash must be 16 bytes")
-        if not isinstance(wildcard, bool):
-            raise ValueError("wildcard must be a bool")
+                raise ValueError(
+                    f"object_hashes[{i}] must be 16 bytes, "
+                    f"got {type(h).__name__} with length {len(h) if hasattr(h, '__len__') else 'N/A'}"
+                )
         if not isinstance(signatures, (list, tuple)) or not signatures:
             raise ValueError("signatures must be a non-empty array of 64-byte blobs")
-        for sig in signatures:
+        for i, sig in enumerate(signatures):
             if not isinstance(sig, (bytes, bytearray)) or len(sig) != SIGNATURE_SIZE:
-                raise ValueError("each signature must be a 64-byte binary blob")
+                raise ValueError(
+                    f"signatures[{i}] must be 64 bytes, "
+                    f"got {type(sig).__name__} with length {len(sig) if hasattr(sig, '__len__') else 'N/A'}"
+                )
+
         return cls(
             tuple=Tuple(
-                relation_hash=bytes(relation_hash),
+                relation_hash=relation_hash,
                 object_hashes=tuple(bytes(h) for h in object_hashes),
                 wildcard=wildcard,
-                grantee=bytes(grantee),
-                issuer=bytes(issuer),
+                grantee=grantee,
+                issuer=issuer,
             ),
             action=Action(action),
             hlc=hlc,

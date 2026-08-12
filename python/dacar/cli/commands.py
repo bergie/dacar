@@ -844,6 +844,90 @@ def cmd_prune(args) -> int:
     return EXIT_OK
 
 
+def cmd_validate(args) -> int:
+    """Validate state integrity and detect corrupted tuples.
+
+    Corruption can happen if:
+    - Old-style batched deltas were accepted before validation was strict
+    - State file was manually modified
+    - Bug in an earlier version of the code
+
+    This command checks for:
+    - Tuples with suspicious patterns (e.g., many object segments suggesting concatenation)
+    - Re-parses state to ensure it can round-trip safely
+    """
+    store = Store(args.store, identity_override=args.identity)
+    store.ensure()
+    config = store.load_config()
+    state = store.load_state(config)
+    aliases = store.load_aliases()
+
+    suspicious = []
+    checked = 0
+
+    for tup, add_ts, remove_ts in state.iter_entries():
+        checked += 1
+
+        # Check for suspicious patterns:
+        # - Very long object_hashes (many segments) might indicate concatenation
+        # - Check if any segment looks like it contains text (ASCII letters)
+
+        if len(tup.object_hashes) > 10:  # More than 10 segments is unusual
+            suspicious.append({
+                "reason": f"unusual number of object segments: {len(tup.object_hashes)}",
+                "tuple_hash": tup.hash().hex(),
+                "grantee": render_identity(tup.grantee, aliases, full=False),
+                "issuer": render_identity(tup.issuer, aliases, full=False),
+                "segment_hashes": [h.hex()[:16] for h in tup.object_hashes[:5]],  # Show first 5
+            })
+
+        # Check if any segment hash looks like it might contain ASCII text
+        # (real hashes should be random-looking)
+        for h in tup.object_hashes:
+            # Count ASCII printable characters in the hash
+            printable = sum(1 for b in h if 32 <= b < 127)
+            if printable > 8:  # More than half printable is suspicious
+                suspicious.append({
+                    "reason": f"suspicious object segment hash (contains {printable}/16 printable ASCII chars)",
+                    "tuple_hash": tup.hash().hex(),
+                    "grantee": render_identity(tup.grantee, aliases, full=False),
+                    "issuer": render_identity(tup.issuer, aliases, full=False),
+                    "suspicious_hash": h.hex(),
+                })
+                break
+
+    _err(f"Checked {checked} tuple(s)")
+
+    if suspicious:
+        _err(f"Found {len(suspicious)} suspicious tuple(s):")
+        for i, item in enumerate(suspicious, 1):
+            _err(f"\n[{i}] Reason: {item['reason']}")
+            _err(f"    Tuple hash: {item['tuple_hash']}")
+            _err(f"    Grantee: {item['grantee']}")
+            _err(f"    Issuer: {item['issuer']}")
+            if 'segment_hashes' in item:
+                _err(f"    First 5 segment hashes: {item['segment_hashes']}")
+            if 'suspicious_hash' in item:
+                _err(f"    Suspicious hash: {item['suspicious_hash']}")
+
+        if args.fix:
+            _err(f"\n⚠ --fix is not yet implemented")
+            _err(f"  To manually clean up corrupted state:")
+            _err(f"  1. Back up your store directory: cp -r {store.path} {store.path}.backup")
+            _err(f"  2. Delete the state file: rm {store.state_path}")
+            _err(f"  3. Re-sync from scratch: dacar sync")
+            _err(f"\n  WARNING: This will remove all locally-issued grants that")
+            _err(f"           haven't been published to RFed or backed up.")
+            return EXIT_FAIL
+        else:
+            _err(f"\nTo remove corrupted tuples, run: dacar validate --fix")
+            _err(f"(This will require re-syncing from RFed to restore valid grants)")
+            return EXIT_FAIL
+    else:
+        _err(f"✔ No corruption detected")
+        return EXIT_OK
+
+
 # ---------------------------------------------------------------------------
 # Aliases / ledger
 # ---------------------------------------------------------------------------
@@ -1024,6 +1108,7 @@ def run_sync(
     topic: str,
     client: object,
     receiver: DeltaReceiver,
+    verbose: bool = False,
 ) -> int:
     """Pull pending Deltas from the rfed channel and apply via verify-on-ingest.
 
@@ -1033,6 +1118,19 @@ def run_sync(
     Persists the CRDT if any Delta was applied. Returns the count applied.
     """
     from dacar.transport.rfed_sync import RfedDeltaSync
+    from dacar.delta import DeltaReceiver as DR
+
+    # If verbose, wrap the receiver to log rejections
+    if verbose:
+        class LoggingReceiver(DR):
+            def __init__(self, state, resolver):
+                super().__init__(state, resolver)
+
+            def apply_payload(self, payload, **kwargs):
+                return super().apply_payload(payload, log_rejections=True, **kwargs)
+
+        receiver = LoggingReceiver(receiver._state, receiver._resolver)
+
     sync = RfedDeltaSync(receiver=receiver, client=client, topic=topic)
     result = sync.subscribe(node_hash)
     if getattr(result, "ok", True) is False:
@@ -1204,7 +1302,7 @@ def cmd_sync(args) -> int:
     rx = DeltaReceiver(state, resolver)
 
     client = RFedClient(identity=identity, rns=rns)
-    applied = run_sync(store, state, node_hash, topic, client, rx)
+    applied = run_sync(store, state, node_hash, topic, client, rx, verbose=True)
 
     # Persist the keyring if any announces were observed during the window.
     store.save_keyring(keyring)

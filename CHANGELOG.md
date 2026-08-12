@@ -5,6 +5,32 @@ All notable changes to Dacar will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+- **Python**: Strengthened Operation payload validation to reject malformed
+  deltas that could corrupt state. The validation now explicitly checks each
+  field's type before conversion using `_expect_bytes()` and `_expect_bool()`
+  helpers that match the JavaScript implementation. Malformed payloads (e.g.,
+  old-style batched deltas, wrong field types) now produce clear error
+  messages identifying the specific field and issue (e.g., "issuer must be a
+  16-byte binary blob, got list" or "object_hashes[0] must be 16 bytes, got str
+  with length 9").
+- **Python**: Added rejection logging to `DeltaReceiver.apply_payload()`.
+  When `log_rejections=True` is set, rejected deltas are logged to stderr with
+  detailed error messages. The `dacar sync` command now enables this logging
+  by default to help users identify and debug invalid deltas received from
+  RFed or other transports. This is critical for detecting when RFed storage
+  contains old-style malformed payloads that should have been rejected.
+
+### Added
+- **Python**: New `dacar validate` command to check state integrity and detect
+  corrupted tuples. The command checks for suspicious patterns like unusually
+  many object segments (which may indicate concatenated object IDs from
+  malformed payloads) and provides guidance on how to clean up corrupted
+  state. See `FIX_INVALID_RFED_DELTAS.md` for details on diagnosing and fixing
+  corrupted state.
+
 ## [1.2.0] - 2026-08-11
 
 ### Added

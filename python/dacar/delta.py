@@ -40,6 +40,7 @@ class DeltaReceiver:
         *,
         now_ms: Optional[int] = None,
         max_future_ms: Optional[int] = DEFAULT_MAX_FUTURE_MS,
+        log_rejections: bool = False,
     ) -> bool:
         """Apply one wire-format Delta.
 
@@ -48,14 +49,24 @@ class DeltaReceiver:
         transport callback must never crash on arbitrary bytes. Signature and
         CRDT-level rejection (unknown Issuer, bad sig, stale/future) is
         delegated to :meth:`StateVector.ingest`.
+
+        If ``log_rejections`` is True, rejections are printed to stderr for
+        debugging (useful during sync to identify invalid deltas).
         """
         try:
             operation = Operation.from_payload(payload)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError) as e:
+            if log_rejections:
+                import sys
+                print(f"dacar: rejected malformed delta: {e}", file=sys.stderr)
             return False  # malformed -> drop silently
-        return self._state.ingest(
+        result = self._state.ingest(
             operation, self._resolver, now_ms=now_ms, max_future_ms=max_future_ms
         )
+        if log_rejections and not result:
+            import sys
+            print(f"dacar: rejected delta: verification failed or stale/future", file=sys.stderr)
+        return result
 
     def apply_payloads(
         self,
