@@ -25,11 +25,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **Python**: New `dacar validate` command to check state integrity and detect
-  corrupted tuples. The command checks for suspicious patterns like unusually
-  many object segments (which may indicate concatenated object IDs from
-  malformed payloads) and provides guidance on how to clean up corrupted
-  state. See `FIX_INVALID_RFED_DELTAS.md` for details on diagnosing and fixing
-  corrupted state.
+  corrupted tuples. The command checks for:
+  - **Ledger corruption**: Object strings containing commas (ALWAYS invalid - objects use
+    `:` separator, not `,`). This catches the corruption pattern from the bug report where
+    objects were concatenated as `blog:publish,grib:request,sys:command`.
+  - State corruption: Unusually many object segments or suspicious hash patterns.
+  Provides guidance on how to clean up corrupted state. Run `dacar validate --fix` for
+  cleanup instructions.
 
 ## [1.2.0] - 2026-08-11
 

@@ -854,6 +854,7 @@ def cmd_validate(args) -> int:
 
     This command checks for:
     - Tuples with suspicious patterns (e.g., many object segments suggesting concatenation)
+    - Ledger entries with invalid object strings (comma-separated = ALWAYS invalid)
     - Re-parses state to ensure it can round-trip safely
     """
     store = Store(args.store, identity_override=args.identity)
@@ -861,19 +862,75 @@ def cmd_validate(args) -> int:
     config = store.load_config()
     state = store.load_state(config)
     aliases = store.load_aliases()
+    ledger = store.load_ledger()
 
     suspicious = []
-    checked = 0
+    checked_tuples = 0
 
+    # First check all ledger entries (corruption is often here)
+    for tuple_hash_hex, row in ledger.rows.items():
+        object_str = row.get("object")
+        if object_str:
+            # Check if object string contains commas (ALWAYS invalid - objects use : separator)
+            if "," in object_str:
+                suspicious.append({
+                    "source": "ledger",
+                    "reason": f"INVALID: object contains comma (objects use ':' separator): '{object_str}'",
+                    "tuple_hash": tuple_hash_hex,
+                    "has_state_tuple": tuple_hash_hex in state._entries,
+                })
+            # Check if object string is unusually long (more than 100 chars)
+            elif len(object_str) > 100:
+                suspicious.append({
+                    "source": "ledger",
+                    "reason": f"object unusually long: {len(object_str)} chars",
+                    "tuple_hash": tuple_hash_hex,
+                    "object_preview": object_str[:80] + "...",
+                    "has_state_tuple": tuple_hash_hex in state._entries,
+                })
+
+    # Then check state tuples
     for tup, add_ts, remove_ts in state.iter_entries():
-        checked += 1
+        checked_tuples += 1
 
-        # Check for suspicious patterns:
+        # Skip if we already flagged this tuple from ledger
+        if any(s["tuple_hash"] == tup.hash().hex() for s in suspicious):
+            continue
+
+        # Check ledger for suspicious patterns
+        row = ledger.lookup(tup.hash())
+        if row:
+            # Check if object string contains commas (suggests concatenation)
+            if row.get("object") and "," in row["object"]:
+                suspicious.append({
+                    "source": "ledger",
+                    "reason": f"object contains commas: '{row['object']}'",
+                    "tuple_hash": tup.hash().hex(),
+                    "grantee": render_identity(tup.grantee, aliases, full=False),
+                    "issuer": render_identity(tup.issuer, aliases, full=False),
+                    "ledger_object": row["object"],
+                    "segment_count": len(tup.object_hashes),
+                })
+                continue  # Skip further checks for this tuple
+
+            # Check if object string is unusually long (more than 100 chars)
+            if row.get("object") and len(row["object"]) > 100:
+                suspicious.append({
+                    "source": "ledger",
+                    "reason": f"object unusually long: {len(row['object'])} chars",
+                    "tuple_hash": tup.hash().hex(),
+                    "grantee": render_identity(tup.grantee, aliases, full=False),
+                    "issuer": render_identity(tup.issuer, aliases, full=False),
+                    "ledger_object": row["object"][:80] + "...",
+                })
+
+        # Check for suspicious patterns in the tuple itself:
         # - Very long object_hashes (many segments) might indicate concatenation
         # - Check if any segment looks like it contains text (ASCII letters)
 
         if len(tup.object_hashes) > 10:  # More than 10 segments is unusual
             suspicious.append({
+                "source": "state",
                 "reason": f"unusual number of object segments: {len(tup.object_hashes)}",
                 "tuple_hash": tup.hash().hex(),
                 "grantee": render_identity(tup.grantee, aliases, full=False),
@@ -888,6 +945,7 @@ def cmd_validate(args) -> int:
             printable = sum(1 for b in h if 32 <= b < 127)
             if printable > 8:  # More than half printable is suspicious
                 suspicious.append({
+                    "source": "state",
                     "reason": f"suspicious object segment hash (contains {printable}/16 printable ASCII chars)",
                     "tuple_hash": tup.hash().hex(),
                     "grantee": render_identity(tup.grantee, aliases, full=False),
@@ -896,15 +954,25 @@ def cmd_validate(args) -> int:
                 })
                 break
 
-    _err(f"Checked {checked} tuple(s)")
+    _err(f"Checked {checked_tuples} tuple(s) and {len(ledger.rows)} ledger entries")
 
     if suspicious:
-        _err(f"Found {len(suspicious)} suspicious tuple(s):")
+        _err(f"Found {len(suspicious)} suspicious entry/entries:")
         for i, item in enumerate(suspicious, 1):
-            _err(f"\n[{i}] Reason: {item['reason']}")
+            _err(f"\n[{i}] [{item.get('source', 'unknown').upper()}] {item['reason']}")
             _err(f"    Tuple hash: {item['tuple_hash']}")
-            _err(f"    Grantee: {item['grantee']}")
-            _err(f"    Issuer: {item['issuer']}")
+            if 'grantee' in item:
+                _err(f"    Grantee: {item['grantee']}")
+            if 'issuer' in item:
+                _err(f"    Issuer: {item['issuer']}")
+            if 'ledger_object' in item:
+                _err(f"    Ledger object: {item['ledger_object']}")
+            if 'object_preview' in item:
+                _err(f"    Object preview: {item['object_preview']}")
+            if 'segment_count' in item:
+                _err(f"    Segment count: {item['segment_count']}")
+            if 'has_state_tuple' in item:
+                _err(f"    Has matching state tuple: {item['has_state_tuple']}")
             if 'segment_hashes' in item:
                 _err(f"    First 5 segment hashes: {item['segment_hashes']}")
             if 'suspicious_hash' in item:
@@ -914,13 +982,15 @@ def cmd_validate(args) -> int:
             _err(f"\n⚠ --fix is not yet implemented")
             _err(f"  To manually clean up corrupted state:")
             _err(f"  1. Back up your store directory: cp -r {store.path} {store.path}.backup")
-            _err(f"  2. Delete the state file: rm {store.state_path}")
+            _err(f"  2. Delete the corrupted files:")
+            _err(f"     rm {store.state_path}")
+            _err(f"     rm {store.ledger_path}")
             _err(f"  3. Re-sync from scratch: dacar sync")
             _err(f"\n  WARNING: This will remove all locally-issued grants that")
             _err(f"           haven't been published to RFed or backed up.")
             return EXIT_FAIL
         else:
-            _err(f"\nTo remove corrupted tuples, run: dacar validate --fix")
+            _err(f"\nTo remove corrupted entries, run: dacar validate --fix")
             _err(f"(This will require re-syncing from RFed to restore valid grants)")
             return EXIT_FAIL
     else:

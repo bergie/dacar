@@ -60,12 +60,32 @@ class DeltaReceiver:
                 import sys
                 print(f"dacar: rejected malformed delta: {e}", file=sys.stderr)
             return False  # malformed -> drop silently
+        
+        # Check if issuer is known before attempting state ingest
+        issuer_hash = operation.issuer
+        keyset = self._resolver(issuer_hash)
+        if keyset is None:
+            if log_rejections:
+                import sys
+                print(f"dacar: rejected delta: unknown issuer {issuer_hash.hex()[:16]}... (not in keyring or RNS)", file=sys.stderr)
+            return False
+        
         result = self._state.ingest(
             operation, self._resolver, now_ms=now_ms, max_future_ms=max_future_ms
         )
         if log_rejections and not result:
             import sys
-            print(f"dacar: rejected delta: verification failed or stale/future", file=sys.stderr)
+            # Check if it was a timestamp issue
+            from dacar.hlc import unpack
+            physical, _ = unpack(operation.hlc)
+            now = now_ms if now_ms is not None else physical_now_ms()
+            horizon = self._state.deletion_horizon_ms
+            
+            if physical < now - horizon:
+                print(f"dacar: rejected delta: timestamp is stale (too old by {(now - physical) / 1000:.0f}s, horizon {horizon / 1000:.0f}s)", file=sys.stderr)
+            else:
+                # Signature verification failed
+                print(f"dacar: rejected delta: signature verification failed for issuer {issuer_hash.hex()[:16]}...", file=sys.stderr)
         return result
 
     def apply_payloads(
