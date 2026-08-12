@@ -7,16 +7,34 @@
     "./transport": "./src/transport/index.js"
   },
   "imports": {
-    "@reticulum/core": "jsr:@reticulum/core@^0.6.3",
-    "@reticulum/node": "jsr:@reticulum/node@^0.6.3"
+    "@reticulum/core": "jsr:@reticulum/core@^0.6.3"
   },
   "exclude": [
     "scripts/",
-    "node_modules/"
+    "src/cli/",
+    "node_modules/",
+    "test/"
   ],
   "publish": {
     "include": [
-      "src/**",
+      "src/index.js",
+      "src/transport/index.js",
+      "src/challenge.js",
+      "src/config.js",
+      "src/crdt.js",
+      "src/delta.js",
+      "src/engine.js",
+      "src/hlc.js",
+      "src/namespace.js",
+      "src/naming.js",
+      "src/operation.js",
+      "src/threshold.js",
+      "src/tuple.js",
+      "src/verifier.js",
+      "src/transport/rnsIdentity.js",
+      "src/transport/rnsChallenge.js",
+      "src/transport/lxmfSync.js",
+      "src/transport/rfedSync.js",
       "README.md"
     ]
   },

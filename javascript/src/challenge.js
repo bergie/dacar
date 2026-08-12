@@ -61,7 +61,7 @@ async function asIdentity(value) {
   return value instanceof Identity ? value : await Identity.fromPublicKey(value);
 }
 
-/** @param {unknown} value @param {number} len @param {string} name @returns {Uint8Array} */
+/** @param {Uint8Array} value @param {number} len @param {string} name @returns {Uint8Array} */
 function expectBytes(value, len, name) {
   if (!(value instanceof Uint8Array) || value.length !== len) {
     throw new Error(`${name} must be a ${len}-byte Uint8Array`);

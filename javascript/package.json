@@ -45,7 +45,8 @@
   },
   "dependencies": {
     "@reticulum/core": "^0.6.3",
-    "@reticulum/node": "^0.6.3"
+    "@reticulum/node": "^0.6.3",
+    "@types/node": "^26.2.0"
   },
   "publishConfig": {
     "access": "public"

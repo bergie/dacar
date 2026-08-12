@@ -232,7 +232,7 @@ export class Operation {
 }
 
 /**
- * @param {unknown} value
+ * @param {Uint8Array} value
  * @param {number} len
  * @param {string} name
  * @returns {Uint8Array}
@@ -245,7 +245,7 @@ function expectBytes(value, len, name) {
 }
 
 /**
- * @param {unknown} value
+ * @param {boolean} value
  * @param {string} name
  * @returns {boolean}
  */

@@ -305,7 +305,7 @@ export class StateVector {
 }
 
 /**
- * @param {unknown} value
+ * @param {Uint8Array} value
  * @param {number} len
  * @param {string} name
  * @returns {Uint8Array}
@@ -317,7 +317,7 @@ function expectBytes(value, len, name) {
   return value;
 }
 
-/** @param {unknown} value @param {string} name @returns {boolean} */
+/** @param {boolean} value @param {string} name @returns {boolean} */
 function expectBool(value, name) {
   if (typeof value !== "boolean") throw new Error(`${name} must be a boolean`);
   return value;

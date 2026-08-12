@@ -283,15 +283,23 @@ class EnsurePathTest(unittest.TestCase):
             def identify(self, identity):
                 pass
 
+        def fake_link(destination, established_callback=None, **_kwargs):
+            # Fire synchronously so the blocking waiter resolves promptly.
+            if established_callback is not None:
+                established_callback(_FakeLink())
+            return _FakeLink()
+
         wrapped_stub = types.SimpleNamespace(rfed_payload=b"payload")
         lxm = LxmfMessage(content=b"delta", title=LXMF_DELIVERY_TITLE)
         with patch("dacar.rfed.client.wrap_channel_message", return_value=wrapped_stub), \
              patch("dacar.rfed.client.RNS.Packet", side_effect=_FakePacket), \
-             patch.object(client, "_establish_link", return_value=_FakeLink()):
+             patch("dacar.rfed.client.RNS.Link", side_effect=fake_link):
             client.publish(NODE, CHANNEL, lxm)
         # The path to the rfed.channel.publish destination was ensured (via _establish_link),
         # and the packet was sent afterwards.
-        mock_await.assert_called_once_with(self.dest_hash, timeout=15.0)
+        self.assertTrue(mock_await.called, "await_path should be called for the publish destination")
+        self.assertEqual(mock_await.call_count, 1)
+        self.assertEqual(mock_await.call_args[1]['timeout'], 15.0)
         self.assertEqual(sent, [b"payload"])
 
 

@@ -105,7 +105,7 @@ export class Tuple {
     return toHex(this.preimage);
   }
 
-  /** Structural equality with another Tuple. @param {unknown} other @returns {boolean} */
+  /** Structural equality with another Tuple. @param {Tuple} other @returns {boolean} */
   equals(other) {
     if (!(other instanceof Tuple)) return false;
     return (

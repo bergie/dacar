@@ -47,21 +47,21 @@ import { messageContent } from "./lxmfSync.js";
  * Only `message` is consumed here.
  * @typedef {Object} RfedDecoded
  * @property {import("@reticulum/core/src/lxmf/index.js").LXMessage} message
- * @property {unknown} [senderIdentity]
- * @property {Uint8Array} [senderPub]
- * @property {Uint8Array} [sourceHash]
- * @property {boolean} [signatureValid]
- * @property {Uint8Array} [channelHash]
- * @property {string | null} [channelName]
+ * @property {import("@reticulum/core/src/core/identity.js").Identity} senderIdentity
+ * @property {Uint8Array} senderPub
+ * @property {Uint8Array} sourceHash
+ * @property {boolean} signatureValid
+ * @property {Uint8Array} channelHash
+ * @property {string} channelName
  */
 
 /**
  * The minimal `RFedClient` surface this adapter relies on. The real client from
  * `@reticulum/core` satisfies it; tests inject a fake.
  * @typedef {Object} RFedClientLike
- * @property {(nodeHash: Uint8Array, channelName: string) => Promise<unknown>} subscribe
- * @property {(nodeHash: Uint8Array, channelName: string) => Promise<unknown>} [unsubscribe]
- * @property {(nodeHash: Uint8Array, channelName: string, lxmMessage: import("@reticulum/core/src/lxmf/index.js").LXMessage) => Promise<unknown>} publish
+ * @property {(nodeHash: Uint8Array, channelName: string) => Promise<{ ok: boolean, stampCost: number | null }>} subscribe
+ * @property {(nodeHash: Uint8Array, channelName: string) => Promise<{ ok: boolean }>} [unsubscribe]
+ * @property {(nodeHash: Uint8Array, channelName: string, lxmMessage: import("@reticulum/core/src/lxmf/index.js").LXMessage) => Promise<void>} publish
  * @property {(nodeHash: Uint8Array, channelName: string) => Promise<{ items: Array<{ channelHash: Uint8Array, blob: Uint8Array }>, morePending: boolean }>} pull
  * @property {(onMessage: (decoded: RfedDecoded) => void) => Promise<Uint8Array>} listen
  */
@@ -123,7 +123,7 @@ export class RfedDeltaSync {
    * Subscribes to the channel on a node, caching its advertised stamp cost.
    * Call at least once per session and after any publish seems dropped.
    * @param {Uint8Array} nodeHash Any `rfed.*` destination hash of the node.
-   * @returns {Promise<unknown>} The client's `{ ok, stampCost }` result.
+   * @returns {Promise<{ ok: boolean, stampCost: number | null }>} The client's `{ ok, stampCost }` result.
    */
   async subscribe(nodeHash) {
     return this._client.subscribe(nodeHash, this._topic);
@@ -132,7 +132,7 @@ export class RfedDeltaSync {
   /**
    * Removes the subscription.
    * @param {Uint8Array} nodeHash
-   * @returns {Promise<unknown>}
+   * @returns {Promise<{ ok: boolean }>}
    */
   async unsubscribe(nodeHash) {
     if (!this._client.unsubscribe) {
