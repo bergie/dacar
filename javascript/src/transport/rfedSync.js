@@ -46,12 +46,11 @@
  * ```
  */
 
-import { Destination } from "@reticulum/core/src/core/destination.js";
+import { Destination, MicroMsgPack } from "@reticulum/core";
 import {
   deriveChannel,
   unwrapRawChannelMessage,
 } from "@reticulum/core/src/rfed/index.js";
-import { MicroMsgPack } from "@reticulum/core/src/utils/msgpack.js";
 import { RFED_TOPIC } from "../naming.js";
 
 /**
@@ -82,7 +81,7 @@ import { RFED_TOPIC } from "../naming.js";
  * @typedef {Object} RfedDecodedRaw
  * @property {"raw"|"lxmf"} kind
  * @property {Uint8Array} [payload] Raw application payload (`kind === "raw"`).
- * @property {import("@reticulum/core/src/core/identity.js").Identity} [senderIdentity]
+ * @property {import("@reticulum/core").Identity} [senderIdentity]
  * @property {Uint8Array} [senderPub]
  * @property {Uint8Array} [channelHash]
  * @property {string} [channelName]
