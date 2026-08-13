@@ -46,10 +46,12 @@
  * ```
  */
 
+import { Destination } from "@reticulum/core/src/core/destination.js";
 import {
   deriveChannel,
   unwrapRawChannelMessage,
 } from "@reticulum/core/src/rfed/index.js";
+import { MicroMsgPack } from "@reticulum/core/src/utils/msgpack.js";
 import { RFED_TOPIC } from "../naming.js";
 
 /**
@@ -182,8 +184,29 @@ export class RfedDeltaSync {
       throw new Error("RfedDeltaSync.listen requires a receiver");
     }
     const receiver = this._receiver;
-    return this._client.listen((decoded) => {
+    return this._client.listen(async (decoded) => {
       if (decoded?.kind !== "raw") return; // not a raw channel payload
+
+      // Remember the sender identity so future RNS recalls succeed without
+      // needing an announce. Best-effort: decode must still succeed without it.
+      try {
+        // Extract issuer_hash (field [0]) from the delta to map identity.
+        const decodedDelta = MicroMsgPack.decode(decoded.payload);
+        if (Array.isArray(decodedDelta) && decodedDelta.length > 0) {
+          const issuerHash = decodedDelta[0];
+          if (issuerHash instanceof Uint8Array && issuerHash.length === 16) {
+            await Destination.remember(
+              decoded.senderIdentity.identityHash,
+              decoded.senderIdentity.identityHash,
+              decoded.senderPub,
+              null,
+            );
+          }
+        }
+      } catch {
+        // Remembering is best-effort; failure doesn't affect correctness.
+      }
+
       // RFedClient.invoke does not await the callback; run applyPayload without
       // leaving an unhandled rejection (it swallows malformed payloads itself).
       Promise.resolve(receiver.applyPayload(decoded.payload)).catch(() => {});
@@ -224,6 +247,27 @@ export class RfedDeltaSync {
             innerBlob: item.blob,
             channelIdentity,
           });
+
+          // Remember the sender identity so future RNS recalls succeed without
+          // needing an announce. Best-effort: decode must still succeed without it.
+          try {
+            // Extract issuer_hash (field [0]) from the delta to map identity.
+            const decodedDelta = MicroMsgPack.decode(decoded.payload);
+            if (Array.isArray(decodedDelta) && decodedDelta.length > 0) {
+              const issuerHash = decodedDelta[0];
+              if (issuerHash instanceof Uint8Array && issuerHash.length === 16) {
+                await Destination.remember(
+                  decoded.senderIdentity.identityHash,
+                  decoded.senderIdentity.identityHash,
+                  decoded.senderPub,
+                  null,
+                );
+              }
+            }
+          } catch {
+            // Remembering is best-effort; failure doesn't affect correctness.
+          }
+
           if (await receiver.applyPayload(decoded.payload)) {
             applied++;
           }

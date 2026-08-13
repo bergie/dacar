@@ -42,6 +42,9 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+import RNS
+
+import dacar.serialization
 from dacar.delta import DeltaReceiver
 from dacar.naming import RFED_TOPIC
 from dacar.rfed.blob import unwrap_dacar_delta, wrap_dacar_delta
@@ -159,6 +162,23 @@ class RfedDeltaSync:
                 decoded = unwrap_dacar_delta(
                     inner_blob=inner_blob, channel_identity=channel_identity
                 )
+                # Remember the sender identity so future RNS recalls succeed without
+                # needing an announce. Best-effort: decode must still succeed without it.
+                try:
+                    # Extract issuer_hash (field [0]) from the delta to map identity.
+                    decoded_delta = dacar.serialization.unpackb(decoded.delta)
+                    if isinstance(decoded_delta, list) and len(decoded_delta) > 0:
+                        issuer_hash = decoded_delta[0]
+                        if isinstance(issuer_hash, (bytes, bytearray)) and len(issuer_hash) == 16:
+                            RNS.Identity.remember(
+                                bytes(issuer_hash),
+                                bytes(issuer_hash),
+                                decoded.sender_pub,
+                                None,
+                            )
+                except Exception:
+                    # Remembering is best-effort; failure doesn't affect correctness.
+                    pass
                 receiver.apply_payload(decoded.delta)
             except Exception:
                 # A malformed/forged fanout payload is dropped, not fatal —
@@ -196,6 +216,23 @@ class RfedDeltaSync:
                     decoded = unwrap_dacar_delta(
                         inner_blob=blob, channel_identity=channel_identity
                     )
+                    # Remember the sender identity so future RNS recalls succeed without
+                    # needing an announce. Best-effort: decode must still succeed without it.
+                    try:
+                        # Extract issuer_hash (field [0]) from the delta to map identity.
+                        decoded_delta = dacar.serialization.unpackb(decoded.delta)
+                        if isinstance(decoded_delta, list) and len(decoded_delta) > 0:
+                            issuer_hash = decoded_delta[0]
+                            if isinstance(issuer_hash, (bytes, bytearray)) and len(issuer_hash) == 16:
+                                RNS.Identity.remember(
+                                    bytes(issuer_hash),
+                                    bytes(issuer_hash),
+                                    decoded.sender_pub,
+                                    None,
+                                )
+                    except Exception:
+                        # Remembering is best-effort; failure doesn't affect correctness.
+                        pass
                     if receiver.apply_payload(decoded.delta):
                         applied += 1
                 except Exception:

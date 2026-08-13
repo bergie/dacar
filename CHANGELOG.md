@@ -5,6 +5,21 @@ All notable changes to Dacar will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **Python & JavaScript**: RFed transport now remembers sender identities
+  from received Deltas. When a Delta is received via RFed, the sender's
+  public key (from the RTID prelude) is associated with the issuer hash
+  (extracted from the Delta payload) using `RNS.Identity.remember()`
+  (Python) or `Destination.remember()` (JavaScript). This populates the
+  local identity cache so that future `RNS.Identity.recall()` calls succeed
+  without needing a network announce. The change is best-effort (wrapped in
+  try-except) and does not affect security — the real authentication still
+  comes from the Delta's Ed25519 signature verification and trust anchor
+  chain validation. This mirrors the existing behavior in the LXMF transport
+  path and reduces network traffic for identity resolution.
+
 ## [1.2.1] - 2026-08-12
 
 ### Security
