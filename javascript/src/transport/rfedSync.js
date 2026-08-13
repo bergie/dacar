@@ -46,7 +46,7 @@
  * ```
  */
 
-import { Destination, MicroMsgPack } from "@reticulum/core";
+import { Destination, MsgPack } from "@reticulum/core";
 import {
   deriveChannel,
   unwrapRawChannelMessage,
@@ -190,7 +190,7 @@ export class RfedDeltaSync {
       // needing an announce. Best-effort: decode must still succeed without it.
       try {
         // Extract issuer_hash (field [0]) from the delta to map identity.
-        const decodedDelta = MicroMsgPack.decode(decoded.payload);
+        const decodedDelta = MsgPack.decode(decoded.payload);
         if (Array.isArray(decodedDelta) && decodedDelta.length > 0) {
           const issuerHash = decodedDelta[0];
           if (issuerHash instanceof Uint8Array && issuerHash.length === 16) {
@@ -251,7 +251,7 @@ export class RfedDeltaSync {
           // needing an announce. Best-effort: decode must still succeed without it.
           try {
             // Extract issuer_hash (field [0]) from the delta to map identity.
-            const decodedDelta = MicroMsgPack.decode(decoded.payload);
+            const decodedDelta = MsgPack.decode(decoded.payload);
             if (Array.isArray(decodedDelta) && decodedDelta.length > 0) {
               const issuerHash = decodedDelta[0];
               if (issuerHash instanceof Uint8Array && issuerHash.length === 16) {
