@@ -5,6 +5,30 @@ All notable changes to Dacar will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **Python**: RFed channel stamps now use the standard LXMF stamper.
+  `dacar/rfed/stamp.py` no longer mirrors the interim `reticulum-rust`
+  stub `LXStamper` (iterated SHA-256 workblock, sequential `u128` nonce
+  search); it now implements the SPEC-correct mechanism — the memory-hard
+  HKDF workblock byte-compatible with Python LXMF's `LXMF.LXStamper` and
+  `@reticulum/core`'s `lxmf/stamper.js` at rfed's 16 expansion rounds
+  (16 × 256 B = 4 KiB), with LXMF's random-trial stamp search and
+  value-based validation. This matches the (upcoming, unreleased)
+  `reticulum-rust` and `@reticulum/core` releases that fixed
+  https://github.com/jrl290/Reticulum-rust/pull/2 upstream. Public API
+  (`channel_stamp_workblock` / `generate_channel_stamp` /
+  `validate_channel_stamp`, plus new `stamp_workblock` / `stamp_valid`)
+  is unchanged apart from dropping the nonce-cap error path, but stamps
+  generated against the old stub workblock are no longer valid (nor are
+  ours on unfixed Rust nodes) — a protocol-level change, not an API one.
+  New smoketests pin the workblock bytes to a Python-LXMF-derived vector
+  and cross-check byte-identity with `LXMF.LXStamper` when installed.
+  The JavaScript implementation needs no code change (it delegates
+  stamping to `@reticulum/core`); bump its dependency once a core release
+  carrying the standard-LXMF stamping ships.
+
 ## [1.2.2] - 2026-08-12
 
 ### Changed

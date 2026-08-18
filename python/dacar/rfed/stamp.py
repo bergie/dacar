@@ -10,16 +10,28 @@ the bytes it accompanies. The stamp material and value semantics are fixed by
     value        = leading_zero_bits(SHA-256(workblock ‖ stamp))
     valid        = value >= stamp_cost
 
+The workblock, stamp generation, and validation semantics are the **standard
+LXMF** ones — byte-compatible with Python LXMF's ``LXMF.LXStamper`` and
+``@reticulum/core``'s ``lxmf/stamper.js`` — run at rfed's 16 expansion rounds.
+The workblock is the memory-hard HKDF expansion: the concatenation of
+``rounds`` chunks of 256 bytes each, where chunk ``n`` is
+``HKDF-SHA256(ikm=transient_id, salt=SHA-256(transient_id ‖ msgpack(n)), L=256)``
+(4096 bytes at rfed's 16 rounds). Stamp generation mirrors LXMF's random-trial
+search; validation is value-based, so the trial strategy does not affect
+interoperability.
+
 .. note::
 
-   The SPEC defers to ``LXStamper::stamp_workblock``, expecting Python LXMF's
-   memory-hard HKDF expansion. However the deployed ``reticulum-rust``
-   ``LXStamper`` is an incompatible stub: its workblock is ``SHA-256`` iterated
-   ``rounds + 1`` times over the transient id — a 32-byte value, not the
-   memory-hard expansion. To interoperate with live rfed nodes (and with
-   ``@reticulum/core``'s ``RFedClient``), this module mirrors that
-   reticulum-rust workblock exactly. The value/stamp-valid semantics match
-   Python (leading-zero-bits of ``SHA-256(workblock ‖ stamp)``).
+   An interim ``reticulum-rust`` ``LXStamper`` was an incompatible stub: its
+   workblock was ``SHA-256`` iterated ``rounds + 1`` times over the transient
+   id — a 32-byte value, not the memory-hard HKDF expansion — so this module
+   briefly mirrored that stub to interoperate with live rfed nodes. The stub
+   was fixed upstream (https://github.com/jrl290/Reticulum-rust/pull/2), and
+   both ``reticulum-rust`` and ``@reticulum/core`` now use the standard LXMF
+   workblock, so stamps minted by either side cross-validate with Python LXMF
+   and fixed Rust nodes. Stamps generated against the old stub workblock are
+   no longer valid (nor are ours on unfixed Rust nodes) — a protocol-level
+   change, not an API one.
 
 ``stamp_cost`` is owned by the ``/rfed/subscribe`` reply: a cost of ``0`` (or
 ``None``) means stamping is disabled and no stamp is required or appended.
@@ -27,24 +39,22 @@ the bytes it accompanies. The stamp material and value semantics are fixed by
 
 from __future__ import annotations
 
+import os
 from typing import Tuple
 
+import msgpack
 import RNS
 
 from dacar.rfed.constants import STAMP_EXPAND_ROUNDS, STAMP_SIZE
 
 __all__ = [
-    "STAMP_NONCE_CAP",
+    "stamp_workblock",
     "generate_channel_stamp",
     "validate_channel_stamp",
     "channel_stamp_workblock",
     "stamp_value",
+    "stamp_valid",
 ]
-
-
-#: Iteration cap mirroring ``reticulum-rust``'s ``LXStamper::generate_stamp``.
-#: Costs used by rfed (e.g. 12) terminate far below this (~2^cost trials).
-STAMP_NONCE_CAP = 1_000_000
 
 
 def _leading_zero_bits(data: bytes) -> int:
@@ -59,9 +69,26 @@ def _leading_zero_bits(data: bytes) -> int:
     return value
 
 
-def _u128le(nonce: int) -> bytes:
-    """Encode a nonce as a 16-byte little-endian unsigned int (Rust ``u128``)."""
-    return nonce.to_bytes(16, "little")
+def stamp_workblock(material: bytes, expand_rounds: int = STAMP_EXPAND_ROUNDS) -> bytes:
+    """Build the memory-hard LXMF stamp workblock for ``material``.
+
+    Mirrors ``LXMF.LXStamper.stamp_workblock`` byte-for-byte: the concatenation
+    of ``expand_rounds`` chunks, each 256 bytes of HKDF-SHA256 keyed on
+    ``material`` and salted with ``SHA-256(material ‖ msgpack(n))``. At the
+    default 3000 LXMF rounds the workblock is 768 KiB — deliberately
+    cache-unfriendly to limit GPU/ASIC speedup; at rfed's 16 rounds it is a
+    4 KiB block. The per-round msgpack counter matches ``umsgpack.packb``
+    (positive fixint below 128, then wider uint encodings).
+    """
+    workblock = b""
+    for n in range(expand_rounds):
+        workblock += RNS.Cryptography.hkdf(
+            length=256,
+            derive_from=material,
+            salt=RNS.Identity.full_hash(material + msgpack.packb(n)),
+            context=None,
+        )
+    return workblock
 
 
 def channel_stamp_workblock(
@@ -70,15 +97,12 @@ def channel_stamp_workblock(
     """Compute the transient id and workblock for a channel stamp.
 
     ``transient_id = SHA-256(channel_hash ‖ inner_blob)``; the workblock is the
-    reticulum-rust ``LXStamper`` workblock: ``SHA-256`` iterated ``rounds + 1``
-    times over the transient id (a 32-byte value).
+    standard LXMF memory-hard HKDF expansion of the transient id
+    (:func:`stamp_workblock`) at rfed's expansion rounds.
     """
     material = bytes(channel_hash) + bytes(inner_blob)
     transient_id = RNS.Identity.full_hash(material)
-    workblock = RNS.Identity.full_hash(transient_id)
-    for _ in range(rounds):
-        workblock = RNS.Identity.full_hash(workblock)
-    return transient_id, workblock
+    return transient_id, stamp_workblock(transient_id, rounds)
 
 
 def stamp_value(workblock: bytes, stamp: bytes) -> int:
@@ -86,27 +110,35 @@ def stamp_value(workblock: bytes, stamp: bytes) -> int:
     return _leading_zero_bits(RNS.Identity.full_hash(bytes(workblock) + bytes(stamp)))
 
 
+def stamp_valid(stamp: bytes, target_cost: int, workblock: bytes) -> bool:
+    """Validate a stamp against a target proof-of-work cost (LXMF semantics).
+
+    A stamp meets ``target_cost`` when
+    ``int(SHA-256(workblock ‖ stamp)) <= 1 << (256 - target_cost)`` — equivalent
+    to :func:`stamp_value` ``>= target_cost``.
+    """
+    target = 1 << (256 - target_cost)
+    result = RNS.Identity.full_hash(bytes(workblock) + bytes(stamp))
+    return int.from_bytes(result, byteorder="big") <= target
+
+
 def generate_channel_stamp(
     channel_hash: bytes, inner_blob: bytes, stamp_cost: int, rounds: int = STAMP_EXPAND_ROUNDS
 ) -> Tuple[bytes, int]:
     """Search for a valid 32-byte channel PoW stamp.
 
-    Mirrors ``reticulum-rust``'s ``LXStamper::generate_stamp``: a stamp is
-    ``SHA-256(workblock ‖ nonce_le16)`` for an increasing ``u128`` nonce,
-    accepted once ``stamp_value(workblock, stamp) >= stamp_cost``.
+    Mirrors LXMF's ``LXStamper.generate_stamp``: random 32-byte trials over the
+    standard-LXMF workblock, accepted once
+    ``stamp_value(workblock, stamp) >= stamp_cost``. Expected trials are
+    ``~2^stamp_cost`` (rfed costs such as 12 terminate in a few thousand).
 
-    Returns ``(stamp, achieved_value)``. Raises if no stamp meets the cost
-    within :data:`STAMP_NONCE_CAP` trials.
+    Returns ``(stamp, achieved_value)``.
     """
     _, workblock = channel_stamp_workblock(channel_hash, inner_blob, rounds)
-    for nonce in range(STAMP_NONCE_CAP + 1):
-        stamp = RNS.Identity.full_hash(workblock + _u128le(nonce))
-        value = stamp_value(workblock, stamp)
-        if value >= stamp_cost:
-            return stamp, value
-    raise RuntimeError(
-        f"rfed stamp generation exhausted {STAMP_NONCE_CAP} trials at cost {stamp_cost}"
-    )
+    while True:
+        stamp = os.urandom(STAMP_SIZE)
+        if stamp_valid(stamp, stamp_cost, workblock):
+            return stamp, stamp_value(workblock, stamp)
 
 
 def validate_channel_stamp(
