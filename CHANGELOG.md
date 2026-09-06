@@ -26,8 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   New smoketests pin the workblock bytes to a Python-LXMF-derived vector
   and cross-check byte-identity with `LXMF.LXStamper` when installed.
   The JavaScript implementation needs no code change (it delegates
-  stamping to `@reticulum/core`); bump its dependency once a core release
-  carrying the standard-LXMF stamping ships.
+  stamping to `@reticulum/core`); its dependencies have been bumped to
+  `@reticulum/core`/`@reticulum/node` `^0.7.0`, the first release carrying
+  the standard-LXMF stamping.
 
 ## [1.2.2] - 2026-08-12
 
