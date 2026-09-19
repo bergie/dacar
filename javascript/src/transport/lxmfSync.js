@@ -15,10 +15,10 @@
  * through the router.
  *
  * This module is part of the optional transport layer: importing the pure core
- * never pulls it in. It depends only on `@reticulum/core`, which the core
- * already depends on, so no new dependency is added.
+ * never pulls it in. It depends on `@reticulum/lxmf` (which itself builds on
+ * `@reticulum/core`).
  *
- * Typical use (receiver, wired to a {@link import("@reticulum/core/src/lxmf/index.js").LXMRouter
+ * Typical use (receiver, wired to a {@link import("@reticulum/lxmf").LXMRouter
  * LXMRouter}):
  *
  * ```js
@@ -38,7 +38,7 @@
  * await delivery.handleMessage(event.detail.message);
  */
 
-import { LXMessage as LXMFMessage } from "@reticulum/core/src/lxmf/index.js";
+import { LXMessage as LXMFMessage } from "@reticulum/lxmf";
 import { LXMF_DELIVERY_TITLE } from "../naming.js";
 
 /**
@@ -60,7 +60,7 @@ export function messageTitle(message) {
 /**
  * Best-effort content of an LXMF message as raw bytes (the §5.3 Delta payload).
  *
- * `@reticulum/core`'s `Message.deserialize()` UTF-8-decodes the content element
+ * `@reticulum/lxmf`'s `Message.deserialize()` UTF-8-decodes the content element
  * into `message.content`, which corrupts arbitrary binary Deltas. The raw bytes
  * are preserved on `_decodedPayload[2]` (the same field the library uses
  * internally for §5.6 signature re-verification), so this helper recovers the
@@ -99,13 +99,13 @@ export class LxmfDeltaDelivery {
    * @param {import("../delta.js").DeltaReceiver | null} [opts.receiver]
    *   The shared DeltaReceiver (state + key resolver). May be omitted on a
    *   send-only node (then `handleMessage` throws if called).
-   * @param {import("@reticulum/core/src/lxmf/index.js").LXMRouter | null} [opts.router]
+   * @param {import("@reticulum/lxmf").LXMRouter | null} [opts.router]
    *   Optional bound `LXMRouter` for `deliver` / `ingestPaperUri`.
    */
   constructor({ receiver = null, router = null } = {}) {
     /** @type {import("../delta.js").DeltaReceiver | null} */
     this._receiver = receiver;
-    /** @type {import("@reticulum/core/src/lxmf/index.js").LXMRouter | null} */
+    /** @type {import("@reticulum/lxmf").LXMRouter | null} */
     this._router = router;
   }
 
@@ -121,7 +121,7 @@ export class LxmfDeltaDelivery {
    * @param {Uint8Array} deltaPayload
    * @param {Uint8Array} destinationHash The recipient `lxmf.delivery` hash.
    * @param {Uint8Array} sourceHash The sender's `lxmf.delivery` hash.
-   * @returns {import("@reticulum/core/src/lxmf/index.js").LXMessage}
+   * @returns {import("@reticulum/lxmf").LXMessage}
    */
   makeMessage(deltaPayload, destinationHash, sourceHash) {
     if (!(deltaPayload instanceof Uint8Array)) {
@@ -145,7 +145,7 @@ export class LxmfDeltaDelivery {
    * @param {Uint8Array} destinationHash The recipient `lxmf.delivery` hash.
    * @param {Object} [opts]
    * @param {Uint8Array | null} [opts.linkId] Reuse an existing DIRECT link id.
-   * @returns {Promise<import("@reticulum/core/src/lxmf/index.js").LXMessage>}
+   * @returns {Promise<import("@reticulum/lxmf").LXMessage>}
    */
   async deliver(deltaPayload, destinationHash, { linkId = null } = {}) {
     if (!this._router) {
@@ -210,7 +210,7 @@ export class LxmfDeltaDelivery {
    * ingest result (the reconstructed message, or `null` if it was not for this
    * node / already ingested).
    * @param {string} uri
-   * @returns {Promise<import("@reticulum/core/src/lxmf/index.js").LXMessage | null>}
+   * @returns {Promise<import("@reticulum/lxmf").LXMessage | null>}
    */
   async ingestPaperUri(uri) {
     if (!this._router) {

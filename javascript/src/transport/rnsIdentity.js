@@ -21,9 +21,8 @@
  * identities always win.
  *
  * This module is part of the optional transport layer: importing the pure
- * core (`@reticulum/dacar`) never pulls it in. It depends only on
- * `@reticulum/core`'s `Destination.recall`, which the core already depends on
- * for `Identity` / `MsgPack`, so it adds no new dependency.
+ * core (`@reticulum/dacar`) never pulls it in. It uses only `@reticulum/core`'s
+ * `Destination.recall`.
  */
 
 import { Destination } from "@reticulum/core";

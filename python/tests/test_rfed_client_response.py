@@ -172,6 +172,30 @@ class RFedClientResponseTest(unittest.TestCase):
         self.assertEqual(page.items, [])
         self.assertFalse(page.more_pending)
 
+    def test_pull_error_code_raises(self):
+        """A numeric response ≥ 0xF0 is a node error code, not an empty queue.
+
+        Mirrors ``@reticulum/rfed`` 0.8.2: ``0xF0`` ERROR_NO_IDENTITY means the
+        link could not be authenticated — the caller should re-identify on a
+        fresh link instead of mistaking the refusal for an empty queue.
+        """
+        self._patch_link(0xF0)
+        with self.assertRaises(Exception) as ctx:
+            self.client.pull(NODE, CHANNEL)
+        self.assertIn("0xf0", str(ctx.exception))
+
+        self._patch_link(0xF4)
+        with self.assertRaises(Exception):
+            self.client.pull(NODE, CHANNEL)
+
+    def test_pull_error_code_subclass(self):
+        """The raised error is the public ``RFedPullError`` type."""
+        from dacar.rfed.client import RFedPullError
+
+        self._patch_link(0xF0)
+        with self.assertRaises(RFedPullError):
+            self.client.pull(NODE, CHANNEL)
+
     # -- subscribe payload shape (regression: no double msgpack encoding) -----
 
     def test_signed_channel_payload_returns_list_not_packed_bytes(self):

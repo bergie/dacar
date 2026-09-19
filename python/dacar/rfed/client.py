@@ -6,7 +6,8 @@ the node's single identity:
 
   - ``rfed.channel.subscribe`` — ``/rfed/subscribe`` request (caches stamp cost)
   - ``rfed.channel.unsubscribe`` — ``/rfed/unsubscribe`` request
-  - ``rfed.channel.publish``   — fire-and-forget DATA SEND (wrapped Phase-0 blob)
+  - ``rfed.channel.publish``   — fire-and-forget publish (a single DATA packet,
+    or a Resource over a link for payloads beyond the link MDU)
   - ``rfed.channel.pull``      — ``/rfed/pull`` paging (caller-identified)
 
 Delivery arrives on the client's own inbound ``rfed.delivery`` destination as a
@@ -43,6 +44,7 @@ from dacar.rfed.constants import (
     CHANNEL_SUBSCRIBE_NAME,
     CHANNEL_UNSUBSCRIBE_NAME,
     DELIVERY_NAME,
+    PUBLISH_DATA_MAX,
     PULL_PATH,
     SUBSCRIBE_PATH,
     UNSUBSCRIBE_PATH,
@@ -50,12 +52,26 @@ from dacar.rfed.constants import (
 
 __all__ = [
     "RFedClient",
+    "RFedPullError",
     "SubscribeResult",
     "PullPage",
     "PullItem",
     "DEFAULT_REQUEST_TIMEOUT",
     "DEFAULT_ESTABLISH_TIMEOUT",
 ]
+
+class RFedPullError(Exception):
+    """The rfed node answered a ``/rfed/pull`` request with an error code.
+
+    Error codes are msgpack integers ``≥ 0xF0`` (``0xF0`` ERROR_NO_IDENTITY —
+    the link could not be authenticated, re-identify on a fresh link;
+    ``0xF4`` ERROR_INVALID_DATA — malformed request). Mirrors the numeric
+    error handling of ``@reticulum/rfed`` 0.8.2's ``RFedClient.pull()``.
+    """
+
+
+#: Smallest rfed error code (``ERROR_NO_IDENTITY``).
+_ERROR_CODE_MIN = 0xF0
 
 #: Default request round-trip timeout in seconds.
 DEFAULT_REQUEST_TIMEOUT = 15.0
@@ -388,9 +404,11 @@ class RFedClient:
 
         SEND is fire-and-forget — there is no acceptance response. Call
         :meth:`subscribe` again to refresh the stamp cost if publishes seem
-        dropped (the node silently rejects under-stamped blobs). The publish
-        destination does NOT accept link requests, so the payload must fit
-        within the RNS MTU (default 500 bytes). For application-specific inner
+        dropped (the node silently rejects under-stamped blobs). Payloads
+        within the link MDU (:data:`~dacar.rfed.constants.PUBLISH_DATA_MAX`,
+        431 B at the default 500 B MTU) go out as a single DATA packet; larger
+        payloads are sent as a Resource over a link to the publish destination
+        (the node accepts both paths). For application-specific inner
         formats that skip the LXMF envelope (e.g. Dacar's compact Delta
         format, §11.1), build the ``rfed_payload`` yourself and send it via
         :meth:`send_publish`.
@@ -413,30 +431,59 @@ class RFedClient:
 
         The general publish primitive, independent of the inner format:
         ``rfed_payload`` must already be fully wrapped
-        (``channel_hash ‖ inner_blob ‖ stamp``) and fit within the RNS MTU.
-        Use this for application-specific inner formats that don't use the LXMF
+        (``channel_hash ‖ inner_blob ‖ stamp``). Use this for
+        application-specific inner formats that don't use the LXMF
         message envelope (e.g. Dacar's compact Delta format, §11.1) — build
         the payload with the channel codec (e.g.
         :func:`dacar.rfed.blob.wrap_dacar_delta`) and send it here.
 
-        SEND is fire-and-forget — there is no acceptance response, and the
-        ``rfed.channel.publish`` destination does NOT accept link requests
-        (per the Rust reference implementation), so oversized payloads are
-        silently dropped (RNS raises ``IOError`` if the *packet* exceeds the
-        MTU, but a within-MTU packet may still be dropped by the node, e.g. an
-        under-stamped blob). Returns ``True`` if the transport accepted the
-        outbound packet (a path was known and an interface could process it),
-        ``False`` otherwise — this is transport acceptance, **not** confirmation
-        that the node stored the blob.
+        Payloads up to the link MDU
+        (:data:`~dacar.rfed.constants.PUBLISH_DATA_MAX`, 431 B at the default
+        500 B MTU) go out as a single fire-and-forget DATA packet. Anything
+        larger would be fragmented into packets the node drops, so it is sent
+        as a Resource over a link to the publish destination instead — the
+        node ingests both paths identically (matching the Rust reference and
+        ``@reticulum/rfed`` 0.8.2).
+
+        SEND is fire-and-forget for the DATA path — there is no acceptance
+        response. The Resource path waits for the transfer to conclude, since
+        the advertisement alone does not deliver the payload. Returns ``True``
+        if the transport accepted the outbound publish (the DATA packet was
+        sent, or the Resource reached ``COMPLETE``), ``False`` otherwise —
+        this is transport acceptance, **not** confirmation that the node
+        stored the blob (an under-stamped blob is still silently dropped by
+        the node).
         """
         node_identity = self._node_identity(node_hash)
         dest = self._out_destination(CHANNEL_PUBLISH_NAME, node_identity)
-        # Ensure path to destination before sending. The publish destination
-        # accepts DATA packets but does NOT accept link requests, so payloads
-        # must be <= RNS MTU.
+        payload = bytes(rfed_payload)
+        if len(payload) > PUBLISH_DATA_MAX:
+            return self._send_publish_resource(dest, payload)
+        # Ensure path to destination before sending.
         self._ensure_path(dest.hash)
-        receipt = RNS.Packet(dest, bytes(rfed_payload)).send()
+        receipt = RNS.Packet(dest, payload).send()
         return receipt is not False
+
+    def _send_publish_resource(self, destination: RNS.Destination, payload: bytes) -> bool:
+        """Send an oversized publish as a Resource over a link.
+
+        Opens a link to the publish destination (which the node accepts for
+        exactly this purpose), advertises the payload as an
+        :class:`RNS.Resource`, and waits for the transfer to conclude.
+        Returns ``True`` iff the Resource reached ``COMPLETE``.
+        """
+        link = self._establish_link(destination)
+        done = threading.Event()
+        result: Dict[str, Any] = {}
+
+        def on_concluded(resource: Any) -> None:
+            result["status"] = getattr(resource, "status", None)
+            done.set()
+
+        RNS.Resource(payload, link, callback=on_concluded)
+        if not done.wait(DEFAULT_REQUEST_TIMEOUT):
+            return False
+        return result.get("status") == RNS.Resource.COMPLETE
 
     # -- pull --------------------------------------------------------------
 
@@ -453,6 +500,15 @@ class RFedClient:
         ``/rfed/pull`` with the channel hash. The response is
         ``[[[channel_hash, blob], …], more_pending]``; repeat while
         ``more_pending`` is ``True`` to drain the queue.
+
+        A numeric response ``≥ 0xF0`` is a node error code (``0xF0``
+        ERROR_NO_IDENTITY — the link was not authenticated;
+        ``0xF4`` ERROR_INVALID_DATA). This raises :class:`RFedPullError` so
+        the caller can re-identify on a fresh link, instead of mistaking the
+        refusal for an empty deferred queue. Mirrors ``@reticulum/rfed``
+        0.8.2's ``RFedClient.pull()``.
+
+        :raises RFedPullError: when the node answers with an error code.
         """
         channel = self._channel(channel_name)
         node_identity = self._node_identity(node_hash)
@@ -464,6 +520,8 @@ class RFedClient:
         # ``raw`` is the decoded ``[[[channel_hash, blob], ...], more_pending]``
         # structure (or None on failure), not raw bytes.
         raw = self._request(link, PULL_PATH, bytes(channel["channel_hash"]), timeout=timeout)
+        if isinstance(raw, int) and not isinstance(raw, bool) and raw >= _ERROR_CODE_MIN:
+            raise RFedPullError(f"rfed pull error code 0x{raw:02x}")
         if not isinstance(raw, (list, tuple)) or len(raw) < 2:
             return PullPage([], False)
         pairs = raw[0]

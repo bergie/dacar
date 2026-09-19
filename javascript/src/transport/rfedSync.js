@@ -10,7 +10,7 @@
  * delivery — **never** through the unauthenticated `StateVector.merge()` path.
  * A forged or stale Delta is simply dropped before it can mutate state.
  *
- * `RfedDeltaSync` wraps a `@reticulum/core` `RFedClient`. A Delta travels in
+ * `RfedDeltaSync` wraps a `@reticulum/rfed` `RFedClient`. A Delta travels in
  * Dacar's **compact inner format** (§11.1.1): the raw §5.3 payload is placed
  * straight after the RTID source-identity prelude and EC-encrypted to the
  * derived channel identity — no LXMF envelope, which would only duplicate the
@@ -19,7 +19,7 @@
  * discriminator (every message on it is a Dacar Delta), and the recovered Delta
  * bytes are fed to `DeltaReceiver`.
  *
- * The compact format is built on `@reticulum/core`'s raw RFed primitives —
+ * The compact format is built on `@reticulum/rfed`'s raw RFed primitives —
  * `subscribeRaw` / `publishRaw` / `unwrapRawChannelMessage` — which carry an
  * arbitrary self-authenticating payload in place of the LXMF tail. The Delta's
  * own Ed25519 signature (§5.3 field [7]) is the authenticity check at
@@ -31,8 +31,8 @@
  * channel uses the compact format.
  *
  * This module is part of the optional transport layer: importing the pure core
- * never pulls it in. It depends only on `@reticulum/core`, which the core
- * already depends on, so no new dependency is added. It mirrors
+ * never pulls it in. It depends on `@reticulum/rfed` (which itself builds on
+ * `@reticulum/core`). It mirrors
  * `python/dacar/transport/rfed_sync.py` (the canonical implementation).
  *
  * Typical use:
@@ -50,12 +50,12 @@ import { Destination, MsgPack } from "@reticulum/core";
 import {
   deriveChannel,
   unwrapRawChannelMessage,
-} from "@reticulum/core/src/rfed/index.js";
+} from "@reticulum/rfed";
 import { RFED_TOPIC } from "../naming.js";
 
 /**
  * The minimal `RFedClient` surface this adapter relies on. The real client from
- * `@reticulum/core` satisfies it; tests inject a fake. The raw-publish API
+ * `@reticulum/rfed` satisfies it; tests inject a fake. The raw-publish API
  * (`subscribeRaw` / `publishRaw`) carries a self-authenticating payload in the
  * RTID prelude instead of an LXMF envelope (§11.1.1).
  *
@@ -99,7 +99,7 @@ export class RfedDeltaSync {
    * @param {import("../delta.js").DeltaReceiver | null} [opts.receiver]
    *   The shared DeltaReceiver (state + key resolver). May be omitted on a
    *   publish-only node (then `listen`/`pull` throw if called).
-   * @param {RFedClientLike} opts.client A `@reticulum/core` `RFedClient`.
+   * @param {RFedClientLike} opts.client A `@reticulum/rfed` `RFedClient`.
    * @param {string} [opts.topic] RFed channel name (default `dacar.policy.v1`).
    */
   constructor({ receiver = null, client, topic = RFED_TOPIC }) {

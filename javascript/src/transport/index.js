@@ -3,7 +3,9 @@
  *
  * These wire the pure, transport-agnostic core — the §8 `Challenge`/
  * `AuthoritativeServer`/`ChallengeClient` and the §11 `DeltaReceiver` — to the
- * concrete Reticulum transports from `@reticulum/core`:
+ * concrete Reticulum transports from `@reticulum/core`, `@reticulum/lxmf`, and
+ * `@reticulum/rfed` (since reticulum-js 0.8.2, LXMF and rfed are packages of
+ * their own rather than core subpaths):
  *
  *   - {@link RnsIdentityResolver}      §3.1, §11.2.4  recall → verify key
  *   - {@link RnsChallengeServer} &c.   §8             Challenge over an RNS Link
@@ -11,9 +13,8 @@
  *   - {@link RfedDeltaSync}            §11.1          RFed many-to-many convergence
  *
  * Importing the pure core (`@reticulum/dacar`) does **not** import this
- * subpath: it is opt-in via `@reticulum/dacar/transport`. Every adapter depends
- * only on `@reticulum/core`, which the core already depends on, so the
- * transport layer adds no new dependency.
+ * subpath: it is opt-in via `@reticulum/dacar/transport`. The adapters build
+ * on the `@reticulum/*` reticulum-js packages (core, lxmf, rfed).
  */
 
 export { RnsIdentityResolver } from "./rnsIdentity.js";

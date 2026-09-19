@@ -4,7 +4,7 @@ import { Identity } from "@reticulum/core";
 import {
   deriveChannel,
   wrapRawChannelMessage,
-} from "@reticulum/core/src/rfed/index.js";
+} from "@reticulum/rfed";
 import { Action, Operation } from "../src/operation.js";
 import { Tuple } from "../src/tuple.js";
 import { HASH_SIZE, NamespaceHasher } from "../src/namespace.js";

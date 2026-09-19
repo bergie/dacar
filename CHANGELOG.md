@@ -5,6 +5,40 @@ All notable changes to Dacar will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **JavaScript**: Dependencies updated to the reticulum-js 0.8.2 package
+  family. LXMF and rfed are no longer subpaths of `@reticulum/core` — they
+  were spun out into their own packages — so `@reticulum/lxmf` and
+  `@reticulum/rfed` are now declared dependencies and all imports moved:
+  `@reticulum/core/src/lxmf/index.js` → `@reticulum/lxmf`,
+  `@reticulum/core/src/rfed/index.js` → `@reticulum/rfed`
+  (in `src/transport/lxmfSync.js`, `src/transport/rfedSync.js`,
+  `src/cli/dacar.js` and the transport tests). `@reticulum/core` and
+  `@reticulum/node` are bumped from `^0.7.0` to `^0.8.2`; the JSR import map
+  gains the two new packages. No public Dacar API changed.
+- **Python**: RNS requirement bumped from `>=1.4` to `>=1.5.4`, matching the
+  reticulum-js 0.8.2 wire protocol generation.
+
+### Added
+- **Python**: `RFedClient.send_publish()` now supports oversized channel
+  publishes over links, mirroring the reference rfed node and
+  `@reticulum/rfed` 0.8.2. Payloads up to the link MDU (new constant
+  `dacar.rfed.constants.PUBLISH_DATA_MAX`, 431 B at the default 500 B MTU)
+  still go out as a single fire-and-forget DATA packet; anything larger is
+  sent as an `RNS.Resource` over a link to the `rfed.channel.publish`
+  destination (which accepts both paths) and awaited to `COMPLETE` —
+  previously an oversized publish was fragmented into packets the node
+  silently dropped. The return value for the Resource path is `True` iff the
+  transfer concluded `COMPLETE`.
+- **Python**: `RFedClient.pull()` now raises the new `dacar.rfed.client.RFedPullError`
+  when the node answers with a numeric error code (`0xF0`
+  ERROR_NO_IDENTITY / `0xF4` ERROR_INVALID_DATA) instead of silently
+  returning an empty page, so callers can re-identify on a fresh link. This
+  mirrors the `@reticulum/rfed` 0.8.2 client behaviour; previously a refusal
+  was indistinguishable from an empty deferred queue.
+
 ## [1.3.0] - 2026-09-08
 
 ### Changed

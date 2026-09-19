@@ -54,6 +54,13 @@ UNSUBSCRIBE_PATH = "/rfed/unsubscribe"
 #: ``/rfed/pull`` request path.
 PULL_PATH = "/rfed/pull"
 
+#: Maximum publish payload size sent as a single fire-and-forget DATA packet:
+#: the link MDU at the default 500 B RNS MTU (500 − 69 B link overhead).
+#: Anything larger must go as a Resource over a link to the publish
+#: destination — the node ingests both paths identically. Mirrors
+#: ``@reticulum/rfed``'s ``PUBLISH_DATA_MAX``.
+PUBLISH_DATA_MAX = 431
+
 __all__ = [
     "MAGIC_RTID",
     "MAGIC_LENGTH",
@@ -71,4 +78,5 @@ __all__ = [
     "SUBSCRIBE_PATH",
     "UNSUBSCRIBE_PATH",
     "PULL_PATH",
+    "PUBLISH_DATA_MAX",
 ]

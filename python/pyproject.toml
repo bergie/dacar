@@ -29,7 +29,9 @@ dependencies = [
     # Reticulum Network Stack. The `dacar` CLI keeps an RNS Identity in its
     # store, and the §8 Challenge / §11.2.4 identity-recall transport adapters
     # build on RNS. (The LXMF §11.2/§11.3 adapters stay opt-in below.)
-    "rns>=1.4",
+    # 1.5.4 pairs with the @reticulum/* 0.8.2 wire protocol (rfed link
+    # publishes, pull error codes).
+    "rns>=1.5.4",
 ]
 
 [project.scripts]

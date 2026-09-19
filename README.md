@@ -97,7 +97,7 @@ Python implementation of Dacar, a Decentralized Access Control system for Reticu
 
 ### JavaScript
 
-JavaScript implementation of Dacar, a Decentralized Access Control system for Reticulum. Runs in browsers and on servers (Node, Deno, Bun), built on `@reticulum/core`.
+JavaScript implementation of Dacar, a Decentralized Access Control system for Reticulum. Runs in browsers and on servers (Node, Deno, Bun), built on the reticulum-js packages (`@reticulum/core`, `@reticulum/lxmf`, `@reticulum/rfed`).
 
 ## Development
 

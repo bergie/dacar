@@ -44,8 +44,10 @@
     "node": ">=20"
   },
   "dependencies": {
-    "@reticulum/core": "^0.7.0",
-    "@reticulum/node": "^0.7.0",
+    "@reticulum/core": "^0.8.2",
+    "@reticulum/lxmf": "^0.8.2",
+    "@reticulum/node": "^0.8.2",
+    "@reticulum/rfed": "^0.8.2",
     "@types/node": "^26.2.0"
   },
   "publishConfig": {

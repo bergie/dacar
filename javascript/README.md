@@ -19,9 +19,9 @@ This is a modern ES-module package with JSDoc type annotations that runs on
 | HMAC-SHA256 / SHA-256 (§3.3, §6.1) | Web Crypto `crypto.subtle` | Standard, runtime-portable |
 | MessagePack (§5.3) | `@reticulum/core` `MsgPack` | Reuses the canonical stack's encoder |
 
-`@reticulum/core` is the only dependency (for both the core and the optional
-transport adapters — which additionally use its `Destination`, `Link`,
-`LXMRouter`, and `RFedClient`).
+`@reticulum/core` is the base dependency of the pure core; the optional
+transport adapters additionally use `@reticulum/lxmf` (the `LXMRouter`),
+`@reticulum/rfed` (the `RFedClient`), and core's `Destination`/`Link`.
 
 > **Note on MessagePack + 64-bit HLCs:** a packed HLC (`physical_ms << 16`)
 > exceeds `Number.MAX_SAFE_INTEGER`, so it is represented as a `bigint`. The HLC
@@ -112,8 +112,9 @@ console.log(await engine.evaluate("sensor:wind", "read", ROOT)); // true
 
 The pure core has no transport: it is wired to the Reticulum transports by the
 optional `@reticulum/dacar/transport` subpath. Importing the core
-(`@reticulum/dacar`) never pulls it in, and every adapter depends only on
-`@reticulum/core` (already a core dependency), so it adds **no new dependency**.
+(`@reticulum/dacar`) never pulls it in. The transport adapters build on
+`@reticulum/core`, `@reticulum/lxmf`, and `@reticulum/rfed` (since reticulum-js
+0.8.2, LXMF and rfed are packages of their own rather than core subpaths).
 
 Every transport funnels received bytes through the same verify-on-ingest seam
 (`DeltaReceiver.applyPayload()`, §11.2.4): a Delta is decoded, authenticated by
@@ -159,7 +160,7 @@ import {
 ### RFed convergence
 
 ```js
-import { RFedClient } from "@reticulum/core";
+import { RFedClient } from "@reticulum/rfed";
 import { DeltaReceiver, StateVector } from "@reticulum/dacar";
 import { RfedDeltaSync } from "@reticulum/dacar/transport";
 

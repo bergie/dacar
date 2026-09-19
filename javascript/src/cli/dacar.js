@@ -35,7 +35,7 @@ import process from "node:process";
 import { Identity, toHex } from "@reticulum/core";
 import { MemoryStorageAdapter } from "@reticulum/core";
 import { DacarFileAdapter } from "./fileStore.js";
-import { RFedClient } from "@reticulum/core/src/rfed/index.js";
+import { RFedClient } from "@reticulum/rfed";
 import { bootRns } from "./rns_boot.js";
 
 import { Action, Operation, Tuple, Engine } from "../index.js";
