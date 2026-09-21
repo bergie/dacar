@@ -31,7 +31,7 @@ const RFED_PUBLISH_DEST = "rfed.channel.publish";
  * Announce the node's identity on the `dacar.node` destination (§11.2.4).
  *
  * Any announced destination under an identity makes that identity recallable by
- * peers via `Destination.recall(hash, true)` — the announce invariant: without
+ * peers via `rns.transport.recallIdentity(hash, true)` — the announce invariant: without
  * it, receivers drop the node's signed Deltas as "unknown issuer" because the
  * `RnsIdentityResolver` cannot recall the issuer's public key.
  *
@@ -68,7 +68,8 @@ export const DEFAULT_NODE_DISCOVERY_TIMEOUT = 15_000;
  * announce isn't in the recall store yet, `RFedClient.subscribe` can't open a
  * link and fails with `rfed node identity unknown for <hash>; wait for its
  * announce`. Rather than fail immediately, this sends a `path?` request for
- * the destination and polls `Destination.recall` until the node's
+ * the destination and polls the transport's identity recall store
+ * (`rns.transport.recallIdentity`) until the node's
  * path-response announce populates it (or `timeout` elapses), then returns
  * the identity.
  *
@@ -94,7 +95,7 @@ export async function ensureNodeIdentity(
   nodeHash,
   { timeout = DEFAULT_NODE_DISCOVERY_TIMEOUT, pollInterval = 250, onRequest } = {},
 ) {
-  let identity = await Destination.recall(nodeHash);
+  let identity = await rns.transport.recallIdentity(nodeHash);
   if (identity) return identity;
   // Not yet known — proactively request the destination's path (§7.1). The
   // rfed node answers with a path-response announce (§7.2.4) that populates
@@ -103,7 +104,7 @@ export async function ensureNodeIdentity(
   await rns.transport.requestPath(nodeHash);
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
-    identity = await Destination.recall(nodeHash);
+    identity = await rns.transport.recallIdentity(nodeHash);
     if (identity) return identity;
     await new Promise((resolve) => setTimeout(resolve, pollInterval));
   }
@@ -155,7 +156,7 @@ export async function ensureRfedPath(
   destName,
   { timeout = DEFAULT_PATH_TIMEOUT, pollInterval = 100, onRequest } = {},
 ) {
-  const identity = await Destination.recall(nodeHash);
+  const identity = await rns.transport.recallIdentity(nodeHash);
   if (!identity) {
     throw new Error(
       `rfed node identity unknown for ${toHex(nodeHash)}; wait for its announce`,
@@ -207,7 +208,7 @@ export async function ensureRfedPath(
  * @returns {Promise<boolean[]>}
  */
 export async function runPublishMany({ deltaPayloads, nodeHash, topic, client, rns = null }) {
-  const sync = new RfedDeltaSync({ client, topic });
+  const sync = new RfedDeltaSync({ client, topic, rns });
   if (rns) {
     await ensureRfedPath(rns, nodeHash, RFED_SUBSCRIBE_DEST);
     await ensureRfedPath(rns, nodeHash, RFED_PUBLISH_DEST);
@@ -277,7 +278,7 @@ export async function runPublish({ deltaPayload, nodeHash, topic, client, rns = 
  * @returns {Promise<number>}
  */
 export async function runSync({ nodeHash, topic, client, receiver, rns = null }) {
-  const sync = new RfedDeltaSync({ receiver, client, topic });
+  const sync = new RfedDeltaSync({ receiver, client, topic, rns });
   if (rns) {
     await ensureRfedPath(rns, nodeHash, RFED_SUBSCRIBE_DEST);
     await ensureRfedPath(rns, nodeHash, RFED_PULL_DEST);

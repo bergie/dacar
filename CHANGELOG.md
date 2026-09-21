@@ -5,6 +5,21 @@ All notable changes to Dacar will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **JavaScript**: Dependencies updated to the reticulum-js 0.9.0 package
+  family. `@reticulum/core` 0.9.0 moved the identity recall store from
+  class-level statics to instance-scoped transport caches, so
+  `Destination.remember`/`recall` callers were migrated to the instance
+  methods `rns.transport.rememberIdentity`/`recallIdentity`
+  (`src/transport/rnsIdentity.js`, `src/transport/rfedSync.js`,
+  `src/cli/session.js`, `src/cli/dacar.js`). `RnsIdentityResolver` now takes
+  the `Reticulum` instance as its first constructor argument (the fallback
+  resolver is second); `RfedDeltaSync` accepts an optional `rns` instance so
+  received Deltas' transport senders are remembered into the instance cache.
+  No wire-format or spec-level change.
+
 ## [1.4.0] - 2026-09-20
 
 ### Changed

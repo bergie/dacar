@@ -7,9 +7,9 @@
     "./transport": "./src/transport/index.js"
   },
   "imports": {
-    "@reticulum/core": "jsr:@reticulum/core@^0.8.2",
-    "@reticulum/lxmf": "jsr:@reticulum/lxmf@^0.8.2",
-    "@reticulum/rfed": "jsr:@reticulum/rfed@^0.8.2"
+    "@reticulum/core": "jsr:@reticulum/core@^0.9.0",
+    "@reticulum/lxmf": "jsr:@reticulum/lxmf@^0.9.0",
+    "@reticulum/rfed": "jsr:@reticulum/rfed@^0.9.0"
   },
   "exclude": [
     "scripts/",

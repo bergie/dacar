@@ -1,6 +1,6 @@
 import { describe, it, before } from "node:test";
 import assert from "node:assert/strict";
-import { Destination, Identity } from "@reticulum/core";
+import { Identity, Reticulum } from "@reticulum/core";
 import { Action, Operation } from "../src/operation.js";
 import { Tuple } from "../src/tuple.js";
 import { HASH_SIZE, NamespaceHasher } from "../src/namespace.js";
@@ -23,32 +23,31 @@ async function makeOp(issuer, signers = []) {
   return signers.length ? base.sign(...signers) : base;
 }
 
-/** Populate RNS's recall store for *identity* (as an announce would). */
-async function remember(identity) {
-  await Destination.remember(
-    new Uint8Array(16),
-    new Uint8Array(16),
-    await identity.getPublicKey(),
-    null,
-  );
-}
-
 describe("RnsIdentityResolver (§3.1, §11.2.4)", () => {
   /** @type {Identity} */ let identity;
   /** @type {Uint8Array} */ let issuer;
   /** @type {Uint8Array} */ let publicKey;
+  /** @type {import("@reticulum/core").Reticulum} */ let rns;
 
   before(async () => {
     identity = await Identity.generate();
     publicKey = await identity.getPublicKey();
     issuer = identity.identityHash;
-    await remember(identity);
+    // A headless Reticulum whose transport owns the instance-scoped recall
+    // store (0.9.0 work doc #37) — stand-in for a live announce listener.
+    rns = new Reticulum({});
+    await rns.transport.rememberIdentity(
+      new Uint8Array(16),
+      new Uint8Array(16),
+      publicKey,
+      null,
+    );
   });
 
   // -- recall → keyset ---------------------------------------------------
 
   it("resolves an announced identity to its full 64-byte public key", async () => {
-    const keyset = await new RnsIdentityResolver().resolve(issuer);
+    const keyset = await new RnsIdentityResolver(rns).resolve(issuer);
     assert.ok(keyset);
     assert.equal(keyset.threshold, 1);
     assert.equal(keyset.memberPublicKeys.length, 1);
@@ -57,7 +56,7 @@ describe("RnsIdentityResolver (§3.1, §11.2.4)", () => {
 
   it("an unknown hash resolves to null without a fallback", async () => {
     const stranger = await Identity.generate();
-    assert.equal(await new RnsIdentityResolver().resolve(stranger.identityHash), null);
+    assert.equal(await new RnsIdentityResolver(rns).resolve(stranger.identityHash), null);
   });
 
   // -- the real path: recall → verify-on-ingest → CRDT merge -------------
@@ -65,7 +64,7 @@ describe("RnsIdentityResolver (§3.1, §11.2.4)", () => {
   it("applies a signed Delta from an announced identity", async () => {
     const op = await makeOp(issuer, [identity]); // signed by the real identity
     const state = new StateVector();
-    const rx = new DeltaReceiver(state, new RnsIdentityResolver());
+    const rx = new DeltaReceiver(state, new RnsIdentityResolver(rns));
     assert.equal(await rx.applyPayload(op.toPayload(), { nowMs: NOW }), true);
     assert.equal(state.size, 1);
   });
@@ -75,7 +74,7 @@ describe("RnsIdentityResolver (§3.1, §11.2.4)", () => {
     // different key → signature verification fails → Delta dropped.
     const op = await makeOp(issuer, [await Identity.generate()]);
     const state = new StateVector();
-    const rx = new DeltaReceiver(state, new RnsIdentityResolver());
+    const rx = new DeltaReceiver(state, new RnsIdentityResolver(rns));
     assert.equal(await rx.applyPayload(op.toPayload(), { nowMs: NOW }), false);
     assert.equal(state.size, 0);
   });
@@ -85,7 +84,7 @@ describe("RnsIdentityResolver (§3.1, §11.2.4)", () => {
   it("falls back to a Keyring for groups and unknowns", async () => {
     const group = Uint8Array.from({ length: HASH_SIZE }, () => 0xaa);
     const fallback = new Keyring().registerSingle(group, Uint8Array.from({ length: 64 }, () => 0xbb));
-    const resolver = new RnsIdentityResolver(fallback);
+    const resolver = new RnsIdentityResolver(rns, fallback);
     assert.ok(await resolver.resolve(group)); // fallback single
     const stranger = await Identity.generate();
     assert.equal(await resolver.resolve(stranger.identityHash), null); // neither knows it
@@ -97,12 +96,12 @@ describe("RnsIdentityResolver (§3.1, §11.2.4)", () => {
       issuer,
       Uint8Array.from({ length: 64 }, () => 0xcc),
     );
-    const keyset = await new RnsIdentityResolver(fallback).resolve(issuer);
+    const keyset = await new RnsIdentityResolver(rns, fallback).resolve(issuer);
     assert.deepEqual(keyset.memberPublicKeys[0], publicKey);
   });
 
   it("works as a KeyResolver function via .resolve", async () => {
-    const resolver = new RnsIdentityResolver();
+    const resolver = new RnsIdentityResolver(rns);
     const rx = new DeltaReceiver(new StateVector(), resolver.resolve.bind(resolver));
     const op = await makeOp(issuer, [identity]);
     assert.equal(await rx.applyPayload(op.toPayload(), { nowMs: NOW }), true);

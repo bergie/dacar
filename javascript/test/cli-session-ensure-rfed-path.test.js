@@ -16,7 +16,7 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { Destination, Identity, Reticulum, toHex } from "@reticulum/core";
+import { Identity, Reticulum, toHex } from "@reticulum/core";
 import {
   DEFAULT_PATH_TIMEOUT,
   ensureRfedPath,
@@ -25,41 +25,33 @@ import {
 const NODE_HASH = Uint8Array.from({ length: 16 }, (_, i) => i + 1);
 const DEST_NAME = "rfed.channel.subscribe";
 
-/** A minimal Reticulum whose transport path API we can stub. */
-function fakeRns({ hasPath = () => false } = {}) {
+/** A minimal Reticulum whose transport recall/path API we can stub. */
+function fakeRns({ hasPath = () => false, identity = null } = {}) {
   const rns = new Reticulum({});
   rns.transport.hasPath = hasPath;
+  if (identity) rns.transport.recallIdentity = async () => identity;
   return rns;
 }
 
 describe("ensureRfedPath (rngit await_path pattern)", () => {
   it("is a no-op (no requestPath) when the path is already known", async () => {
     const identity = await Identity.generate();
-    const originalRecall = Destination.recall;
-    Destination.recall = async () => identity;
     let requested = 0;
-    const rns = fakeRns({ hasPath: () => true });
+    const rns = fakeRns({ hasPath: () => true, identity });
     rns.transport.requestPath = async () => {
       requested++;
     };
-    try {
-      const destHash = await ensureRfedPath(rns, NODE_HASH, DEST_NAME, {
-        onRequest: () => requested++,
-      });
-      assert.equal(destHash.length, 16);
-      assert.equal(requested, 0); // no path request — already known
-    } finally {
-      Destination.recall = originalRecall;
-    }
+    const destHash = await ensureRfedPath(rns, NODE_HASH, DEST_NAME, {
+      onRequest: () => requested++,
+    });
+    assert.equal(destHash.length, 16);
+    assert.equal(requested, 0); // no path request — already known
   });
 
   it("computes a real rfed.channel.* hash (matches Destination._computeHashes)", async () => {
     const identity = await Identity.generate();
-    const originalRecall = Destination.recall;
-    Destination.recall = async () => identity;
-    const rns = fakeRns({ hasPath: () => true });
-    try {
-      const destHash = await ensureRfedPath(rns, NODE_HASH, DEST_NAME);
+    const rns = fakeRns({ hasPath: () => true, identity });
+    const destHash = await ensureRfedPath(rns, NODE_HASH, DEST_NAME);
       // nameHash = SHA-256("rfed.channel.subscribe")[:10]
       // destHash = SHA-256(nameHash || identityHash)[:16]
       const enc = new TextEncoder();
@@ -73,18 +65,13 @@ describe("ensureRfedPath (rngit await_path pattern)", () => {
         (await crypto.subtle.digest("SHA-256", combined)).slice(0, 16),
       );
       assert.deepEqual(destHash, expected);
-    } finally {
-      Destination.recall = originalRecall;
-    }
   });
 
   it("sends a path request then returns when the announce arrives", async () => {
     const identity = await Identity.generate();
-    const originalRecall = Destination.recall;
-    Destination.recall = async () => identity;
     const state = { requested: false };
     const requestedPath = [];
-    const rns = fakeRns({ hasPath: (h) => state.requested });
+    const rns = fakeRns({ hasPath: (h) => state.requested, identity });
     const originalRequestPath = rns.transport.requestPath.bind(rns.transport);
     rns.transport.requestPath = async (destinationHash) => {
       state.requested = true; // simulate the path-response announce arriving
@@ -102,16 +89,13 @@ describe("ensureRfedPath (rngit await_path pattern)", () => {
       assert.equal(requestedPath.length, 1);
       assert.deepEqual(requestedPath[0], destHash); // requested the derived hash
     } finally {
-      Destination.recall = originalRecall;
       rns.transport.requestPath = originalRequestPath;
     }
   });
 
   it("raises the 'no path' error after the timeout when never announced", async () => {
     const identity = await Identity.generate();
-    const originalRecall = Destination.recall;
-    Destination.recall = async () => identity;
-    const rns = fakeRns({ hasPath: () => false });
+    const rns = fakeRns({ hasPath: () => false, identity });
     const originalRequestPath = rns.transport.requestPath.bind(rns.transport);
     rns.transport.requestPath = async () => {};
     try {
@@ -129,40 +113,28 @@ describe("ensureRfedPath (rngit await_path pattern)", () => {
       );
       assert.equal(requested, 1);
     } finally {
-      Destination.recall = originalRecall;
       rns.transport.requestPath = originalRequestPath;
     }
   });
 
   it("raises 'identity unknown' when the node identity cannot be recalled", async () => {
-    const originalRecall = Destination.recall;
-    Destination.recall = async () => null;
     const rns = fakeRns();
-    try {
-      await assert.rejects(
-        () => ensureRfedPath(rns, NODE_HASH, DEST_NAME, { timeout: 0 }),
-        (err) =>
-          /rfed node identity unknown for /i.test(err.message) &&
-          err.message.includes(toHex(NODE_HASH)),
-      );
-    } finally {
-      Destination.recall = originalRecall;
-    }
+    rns.transport.recallIdentity = async () => null;
+    await assert.rejects(
+      () => ensureRfedPath(rns, NODE_HASH, DEST_NAME, { timeout: 0 }),
+      (err) =>
+        /rfed node identity unknown for /i.test(err.message) &&
+        err.message.includes(toHex(NODE_HASH)),
+    );
   });
 
   it("is a no-op when the transport lacks the path-discovery API (mock)", async () => {
     const identity = await Identity.generate();
-    const originalRecall = Destination.recall;
-    Destination.recall = async () => identity;
-    // A mock transport with neither hasPath nor requestPath.
+    // A mock transport with recallIdentity but neither hasPath nor requestPath.
     const rns = new Reticulum({});
-    rns.transport = {};
-    try {
-      const destHash = await ensureRfedPath(rns, NODE_HASH, DEST_NAME);
-      assert.equal(destHash.length, 16);
-    } finally {
-      Destination.recall = originalRecall;
-    }
+    rns.transport = { recallIdentity: async () => identity };
+    const destHash = await ensureRfedPath(rns, NODE_HASH, DEST_NAME);
+    assert.equal(destHash.length, 16);
   });
 
   it("default timeout is reasonable for a one-shot CLI", () => {

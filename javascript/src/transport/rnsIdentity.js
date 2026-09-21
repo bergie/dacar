@@ -21,11 +21,11 @@
  * identities always win.
  *
  * This module is part of the optional transport layer: importing the pure
- * core (`@reticulum/dacar`) never pulls it in. It uses only `@reticulum/core`'s
- * `Destination.recall`.
+ * core (`@reticulum/dacar`) never pulls it in. It uses only
+ * `@reticulum/core`'s instance-scoped identity recall store
+ * (`rns.transport.recallIdentity`).
  */
 
-import { Destination } from "@reticulum/core";
 import { IssuerKeyset } from "../verifier.js";
 
 /**
@@ -54,11 +54,17 @@ async function resolveWith(resolver, hash) {
  */
 export class RnsIdentityResolver {
   /**
+   * @param {import("@reticulum/core").Reticulum} rns A booted Reticulum whose
+   *   transport owns the instance-scoped identity recall store
+   *   (`rns.transport.recallIdentity`). A bare `TransportCore` is accepted
+   *   too (its `recallIdentity` is resolved directly).
    * @param {import("../verifier.js").KeyResolver | import("../verifier.js").Keyring | null} [fallback]
    *   Consulted when RNS has no Identity for a hash — e.g. for Threshold Group
    *   IDs and out-of-band identities. RNS is consulted first, then the fallback.
    */
-  constructor(fallback = null) {
+  constructor(rns, fallback = null) {
+    if (!rns) throw new TypeError("RnsIdentityResolver requires a Reticulum instance");
+    this._rns = rns;
     this._fallback = fallback;
   }
 
@@ -70,9 +76,12 @@ export class RnsIdentityResolver {
    * @returns {Promise<import("../verifier.js").IssuerKeyset | null>}
    */
   async resolve(issuerHash) {
+    // A bare `TransportCore` is accepted wherever a `Reticulum` is (its
+    // `recallIdentity` is the same instance method).
+    const transport = this._rns.transport ?? this._rns;
     // `fromIdentityHash = true` scans the recall store matching by the
     // identity hash (SHA-256(P)[:16]) rather than by destination hash.
-    const identity = await Destination.recall(issuerHash, true);
+    const identity = await transport.recallIdentity(issuerHash, true);
     if (identity) {
       // IssuerKeyset carries the full 64-byte RNS public key (X25519 ‖ Ed25519).
       return IssuerKeyset.single(await identity.getPublicKey());

@@ -46,7 +46,7 @@
  * ```
  */
 
-import { Destination, MsgPack } from "@reticulum/core";
+import { MsgPack } from "@reticulum/core";
 import {
   deriveChannel,
   unwrapRawChannelMessage,
@@ -100,14 +100,21 @@ export class RfedDeltaSync {
    *   The shared DeltaReceiver (state + key resolver). May be omitted on a
    *   publish-only node (then `listen`/`pull` throw if called).
    * @param {RFedClientLike} opts.client A `@reticulum/rfed` `RFedClient`.
+   * @param {import("@reticulum/core").Reticulum} [opts.rns] The Reticulum
+   *   instance owning the identity recall store. When given, each received
+   *   Delta's transport sender is remembered into it
+   *   (`rns.transport.rememberIdentity`) so future RNS recalls succeed without
+   *   an announce. Best-effort: reception works without it.
    * @param {string} [opts.topic] RFed channel name (default `dacar.policy.v1`).
    */
-  constructor({ receiver = null, client, topic = RFED_TOPIC }) {
+  constructor({ receiver = null, client, rns = null, topic = RFED_TOPIC }) {
     if (!client) throw new TypeError("RfedDeltaSync requires an RFedClient");
     /** @type {import("../delta.js").DeltaReceiver | null} */
     this._receiver = receiver;
     /** @type {RFedClientLike} */
     this._client = client;
+    /** @type {import("@reticulum/core").Reticulum | null} */
+    this._rns = rns;
     /** @type {string} */
     this._topic = topic;
   }
@@ -186,30 +193,45 @@ export class RfedDeltaSync {
     return this._client.listen(async (decoded) => {
       if (decoded?.kind !== "raw") return; // not a raw channel payload
 
-      // Remember the sender identity so future RNS recalls succeed without
-      // needing an announce. Best-effort: decode must still succeed without it.
-      try {
-        // Extract issuer_hash (field [0]) from the delta to map identity.
-        const decodedDelta = MsgPack.decode(decoded.payload);
-        if (Array.isArray(decodedDelta) && decodedDelta.length > 0) {
-          const issuerHash = decodedDelta[0];
-          if (issuerHash instanceof Uint8Array && issuerHash.length === 16) {
-            await Destination.remember(
-              decoded.senderIdentity.identityHash,
-              decoded.senderIdentity.identityHash,
-              decoded.senderPub,
-              null,
-            );
-          }
-        }
-      } catch {
-        // Remembering is best-effort; failure doesn't affect correctness.
-      }
+      await this._rememberSender(decoded);
 
       // RFedClient.invoke does not await the callback; run applyPayload without
       // leaving an unhandled rejection (it swallows malformed payloads itself).
       Promise.resolve(receiver.applyPayload(decoded.payload)).catch(() => {});
     });
+  }
+
+  /**
+   * Remembers a fanout/pull sender into the RNS identity recall store so
+   * future RNS recalls succeed without needing an announce (best-effort —
+   * failure never affects correctness, and it is skipped entirely when no
+   * `rns` instance was given).
+   *
+   * The delta's issuer hash (field [0]) is inspected to confirm the payload
+   * is a Dacar Delta before caching the transport sender's key under the
+   * sender's identity hash.
+   * @param {RfedDecodedRaw} decoded A decoded fanout delivery.
+   * @returns {Promise<void>}
+   */
+  async _rememberSender(decoded) {
+    if (!this._rns?.transport?.rememberIdentity) return;
+    try {
+      // Extract issuer_hash (field [0]) from the delta to map identity.
+      const decodedDelta = MsgPack.decode(decoded.payload);
+      if (Array.isArray(decodedDelta) && decodedDelta.length > 0) {
+        const issuerHash = decodedDelta[0];
+        if (issuerHash instanceof Uint8Array && issuerHash.length === 16) {
+          await this._rns.transport.rememberIdentity(
+            decoded.senderIdentity.identityHash,
+            decoded.senderIdentity.identityHash,
+            decoded.senderPub,
+            null,
+          );
+        }
+      }
+    } catch {
+      // Remembering is best-effort; failure doesn't affect correctness.
+    }
   }
 
   /**
@@ -247,25 +269,7 @@ export class RfedDeltaSync {
             channelIdentity,
           });
 
-          // Remember the sender identity so future RNS recalls succeed without
-          // needing an announce. Best-effort: decode must still succeed without it.
-          try {
-            // Extract issuer_hash (field [0]) from the delta to map identity.
-            const decodedDelta = MsgPack.decode(decoded.payload);
-            if (Array.isArray(decodedDelta) && decodedDelta.length > 0) {
-              const issuerHash = decodedDelta[0];
-              if (issuerHash instanceof Uint8Array && issuerHash.length === 16) {
-                await Destination.remember(
-                  decoded.senderIdentity.identityHash,
-                  decoded.senderIdentity.identityHash,
-                  decoded.senderPub,
-                  null,
-                );
-              }
-            }
-          } catch {
-            // Remembering is best-effort; failure doesn't affect correctness.
-          }
+          await this._rememberSender(decoded);
 
           if (await receiver.applyPayload(decoded.payload)) {
             applied++;

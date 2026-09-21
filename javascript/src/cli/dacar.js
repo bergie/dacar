@@ -399,7 +399,7 @@ async function cmdSync(args) {
   });
   const topic = await resolveTopic(args, store);
   const state = await store.loadState(config);
-  const resolver = new RnsIdentityResolver(keyring);
+  const resolver = new RnsIdentityResolver(rns, keyring);
   const rx = new DeltaReceiver(state, resolver);
 
   const client = new RFedClient({ identity, rns });
@@ -613,8 +613,7 @@ async function cmdIdentityRemember(args) {
     const rns = await bootRns(configDir, args.interface || "shared", {
       verbose: !!args.verbose,
     });
-    const { Destination } = await import("@reticulum/core");
-    const recalled = await Destination.recall(issuerHash, true);
+    const recalled = await rns.transport.recallIdentity(issuerHash, true);
     if (!recalled) {
       throw new CliError(
         `could not recall ${shortHash(issuerHash, args.fullHashes)} from RNS; use --pubkey <hex> or --file <path>`,
