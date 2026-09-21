@@ -107,9 +107,13 @@ class GenerateValidateStampTest(unittest.TestCase):
                 )
 
     def test_stamp_is_bound_to_material(self) -> None:
-        stamp, _ = generate_channel_stamp(CHANNEL_HASH, INNER_BLOB, 4)
+        # Stamp generation is a random-trial search, so a stamp that merely
+        # meets a low cost still validates against unrelated material by
+        # chance (p ≈ 2^-cost). Use a cost high enough that a coincidental
+        # match is negligible — at cost 4 this test flaked ~6% of runs.
+        stamp, _ = generate_channel_stamp(CHANNEL_HASH, INNER_BLOB, 16)
         other_blob = INNER_BLOB[:-1] + b"\x03"
-        self.assertFalse(validate_channel_stamp(CHANNEL_HASH, other_blob, stamp, 4))
+        self.assertFalse(validate_channel_stamp(CHANNEL_HASH, other_blob, stamp, 16))
 
     def test_validate_rejects_junk(self) -> None:
         self.assertFalse(

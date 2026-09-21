@@ -5,7 +5,7 @@ All notable changes to Dacar will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.4.1] - 2026-09-21
 
 ### Changed
 - **JavaScript**: Dependencies updated to the reticulum-js 0.9.0 package
@@ -19,6 +19,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resolver is second); `RfedDeltaSync` accepts an optional `rns` instance so
   received Deltas' transport senders are remembered into the instance cache.
   No wire-format or spec-level change.
+
+### Fixed
+- **Python**: `tests/test_rfed_stamp.py`
+  `test_stamp_is_bound_to_material` was flaky (~6% of runs): it generated a
+  random-trial stamp at cost 4 and asserted it must fail to validate against
+  different material — but a stamp that merely meets cost 4 validates against
+  *any* workblock with probability 2⁻⁴. The test now uses cost 16, where a
+  coincidental match (2⁻¹⁶) is negligible. Test-only; no library code changed.
 
 ## [1.4.0] - 2026-09-20
 
