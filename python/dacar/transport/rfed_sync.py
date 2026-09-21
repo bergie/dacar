@@ -9,7 +9,7 @@ ingest seam (:meth:`DeltaReceiver.apply_payload`, §11.2) as LXMF and optical
 delivery — **never** through the unauthenticated :meth:`StateVector.merge`
 path. A forged or stale Delta is simply dropped before it can mutate state.
 
-:class:`RfedDeltaSync` wraps a :class:`dacar.rfed.client.RFedClient`. A Delta
+:class:`RfedDeltaSync` wraps a :class:`rfed.client.RFedClient`. A Delta
 travels in Dacar's **compact inner format** (§11.1): the raw §5.3 payload is
 placed straight after the RTID source-identity prelude and EC-encrypted to the
 derived channel identity — no LXMF envelope, which would only duplicate the
@@ -47,8 +47,8 @@ import RNS
 import dacar.serialization
 from dacar.delta import DeltaReceiver
 from dacar.naming import RFED_TOPIC
-from dacar.rfed.blob import unwrap_dacar_delta, wrap_dacar_delta
-from dacar.rfed.channel import derive_channel
+from dacar.transport.rfed_compact import unwrap_dacar_delta, wrap_dacar_delta
+from rfed.channel import derive_channel
 
 __all__ = ["RfedDeltaSync"]
 
@@ -57,7 +57,7 @@ class RfedDeltaSync:
     """§11.1 RFed Delta broadcast + receive, routed through verify-on-ingest.
 
     Mirrors ``RfedDeltaSync`` in ``javascript/src/transport/rfedSync.js``. The
-    ``client`` is the minimal :class:`~dacar.rfed.client.RFedClient` surface
+    ``client`` is the minimal :class:`~rfed.client.RFedClient` surface
     this adapter relies on; tests may inject a fake.
 
     Parameters
@@ -67,7 +67,7 @@ class RfedDeltaSync:
         ``None`` on a publish-only node (then :meth:`listen`/:meth:`pull`
         raise if called).
     client:
-        A :class:`~dacar.rfed.client.RFedClient` (or compatible fake). Required.
+        A :class:`~rfed.client.RFedClient` (or compatible fake). Required.
     topic:
         RFed channel name (default :data:`~dacar.naming.RFED_TOPIC`).
     """

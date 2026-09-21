@@ -26,9 +26,9 @@ from dacar import Action, DeltaReceiver, Engine, Keyring, Operation, StateVector
 from dacar.hlc import pack, physical_now_ms
 from dacar.naming import RFED_TOPIC
 from dacar.namespace import HASH_SIZE, NamespaceHasher, SALT_SIZE
-from dacar.rfed.blob import wrap_dacar_delta
-from dacar.rfed.channel import derive_channel
-from dacar.rfed.client import PullItem, PullPage, SubscribeResult
+from dacar.transport.rfed_compact import wrap_dacar_delta
+from rfed.channel import derive_channel
+from rfed.client import PullItem, PullPage, SubscribeResult
 from dacar.transport.rns_identity import RnsIdentityResolver
 
 from dacar.cli.commands import run_publish, run_sync, _resolve_rfed_node, _resolve_topic
@@ -264,7 +264,7 @@ class RunPublishTest(unittest.TestCase):
         ``[false, null]`` response was swallowed and the operation continued.
         """
         from dacar.cli.commands import CliError
-        from dacar.rfed.client import SubscribeResult
+        from rfed.client import SubscribeResult
 
         class _FailingClient(_FakeRFedClient):
             def subscribe(self, node_hash, channel_name, **_kw):
@@ -371,7 +371,7 @@ class RunSyncTest(unittest.TestCase):
         fatal to the sync's purpose.
         """
         from dacar.cli.commands import CliError
-        from dacar.rfed.client import SubscribeResult
+        from rfed.client import SubscribeResult
 
         class _FailingClient(_FakeRFedClient):
             def subscribe(self, node_hash, channel_name, **_kw):

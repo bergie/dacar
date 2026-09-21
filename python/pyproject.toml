@@ -32,6 +32,11 @@ dependencies = [
     # 1.5.4 pairs with the @reticulum/* 0.8.2 wire protocol (rfed link
     # publishes, pull error codes).
     "rns>=1.5.4",
+    # RFed (Reticulum Federation) channel client — the §11.1 transport
+    # adapter and CLI wrap it. Extracted from the former `dacar.rfed`
+    # subpackage into its own pip package
+    # (https://github.com/bergie/rfed-python).
+    "rfed>=0.1",
 ]
 
 [project.scripts]
@@ -52,4 +57,4 @@ Specification = "https://github.com/bergie/dacar/blob/main/SPEC.md"
 Changelog = "https://github.com/bergie/dacar/releases"
 
 [tool.setuptools]
-packages = ["dacar", "dacar.transport", "dacar.rfed", "dacar.cli"]
+packages = ["dacar", "dacar.transport", "dacar.cli"]

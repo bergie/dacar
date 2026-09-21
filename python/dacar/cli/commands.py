@@ -1224,7 +1224,7 @@ def _publish_setup(args, store: Store, identity) -> tuple:
     Delta (RNS is a singleton and cannot be re-initialised).
     """
     from dacar.cli.rns import announce_identity, boot, ensure_node_identity, register_announce_handler
-    from dacar.rfed.client import RFedClient
+    from rfed.client import RFedClient
 
     aliases = store.load_aliases()
     topic = _resolve_topic(args, store)
@@ -1331,7 +1331,7 @@ def cmd_sync(args) -> int:
     suffice (work doc #4).
     """
     from dacar.cli.rns import announce_identity, boot, ensure_node_identity, register_announce_handler
-    from dacar.rfed.client import RFedClient
+    from rfed.client import RFedClient
     from dacar.transport.rns_identity import RnsIdentityResolver
 
     store = Store(args.store, identity_override=args.identity)

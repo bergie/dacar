@@ -3,7 +3,8 @@
 The Dacar-specific logic is the compact inner format (raw §5.3 Delta in the
 RTID prelude, no LXMF envelope) routed through verify-on-ingest; the rfed
 machinery (channel derivation, EC envelope, PoW stamp, fanout/pull wire
-format) is exercised in :mod:`dacar.rfed` and upstream and is not re-tested
+format) is exercised in the standalone ``rfed`` package's test suite
+(https://github.com/bergie/rfed-python) and upstream and is not re-tested
 here. A *fake* ``RFedClient`` records publishes and replays
 ``listen_raw``/``pull``, so the adapter is tested without a live Reticulum —
 mirroring ``javascript/test/transport-rfed.test.js``.
@@ -26,10 +27,10 @@ from dacar import Action, DeltaReceiver, Keyring, Operation, StateVector, Tuple
 from dacar.hlc import pack, physical_now_ms
 from dacar.namespace import HASH_SIZE, NamespaceHasher, SALT_SIZE
 from dacar.naming import RFED_TOPIC
-from dacar.rfed.blob import unwrap_dacar_delta, wrap_dacar_delta
-from dacar.rfed.channel import derive_channel
-from dacar.rfed.constants import HASH_LENGTH
-from dacar.rfed.client import PullItem, PullPage, SubscribeResult
+from dacar.transport.rfed_compact import unwrap_dacar_delta, wrap_dacar_delta
+from rfed.channel import derive_channel
+from rfed.constants import HASH_LENGTH
+from rfed.client import PullItem, PullPage, SubscribeResult
 from dacar.transport.rfed_sync import RfedDeltaSync
 
 from tests._rns_fixture import ensure_headless
@@ -57,7 +58,7 @@ class _FakeRFedClient:
     """A minimal RFedClient double that records publishes and replays listen/pull.
 
     Mirrors the surface :class:`RfedDeltaSync` relies on (the same surface the
-    real :class:`dacar.rfed.client.RFedClient` exposes for application-specific
+    real :class:`rfed.client.RFedClient` exposes for application-specific
     inner formats): ``channel``/``stamp_cost``/``send_publish``/``listen_raw``.
     """
 
@@ -280,7 +281,7 @@ class CorePurityTest(unittest.TestCase):
         out = subprocess.check_output(
             [sys.executable, "-c",
              "import sys, dacar; "
-             "leaked=[m for m in ('dacar.transport','dacar.rfed','RNS','LXMF') "
+             "leaked=[m for m in ('dacar.transport','rfed','RNS','LXMF') "
              "if m in sys.modules]; "
              "assert not leaked, leaked; "
              "print('PURE')"],

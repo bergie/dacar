@@ -264,7 +264,7 @@ def discover_rfed_node(
     Listens for a validated ``rfed.node`` announce on the live RNS transport
     and returns that announce's destination hash — the rfed node's canonical
     identifier (the same hash ``--node <hash>`` accepts and
-    :class:`~dacar.rfed.client.RFedClient` recalls to open a link).
+    :class:`~rfed.client.RFedClient` recalls to open a link).
 
     The rfed daemon is an external process (dacar ships only the client); it
     announces ``rfed.node`` and the ``rfed.channel.*`` service destinations

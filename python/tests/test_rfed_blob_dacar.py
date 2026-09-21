@@ -15,14 +15,14 @@ import unittest
 
 import RNS
 
-from dacar.rfed.blob import (
+from dacar.transport.rfed_compact import unwrap_dacar_delta, wrap_dacar_delta
+from rfed.channel import derive_channel
+from rfed.constants import (
+    HASH_LENGTH,
     MAGIC_RTID,
     PRELUDE_LENGTH,
-    unwrap_dacar_delta,
-    wrap_dacar_delta,
+    PUBLIC_KEY_LENGTH,
 )
-from dacar.rfed.channel import derive_channel
-from dacar.rfed.constants import HASH_LENGTH, PUBLIC_KEY_LENGTH
 from dacar.naming import RFED_TOPIC
 
 #: Default RNS path MTU (multi-hop, with stamp) the compact format must fit.

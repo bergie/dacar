@@ -5,6 +5,21 @@ All notable changes to Dacar will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **Python**: the RFed channel client now ships as its own pip package. The
+  `dacar.rfed` subpackage (wire constants, channel derivation, LXMF tail
+  codec, RTID envelope, PoW stamp contract, `RFedClient`) moved verbatim to
+  the standalone `rfed` package
+  (https://github.com/bergie/rfed-python), and `dacar` now depends on
+  `rfed>=0.1`. Imports change from `dacar.rfed.*` to `rfed.*`; the
+  Dacar-specific §11.1.1 compact inner format (`wrap_dacar_delta` /
+  `unwrap_dacar_delta` / `DecodedDacarDelta`) moved to
+  `dacar.transport.rfed_compact`. No behavior changes — the moved smoketests
+  (stamp, client response decoding, publish link) now live in the new
+  repository.
+
 ## [1.4.1] - 2026-09-21
 
 ### Changed

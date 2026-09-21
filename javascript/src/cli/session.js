@@ -18,7 +18,7 @@ import { RfedDeltaSync } from "../transport/rfedSync.js";
 
 /**
  * rfed service destination names (SPEC §2), all sharing the node identity.
- * Mirrors Python's ``dacar.rfed.constants`` and ``@reticulum/core``'s internal
+ * Mirrors Python's ``rfed.constants`` and ``@reticulum/core``'s internal
  * ``client.js`` constants. Used to compute per-destination hashes so dacar can
  * request transport paths to the *specific* rfed service a link targets
  * (a path to ``rfed.node`` does not establish a route to ``rfed.channel.*``).
