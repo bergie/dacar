@@ -137,7 +137,7 @@ Dacar delegates transport responsibilities to established Reticulum protocols.
 Global convergence of the CRDT State Vector is handled via **RFed**. The default topic is `dacar.policy.v1`, but it is **configurable per deployment**: because RFed is a broadcast (many-to-many) medium, nodes that must isolate their policy feed from other Dacar deployments sharing an RNS network SHOULD set a deployment-specific topic. (By contrast, §11.2 LXMF delivery and the §8 Challenge destination are addressed point-to-point to a specific Identity, so they derive isolation from RNS addressing rather than from a configurable name.) Nodes rely on RFed's native store-and-forward to asynchronously retrieve new Operations and merge them into the local LWW-Element-Set, each one authenticated via verify-on-ingest (§11.2) before it may mutate the CRDT.
 
 #### 11.1.1 Inner Format — Compact Dacar Envelope
-A Dacar Delta is **not** wrapped in an LXMF message inside the RFed `inner_blob`. A §5.3 Delta is already self-describing — self-addressed (Issuer Hash, field [0]), self-timed (HLC, field [3]), and self-signed (Ed25519, field [7]) — so an LXMF envelope would only duplicate the destination hash (RFed's `channel_hash` already routes it), the source hash (field [0]), the signature (field [7]), and the timestamp (field [3]), while adding ~111 bytes that push a typical 170-byte Delta past the 500-byte RNS path MTU (the `rfed.channel.publish` destination is fire-and-forget and does not accept links, so it cannot rely on RNS Resource fragmentation).
+A Dacar Delta is **not** wrapped in an LXMF message inside the RFed `inner_blob`. A §5.3 Delta is already self-describing — self-addressed (Issuer Hash, field [0]), self-timed (HLC, field [3]), and self-signed (Ed25519, field [7]) — so an LXMF envelope would only duplicate the destination hash (RFed's `channel_hash` already routes it), the source hash (field [0]), the signature (field [7]), and the timestamp (field [3]), while adding ~111 bytes that push a typical 170-byte Delta past the single-packet publish budget (the `rfed.channel.publish` destination accepts fire-and-forget DATA packets only up to the link MDU — 431 bytes at the default 500-byte MTU; larger payloads must travel as an `RNS.Resource` transfer over a link to the destination, paying link setup and transfer latency).
 
 Instead, the channel `inner_blob` for a Dacar Delta reuses the RFed RTID source-identity prelude but carries the raw Delta in place of the LXMF tail:
 
@@ -157,7 +157,7 @@ On receipt, the subscriber EC-decrypts `inner_blob` with the derived channel ide
 
 This compact format keeps a typical 170-byte Delta within the 500-byte RNS MTU (multi-hop, with stamp): ~499 bytes on the wire (467 without a stamp).
 
-**One Delta per message.** A node MUST publish each §5.3 Operation as its own `rfed_payload` (one envelope per Delta), never a batch of Deltas in a single `inner_blob`. The `rfed.channel.publish` destination is fire-and-forget (it does not accept link requests, so it cannot rely on RNS Resource fragmentation), so a single message cannot exceed the ~500-byte path MTU — and a multi-Delta msgpack array would not fit anyway. Receivers correspondingly apply Deltas one at a time through verify-on-ingest (`apply_payload`, single); there is no multi-Delta batch decode on the RFed path. A node that has accumulated several Deltas (e.g. an outbox being flushed) simply performs one publish per Delta in order.
+**One Delta per message.** A node MUST publish each §5.3 Operation as its own `rfed_payload` (one envelope per Delta), never a batch of Deltas in a single `inner_blob`. The `rfed.channel.publish` destination does accept oversized payloads — anything beyond the single-packet MDU (431 bytes at the default 500-byte MTU) travels as an `RNS.Resource` transfer over a link to the destination — but the receive path defines no batch decode: receivers apply Deltas one at a time through verify-on-ingest (`apply_payload`, single), so a multi-Delta msgpack array would be dropped as malformed on receipt. A node that has accumulated several Deltas (e.g. an outbox being flushed) simply performs one publish per Delta in order.
 
 > **Note — LXMF framing retained.** Only the RFed broadcast channel uses the compact envelope. §11.2 targeted delivery and §11.3 Paper Messages still embed Deltas in full LXMF messages (title `dacar/sync/delta`); that path is unaffected.
 ### 11.2 Targeted Asynchronous Delivery (LXMF Store-and-Forward)
@@ -177,7 +177,7 @@ Because targeted Deltas are LXMF messages, they natively support LXMF’s **Pape
 
 How a node persists its configuration, signing identity, HLC, CRDT state, aliases, plaintext ledger, issuer-identity cache, and outbox is an **implementation choice** — a node MAY use a relational database, a key-value store, cloud storage, or no persistence at all. This section defines a **recommended file-based layout** that implementations are **encouraged** to adopt when they persist to the local filesystem, so that independently-developed CLIs (e.g. the Python and JavaScript reference implementations) can read and write the **same** store directory interchangeably.
 
-The byte formats below are **normative for implementations that choose this file layout**: to claim compatibility with the reference store, an implementation MUST produce byte-identical files for every record except the identity private key (§13.9). The canonical Python `Store` is the reference implementation; other implementations SHOULD match its on-disk bytes. Implementations using a different persistence backend (database, cloud, etc.) need not follow this layout, but SHOULD preserve the same logical records and field semantics where applicable.
+The byte formats below are **normative for implementations that choose this file layout**: to claim compatibility with the reference store, an implementation MUST produce byte-identical files for every record except the identity private key (§13.10). The canonical Python `Store` is the reference implementation; other implementations SHOULD match its on-disk bytes. Implementations using a different persistence backend (database, cloud, etc.) need not follow this layout, but SHOULD preserve the same logical records and field semantics where applicable.
 
 ### 13.1 File Layout
 
@@ -193,7 +193,7 @@ The store directory (conventionally `~/.dacar/`, mode `0700`) contains loose fil
 | `identities.msgpack` | `0600` | Issuer public-key cache (§11.2.4, §13.7) |
 | `outbox.msgpack` | `0600` | Locally-issued, not-yet-published Deltas (§11, §13.8) |
 | `sent.msgpack` | `0600` | Durable replay log of published Deltas (§11, §13.9) |
-| `identity` | `0600` | Node signing identity private key (§13.9) |
+| `identity` | `0600` | Node signing identity private key (§13.10) |
 
 Secret records (the salt, CRDT state, plaintext labels, and node-local signed payloads) are `0600`; the HLC and aliases are `0644` (they carry no secret material). Modes SHOULD be set explicitly (independent of umask).
 
@@ -293,9 +293,9 @@ A Delta moves **outbox → sent box** on send (deduplicating by payload bytes). 
 
 ### 13.10 `identity` — Node Signing Identity
 
-The node's own RNS signing identity private key, persisted library-natively. Because different Reticulum implementations own different private-key serialization formats (Python RNS writes 64 bytes — 32-byte X25519 private + 32-byte Ed25519 private; other runtimes may write 128 bytes including the public halves), this **one file is the sole intentional divergence** between implementations adopting this layout.
+The node's own RNS signing identity private key, persisted library-natively. Because different Reticulum implementations own different private-key serialization formats (Python RNS writes 64 bytes — 32-byte X25519 private + 32-byte Ed25519 private; other runtimes may write 128 bytes including the public halves), this **one record is the sole intentional divergence** between implementations adopting this layout — in both bytes and filename: the Python CLI writes `identity`, while the JavaScript CLI persists its library-native `identity.key` (128 bytes, private + public halves) through its storage adapter. The two files are distinct and may coexist in one store directory.
 
-A store directory therefore carries the signing identity of whichever implementation initialized it. All other records (§13.2–§13.8) are byte-identical across implementations, so a store created by one CLI is fully readable — and writable — by any other. An implementation that did not initialize the store cannot sign with the foreign identity file; it SHOULD re-`init` or load a format-native identity to issue Operations.
+A store directory therefore carries the signing identity of whichever implementation initialized it. All other records (§13.2–§13.9) are byte-identical across implementations, so a store created by one CLI is fully readable — and writable — by any other. An implementation that did not initialize the store cannot sign with the foreign identity file; it SHOULD re-`init` or load a format-native identity to issue Operations.
 
 ### 13.11 Cross-Implementation Interoperability
 

@@ -19,6 +19,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `dacar.transport.rfed_compact`. No behavior changes — the moved smoketests
   (stamp, client response decoding, publish link) now live in the new
   repository.
+- **`SPEC.md` §11.1.1**: the `rfed.channel.publish` destination description no
+  longer claims the destination is link-less/fire-and-forget-only — oversized
+  publishes travel as `RNS.Resource` transfers over a link (single-packet MDU
+  431 B at the default 500 B MTU), matching the `rfed` client /
+  `@reticulum/rfed` behavior shipped since 1.4.0. The one-Delta-per-envelope
+  rule is unchanged (the receive path still has no multi-Delta batch decode).
+- **`SPEC.md` §13.10**: documents that the identity-record divergence is also a
+  filename divergence (Python `identity` 64 B vs JavaScript `identity.key`
+  128 B, which may coexist in one store), and fixes the section's internal
+  references (the identity record is §13.10; byte-identical records span
+  §13.2–§13.9).
+
+### Fixed
+- **Python**: `grant`/`revoke` now record the plaintext ledger's `first_seen`
+  as the **physical HLC timestamp** (high 48 bits) per `SPEC.md` §13.6,
+  instead of the full 64-bit HLC. The JavaScript CLI already wrote the
+  physical part, so `ledger.msgpack` is now byte-identical across
+  implementations (§13.11). `first_seen` is an annotation-only field (never
+  rendered or used for evaluation), so stores written by earlier Python
+  releases need no migration; new writes simply use the correct unit.
 
 ## [1.4.1] - 2026-09-21
 

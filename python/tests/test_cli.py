@@ -19,8 +19,10 @@ from pathlib import Path
 # Silence RNS's own logging so captured stderr holds only the CLI's output.
 logging.getLogger("RNS").setLevel(logging.CRITICAL)
 
+from dacar import Operation  # noqa: E402
 from dacar.cli import main  # noqa: E402
 from dacar.cli.store import AliasRegistry, Ledger, Store  # noqa: E402
+from dacar.hlc import unpack  # noqa: E402
 
 BERGIE_HASH = "000102030405060708090a0b0c0d0e0f"
 ALICE_HASH = "aabbccdd00112233445566778899aabb"
@@ -107,6 +109,23 @@ class CliSmoketest(unittest.TestCase):
         self.assertIn("read", gerr)
         self.assertIn("sensor:wind", gerr)
         self.assertIn("active", gerr)
+
+    # 3b. grant -> ledger first_seen is the *physical* HLC timestamp (high 48
+    # bits, §13.6), not the full 64-bit HLC — matching the JavaScript CLI so
+    # ledger.msgpack stays byte-identical across implementations (§13.11).
+    def test_03b_grant_ledger_first_seen_is_physical_hlc(self) -> None:
+        run(self.store, "init")
+        run(self.store, "alias", "add", "bergie", BERGIE_HASH)
+        code, out, err = run(self.store, "grant", "bergie", "read", "sensor:wind")
+        self.assertEqual(code, 0, err)
+        op = Operation.from_payload(bytes.fromhex(out.strip()))
+        physical_ms, _logical = unpack(op.hlc)
+        row = Store(self.store).load_ledger().lookup(op.tuple.hash())
+        self.assertIsNotNone(row)
+        self.assertEqual(row["first_seen"], physical_ms)
+        self.assertEqual(row["first_seen"], op.hlc >> 16)
+        # The logical counter bits are stripped, not packed along (the old bug).
+        self.assertNotEqual(row["first_seen"], op.hlc)
 
     # 4. check -> ALLOW for granted; DENY for a different relation.
     def test_04_check_allow_and_deny(self) -> None:

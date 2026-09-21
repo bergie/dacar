@@ -512,12 +512,16 @@ def _issue(args, action: Action) -> int:
         store.save_state(state)
 
     # Record plaintext ledger for any locally-issued op with known plaintext.
+    # §13.6: first_seen is the *physical* HLC timestamp (high 48 bits), not
+    # the full 64-bit HLC — matching the JavaScript CLI so ledger.msgpack
+    # stays byte-identical across implementations (§13.11).
     if object_id is not None and relation is not None:
         ledger = store.load_ledger()
+        physical_ms, _ = unpack(hlc)
         ledger.record(
             tup.hash(),
             object_id=object_id, relation=relation,
-            wildcard=bool(wildcard), first_seen=hlc,
+            wildcard=bool(wildcard), first_seen=physical_ms,
         )
         store.save_ledger(ledger)
 
