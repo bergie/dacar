@@ -37,3 +37,13 @@ export const RFED_TOPIC = "dacar.policy.v1";
 
 /** LXMF message title for targeted Delta delivery (§11.2). */
 export const LXMF_DELIVERY_TITLE = "dacar/sync/delta";
+
+/**
+ * LXMF message title for the multi-Delta **batch** envelope (§11.2, work doc
+ * #14). The message content is a msgpack array of §5.3 Delta payloads; every
+ * element is still individually signature-checked at ingest (verify-on-
+ * ingest, §11.2.4) — the envelope is pure packing and adds no trust. A
+ * receiver MUST accept both titles (single for wire compat, batch for chunked
+ * bootstrap/paper transfer).
+ */
+export const LXMF_BATCH_TITLE = "dacar/sync/batch";

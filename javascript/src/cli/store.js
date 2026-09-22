@@ -73,6 +73,7 @@ const SENT_RECORD = "sent.msgpack";
  * @property {number} horizonDays
  * @property {string} rfedTopic
  * @property {Uint8Array | null} [rfedNode]
+ * @property {Uint8Array | null} [lxmfProprietor]
  */
 
 /**
@@ -143,6 +144,7 @@ export class DacarStore {
       horizonDays: opts.horizonDays ?? DEFAULT_DELETION_HORIZON_DAYS,
       rfedTopic: RFED_TOPIC,
       rfedNode: null,
+      lxmfProprietor: null,
     };
     await store.saveConfig(config);
     await store.saveState(new StateVector({ deletionHorizonDays: config.horizonDays }));
@@ -604,6 +606,13 @@ function _encodeConfigIni(config) {
   out += `topic = ${config.rfedTopic}\n`;
   if (config.rfedNode) out += `node = ${toHex(config.rfedNode)}\n`;
   out += "\n";
+  // [lxmf] is written only when a proprietor is set (lazy section, Python
+  // parity — configparser writes sections only when populated).
+  if (config.lxmfProprietor) {
+    out += "[lxmf]\n";
+    out += `proprietor = ${toHex(config.lxmfProprietor)}\n`;
+    out += "\n";
+  }
   return new TextEncoder().encode(out);
 }
 
@@ -641,7 +650,11 @@ function _decodeConfigIni(bytes) {
   const rfed = sections.get("rfed") ?? new Map();
   const rfedTopic = rfed.get("topic") ?? RFED_TOPIC;
   const rfedNode = rfed.has("node") ? _expectHex("node", rfed.get("node"), HASH_SIZE) : null;
-  return { primarySalt, legacySalts, anchors, authoritative, horizonDays, rfedTopic, rfedNode };
+  const lxmf = sections.get("lxmf") ?? new Map();
+  const lxmfProprietor = lxmf.has("proprietor")
+    ? _expectHex("proprietor", lxmf.get("proprietor"), HASH_SIZE)
+    : null;
+  return { primarySalt, legacySalts, anchors, authoritative, horizonDays, rfedTopic, rfedNode, lxmfProprietor };
 }
 
 /**

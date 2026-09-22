@@ -151,3 +151,132 @@ describe("LxmfDeltaDelivery (§11.2, §11.3)", () => {
     assert.equal(contains(paperData, delta), false); // encrypted — no plaintext Delta leak
   });
 });
+
+// ---------------------------------------------------------------------------
+// Batch envelope (§11.2, work doc #14)
+// ---------------------------------------------------------------------------
+
+describe("LXMF batch envelope (§11.2, work doc #14)", () => {
+  const PYTHON_VECTOR_PAYLOADS = Array.from({ length: 5 }, (_, i) =>
+    new Uint8Array(1 + i * 37).fill(i),
+  );
+
+  // The hex constant is minted by the Python reference (encode_batch of the
+  // payloads above) — see the `python-vector` generation note in work doc #14.
+const PYTHON_VECTOR_HEX =
+    "95c40100c4260101010101010101010101010101010101010101010101010101010101010101" +
+    "010101010101c44b020202020202020202020202020202020202020202020202020202020202" +
+    "0202020202020202020202020202020202020202020202020202020202020202020202020202" +
+    "02020202020202c4700303030303030303030303030303030303030303030303030303030303" +
+    "0303030303030303030303030303030303030303030303030303030303030303030303030303" +
+    "0303030303030303030303030303030303030303030303030303030303030303030303030303" +
+    "03030303030303c4950404040404040404040404040404040404040404040404040404040404" +
+    "0404040404040404040404040404040404040404040404040404040404040404040404040404" +
+    "0404040404040404040404040404040404040404040404040404040404040404040404040404" +
+    "0404040404040404040404040404040404040404040404040404040404040404040404040404" +    "040404040404";
+
+  it("encodeBatch is byte-identical with the Python reference", async () => {
+    const { encodeBatch } = await import("../src/transport/lxmfSync.js");
+    assert.equal(
+      toHex(encodeBatch(PYTHON_VECTOR_PAYLOADS)),
+      PYTHON_VECTOR_HEX,
+    );
+  });
+
+  it("decodeBatch accepts the Python-minted vector", async () => {
+    const { decodeBatch } = await import("../src/transport/lxmfSync.js");
+    const decoded = decodeBatch(hexToBytes(PYTHON_VECTOR_HEX));
+    assert.equal(decoded.length, 5);
+    for (let i = 0; i < 5; i++) {
+      assert.deepEqual(decoded[i], PYTHON_VECTOR_PAYLOADS[i]);
+    }
+  });
+
+  it("decodeBatch is strict", async () => {
+    const { decodeBatch } = await import("../src/transport/lxmfSync.js");
+    assert.throws(() => decodeBatch(new Uint8Array(0)));
+    assert.throws(() => decodeBatch(new Uint8Array([0xc0]))); // nil
+    assert.throws(() => decodeBatch(hexToBytes("90"))); // empty array
+    assert.throws(() => decodeBatch(hexToBytes("93010203"))); // int elements
+  });
+
+  it("packChunks is greedy, ordered, and budget-bound", async () => {
+    const { encodeBatch, packChunks } = await import("../src/transport/lxmfSync.js");
+    const payloads = Array.from({ length: 50 }, (_, i) => new Uint8Array(100).fill(i));
+    const chunks = packChunks(payloads, 500);
+    const flat = chunks.flat();
+    assert.equal(flat.length, 50);
+    for (let i = 0; i < 50; i++) assert.deepEqual(flat[i], payloads[i]);
+    assert.ok(chunks.length > 1);
+    for (const c of chunks) assert.ok(encodeBatch(c).length <= 500);
+  });
+
+  it("handleMessage applies every valid batch element (no short-circuit)", async () => {
+    const { encodeBatch } = await import("../src/transport/lxmfSync.js");
+    const issuer = await Identity.generate();
+    const issuerHash = issuer.identityHash;
+    const payloads = [];
+    for (let i = 0; i < 3; i++) {
+      const tuple = await Tuple.fromPlaintext({
+        objectId: `sensor:${i}`, relation: "calibrate", grantee: GRANTEE,
+        issuer: issuerHash, hasher: HASHER,
+      });
+      payloads.push(
+        (await (await new Operation({ tuple, action: Action.GRANT, hlc: packHlc(NOW, 0) }).sign(issuer)).toPayload()),
+      );
+    }
+    const state = new StateVector();
+    const keyring = new Keyring();
+    keyring.registerSingle(issuerHash, await issuer.getPublicKey());
+    const delivery = new LxmfDeltaDelivery({ receiver: new DeltaReceiver(state, keyring) });
+    const applied = await delivery.handleMessage({
+      title: "dacar/sync/batch",
+      content: encodeBatch(payloads),
+    });
+    assert.ok(applied);
+    assert.equal(state.size, 3);
+  });
+
+  it("handleMessage drops malformed batches whole and ignores other titles", async () => {
+    const { encodeBatch } = await import("../src/transport/lxmfSync.js");
+    const state = new StateVector();
+    const delivery = new LxmfDeltaDelivery({ receiver: new DeltaReceiver(state, new Keyring()) });
+    assert.equal(await delivery.handleMessage({ title: "dacar/sync/batch", content: new Uint8Array([1, 2, 3]) }), false);
+    assert.equal(await delivery.handleMessage({ title: "dacar/sync/batch", content: new Uint8Array(0) }), false);
+    assert.equal(await delivery.handleMessage({ title: "chat/hello", content: encodeBatch([new Uint8Array(4)]) }), false);
+    assert.equal(state.size, 0);
+  });
+
+  it("packPaperUris keeps every paper payload within PAPER_MDU", async () => {
+    const { packPaperUris } = await import("../src/transport/lxmfSync.js");
+    const { LXMessage, LXMFConstants } = await import("@reticulum/lxmf");
+    const source = await Identity.generate();
+    const recipient = await Identity.generate();
+    // Recipient OUT destination for encryption (no router needed).
+    const outboundDestination = await Destination.OUT(
+      "lxmf.delivery", DestType.SINGLE, recipient, null,
+    );
+    const payloads = Array.from({ length: 40 }, (_, i) => new Uint8Array(170).fill(i));
+    const uris = await packPaperUris(payloads, outboundDestination.destinationHash, {
+      sourceIdentity: source, outboundDestination,
+    });
+    assert.ok(uris.length > 1, "40 deltas must spill to multiple QRs");
+    for (const uri of uris) {
+      assert.ok(uri.startsWith("lxm://"));
+      const paperData = LXMessage.paperDataFromUri(uri);
+      assert.ok(paperData.length <= LXMFConstants.PAPER_MDU);
+    }
+  });
+});
+
+/** @param {string} hex @returns {Uint8Array} */
+function hexToBytes(hex) {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  return out;
+}
+
+/** @param {Uint8Array} bytes @returns {string} */
+function toHex(bytes) {
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}

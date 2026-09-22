@@ -178,6 +178,9 @@ def cmd_config_show(args) -> int:
     _err(f"  topic : {raw.get('rfed_topic', RFED_TOPIC)}")
     node = raw.get("rfed_node")
     _err(f"  node  : {render_identity(node, aliases, full=full) if node else '(not set)'}")
+    _err("[lxmf]")
+    proprietor = raw.get("lxmf_proprietor")
+    _err(f"  proprietor : {render_identity(proprietor, aliases, full=full) if proprietor else '(not set)'}")
     _err(f"[aliases] {len(aliases.entries)} entries ({store.aliases_path})")
     if raw["primary_salt"] == DEFAULT_SALT:
         _err("WARNING: primary salt is the default null (§3.3 fail-open on privacy).")
@@ -555,7 +558,7 @@ def _issue(args, action: Action) -> int:
         _err("  (not applied locally: --no-apply)")
     elif applied:
         _err("  (applied locally)")
-    if getattr(args, "publish", False):
+    if getattr(args, "publish", False) or getattr(args, "lxmf", None):
         # Durability (work doc #11): enqueue the signed payload to the outbox
         # *before* the risky network send, so it survives a crash or failed
         # transport and can be retried via ``publish --outbox``. On send it
@@ -564,8 +567,19 @@ def _issue(args, action: Action) -> int:
         outbox = store.load_outbox()
         outbox.append(payload)
         store.save_outbox(outbox)
-        accepted = _publish_delta(args, store, identity, [payload])
-        _record_publish(store, [payload], accepted, record_to_sent=True)
+        lxmf_target = getattr(args, "lxmf", None)
+        if lxmf_target:
+            # --lxmf (§11.2, work doc #14): targeted delivery to one recipient
+            # via the proprietor. With --publish *both* transports run (rfed
+            # broadcast + targeted LXMF); alone, --lxmf is LXMF-only.
+            accepted = _lxmf_publish_delta(args, store, identity, [payload])
+            _record_publish(store, [payload], accepted, record_to_sent=True)
+            if getattr(args, "publish", False):
+                accepted = _publish_delta(args, store, identity, [payload])
+                _record_publish(store, [payload], accepted, record_to_sent=True)
+        else:
+            accepted = _publish_delta(args, store, identity, [payload])
+            _record_publish(store, [payload], accepted, record_to_sent=True)
         if accepted and accepted[0]:
             _err("  (published + logged to sent box)")
         else:
@@ -608,6 +622,241 @@ def _read_payload_input(path: str, force_binary: bool) -> bytes:
     if text and len(text) % 2 == 0 and all(c in "0123456789abcdefABCDEF" for c in text):
         return bytes.fromhex(text)
     return data
+
+
+# -- paper messages (§11.3, work doc #14) ---------------------------------
+
+
+def _paper_source_payloads(args, store: Store) -> List[bytes]:
+    """Select the Delta payload(s) a ``paper export`` packs (work doc #14).
+
+    ``--payload`` takes precedence (an explicit hex blob or file, read with the
+    same auto-detect as ``apply``); then the store flags -- ``--outbox``/
+    ``--sent``/``--all`` select those stores wholesale; the default is the
+    newest outbox Delta, falling back to the newest sent (the common
+    "re-deliver this one grant to an air-gapped node" case). Deduplicated by
+    exact bytes, first-seen order preserved.
+    """
+    if args.payload is not None:
+        p = args.payload
+        data = Path(p).read_bytes() if Path(p).exists() else _read_payload_input(p, args.binary)
+        if not data:
+            raise CliError(f"empty payload: {p}")
+        return [data]
+    outbox = [bytes(x) for x in store.load_outbox()]
+    sent = [bytes(x) for x in store.load_sent()]
+    if args.all:
+        selected = outbox + sent
+    elif args.outbox:
+        selected = outbox
+    elif args.sent:
+        selected = sent
+    else:
+        selected = (outbox or sent)[-1:]
+    if not selected:
+        raise CliError(
+            "nothing to export (outbox/sent empty; use --payload <hex|file>)"
+        )
+    seen: set = set()
+    deduped: List[bytes] = []
+    for payload in selected:
+        if payload not in seen:
+            seen.add(payload)
+            deduped.append(payload)
+    return deduped
+
+
+def _paper_manifest(payloads: List[bytes], target: bytes, chunks: int) -> dict:
+    """Build the advisory completeness manifest for a paper export.
+
+    Unsigned by design (work doc #14): a tampered manifest can at worst report
+    false-missing, never false-accept — every Delta passes per-element
+    Ed25519 verify-on-ingest regardless. Digests key on the exact signed bytes.
+    """
+    import hashlib
+
+    digests = [hashlib.sha256(p).hexdigest() for p in payloads]
+    return {
+        "version": 1,
+        "target": target.hex(),
+        "chunks": chunks,
+        "delta_count": len(payloads),
+        "delta_digests": digests,
+        "set_digest": hashlib.sha256(b"".join(bytes(p) for p in payloads)).hexdigest(),
+    }
+
+
+def cmd_paper_export(args) -> int:
+    """``dacar paper export`` — pack Delta(s) as §11.3 Paper Message URI(s).
+
+    Emits one ``lxm://`` URI per paper message (greedy batch packing up to the
+    paper MDU ≈ a dozen typical Deltas per QR; a larger set spills to several
+    URIs — the normal case, chunks are unordered and independently
+    verifiable). URIs go to stdout (one per line), ``--file`` collects them
+    into one artifact, or ``--out-dir`` writes ``chunk-NNN.txt`` per QR.
+    ``--manifest`` writes the advisory completeness JSON sidecar. The QR
+    rendering itself is out of scope — any QR tool handles the URI.
+    """
+    import json
+
+    from dacar.cli.lxmf import lxmf_out_destination
+    from dacar.cli.rns import boot
+    from dacar.transport.lxmf_sync import (
+        LxmfDeltaDelivery,
+        pack_paper_messages,
+    )
+
+    store = Store(args.store, identity_override=args.identity)
+    store.ensure()
+    aliases = store.load_aliases()
+    identity = store.load_identity()
+    if identity is None:
+        raise CliError("no signing identity (run `dacar init` or `dacar identity new`)")
+
+    payloads = _paper_source_payloads(args, store)
+    target = resolve_identity(args.target, aliases)
+
+    boot(_resolve_rns_config_dir(args))
+    try:
+        destination = lxmf_out_destination(target)
+    except ValueError as exc:
+        raise CliError(str(exc)) from exc
+    import RNS
+
+    source = RNS.Destination(
+        identity, RNS.Destination.OUT, RNS.Destination.SINGLE, "lxmf", "delivery"
+    )
+
+    delivery = LxmfDeltaDelivery()
+    if len(payloads) == 1:
+        messages = [delivery.make_paper_message(payloads[0], destination, source)]
+    else:
+        try:
+            messages = pack_paper_messages(payloads, destination, source)
+        except TypeError as exc:
+            raise CliError(f"paper export: {exc}") from exc
+    uris = [m.as_uri() for m in messages]
+
+    if args.out_dir is not None:
+        out_dir = Path(args.out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for i, uri in enumerate(uris, start=1):
+            (out_dir / f"chunk-{i:03d}.txt").write_text(uri + "\n")
+        _err(f"  wrote {len(uris)} chunk file(s) to {out_dir}")
+    elif args.file is not None:
+        Path(args.file).write_text("\n".join(uris) + "\n")
+        _err(f"  wrote {len(uris)} URI(s) to {args.file}")
+    else:
+        for uri in uris:
+            print(uri)
+
+    manifest = _paper_manifest(payloads, target, len(uris))
+    if args.manifest is not None:
+        Path(args.manifest).write_text(json.dumps(manifest, indent=2) + "\n")
+    _err(
+        f"✔ exported {len(payloads)} delta(s) as {len(uris)} paper message(s) "
+        f"to {_short(target, full=args.full_hashes)}"
+        + (f" (manifest: {args.manifest})" if args.manifest else "")
+    )
+    return EXIT_OK
+
+
+def cmd_paper_import(args) -> int:
+    """``dacar paper import`` — apply scanned Paper Message URI(s) (§11.3).
+
+    Accepts ``lxm://`` URI strings, files containing newline-separated URIs
+    (as emitted by ``paper export --file``/``--out-dir``), or ``-`` for stdin.
+    Chunks are unordered and idempotent (CRDT merge); every decrypted payload
+    passes verify-on-ingest exactly like any other transport. ``--manifest``
+    checks advisory completeness (applied vs missing digests). This node must
+    own the delivery identity the export targeted.
+    """
+    import json
+
+    from dacar.cli.lxmf import boot_lxmf_router, uri_to_paper_bytes
+    from dacar.cli.rns import boot
+    from dacar.transport.lxmf_sync import LxmfDeltaDelivery
+    from dacar.transport.rns_identity import RnsIdentityResolver
+
+    store = Store(args.store, identity_override=args.identity)
+    store.ensure()
+    config = store.load_config()
+    identity = store.load_identity()
+    if identity is None:
+        raise CliError("no signing identity (run `dacar init` or `dacar identity new`)")
+
+    uris: List[str] = []
+    for item in args.inputs:
+        if item == "-":
+            uris.extend(sys.stdin.read().splitlines())
+        elif item.lower().startswith("lxm://"):
+            uris.append(item.strip())
+        else:
+            uris.extend(Path(item).read_text().splitlines())
+    uris = [u.strip() for u in uris if u.strip() and not u.strip().startswith("#")]
+    if not uris:
+        raise CliError("no lxm:// URIs given (pass URIs, files, or - for stdin)")
+
+    boot(_resolve_rns_config_dir(args))
+    keyring = store.load_keyring()
+    keyring.register_single(identity.hash, identity.sig_pub_bytes)
+    state = store.load_state(config)
+    resolver = RnsIdentityResolver(fallback=keyring)
+    rx = DeltaReceiver(state, resolver)
+
+    # Record the exact bytes that applied so the manifest check can tell
+    # applied from missing (verify-on-ingest is untouched — this only observes).
+    applied_payloads: List[bytes] = []
+    _apply = rx.apply_payload
+
+    def _recording_apply(payload, **kwargs):
+        ok = _apply(payload, **kwargs)
+        if ok:
+            applied_payloads.append(bytes(payload))
+        return ok
+
+    rx.apply_payload = _recording_apply
+
+    router = boot_lxmf_router(identity, store.path)
+    delivery = LxmfDeltaDelivery(receiver=rx, router=router)
+    router.register_delivery_callback(delivery.handle_delivery)
+
+    ingested = 0
+    for uri in uris:
+        try:
+            paper = uri_to_paper_bytes(uri)
+        except ValueError as exc:
+            _err(f"  ⚠ skipping invalid URI: {exc}")
+            continue
+        # ingest_paper routes through the registered delivery callback →
+        # handle_delivery (title filter) → verify-on-ingest. Unknown-recipient
+        # or duplicate messages return falsy without error.
+        if delivery.ingest_paper(paper):
+            ingested += 1
+
+    if applied_payloads:
+        store.save_state(state)
+    store.save_keyring(keyring)
+
+    _err(
+        f"✔ imported {len(applied_payloads)} delta(s) "
+        f"from {ingested}/{len(uris)} paper message(s)"
+    )
+
+    if args.manifest is not None:
+        import hashlib
+
+        manifest = json.loads(Path(args.manifest).read_text())
+        applied_digests = {hashlib.sha256(p).hexdigest() for p in applied_payloads}
+        missing = [d for d in manifest.get("delta_digests", []) if d not in applied_digests]
+        if missing:
+            _err(
+                f"  ⚠ manifest: {len(missing)} of {manifest.get('delta_count', '?')} "
+                "delta(s) missing — scan/import the remaining chunk(s)"
+            )
+        else:
+            _err("  manifest: complete — all exported delta(s) applied")
+    return EXIT_OK
 
 
 def cmd_apply(args) -> int:
@@ -1114,6 +1363,28 @@ def _resolve_topic(args, store: Store) -> str:
     return raw.get("rfed_topic", RFED_TOPIC)
 
 
+def _resolve_lxmf_proprietor(args, store: Store, aliases: AliasRegistry):
+    """Resolve the LXMF proprietor from --proprietor or [lxmf] config (§11.2).
+
+    The proprietor (LXMF propagation node) is the store-and-forward queue both
+    send legs (outbound propagation) and the receive leg (sync) talk to.
+    Returns ``None`` when unconfigured.
+    """
+    value = getattr(args, "proprietor", None)
+    if value:
+        return resolve_identity(value, aliases)
+    raw = store.load_config_raw()
+    return raw.get("lxmf_proprietor")
+
+
+def _resolve_lxmf_target(args, store: Store, aliases: AliasRegistry) -> bytes:
+    """Resolve the recipient ``lxmf.delivery`` hash from --lxmf (hash|alias)."""
+    value = getattr(args, "lxmf", None)
+    if not value:
+        raise CliError("no LXMF target given (use --lxmf <hash|alias>)")
+    return resolve_identity(value, aliases)
+
+
 def _resolve_rns_config_dir(args) -> str:
     """Resolve the RNS config directory per the priority order (work doc #4)."""
     from dacar.cli.rns import resolve_config_dir
@@ -1282,6 +1553,55 @@ def _publish_delta(args, store: Store, identity, payloads: List[bytes]) -> List[
     return accepted
 
 
+def _lxmf_publish_delta(args, store: Store, identity, payloads: List[bytes]) -> List[bool]:
+    """Online LXMF delivery hook for ``--lxmf`` paths (§11.2, work doc #14).
+
+    Boots RNS **once**, announces the node identity (the announce invariant is
+    *load-bearing* for LXMF: receiving nodes recall the issuer from the
+    announce store — §11.2.4), seeds the durable keyring, then pushes the
+    Deltas to one recipient via the proprietor (PROPAGATED, store-and-forward;
+    ``--direct`` opts into opportunistic direct delivery). Multi-Delta sends
+    batch into as few messages as possible. Returns a per-Delta list of
+    transport-acceptance flags for :func:`_record_publish` (work doc #11 — same
+    outbox → sent-box lifecycle regardless of transport). This is the seam
+    tests patch with a fake router.
+    """
+    from dacar.cli.lxmf import boot_lxmf_router, run_lxmf_publish
+    from dacar.cli.rns import announce_identity, boot, register_announce_handler
+    from dacar.transport.lxmf_sync import LxmfDeltaDelivery
+
+    aliases = store.load_aliases()
+    rns = boot(_resolve_rns_config_dir(args))
+    announce_identity(identity)  # announce invariant (§11.2.4)
+
+    # Durable issuer cache (work doc #5): same seeding as the rfed publish leg.
+    keyring = store.load_keyring()
+    keyring.register_single(identity.hash, identity.sig_pub_bytes)
+    register_announce_handler(keyring, on_save=store.save_keyring)
+    store.save_keyring(keyring)
+
+    target = _resolve_lxmf_target(args, store, aliases)
+    proprietor = _resolve_lxmf_proprietor(args, store, aliases)
+    router = boot_lxmf_router(identity, store.path)
+    delivery = LxmfDeltaDelivery()
+    accepted, messages = run_lxmf_publish(
+        list(payloads),
+        target,
+        proprietor,
+        router,
+        delivery,
+        direct=bool(getattr(args, "direct", False)),
+    )
+    total = len(payloads)
+    sent = sum(1 for ok in accepted if ok)
+    method = "direct link" if getattr(args, "direct", False) else "proprietor"
+    _err(f"  sent {sent}/{total} delta(s) in {messages} LXMF message(s) via {method} "
+         f"to {_short(target, full=args.full_hashes)}")
+    if sent < total:
+        _err("  ⚠ failed delta(s) retained in the outbox for retry (`dacar publish --outbox`)")
+    return accepted
+
+
 def _record_publish(
     store: Store,
     payloads: List[bytes],
@@ -1327,15 +1647,18 @@ def _record_publish(
 
 
 def cmd_sync(args) -> int:
-    """``dacar sync`` — pull pending Deltas from the rfed channel (§11.1).
+    """``dacar sync`` — pull pending Deltas from rfed and/or LXMF (§11.1/§11.2).
 
-    One-shot: attach-or-spawn RNS, announce the node identity, subscribe +
-    pull (drain to empty), route every blob through verify-on-ingest, persist
-    the CRDT, exit. No daemon — store-and-forward means transient online windows
-    suffice (work doc #4).
+    One-shot: attach-or-spawn RNS, announce the node identity, then drain
+    everything that arrived while offline — rfed channel first (subscribe +
+    pull to empty), then LXMF proprietor sync (``request_messages_from_
+    propagation_node``) when one is configured ([lxmf] proprietor, or
+    ``--lxmf``/``--proprietor``; ``--no-lxmf`` skips). Every blob routes
+    through verify-on-ingest; persist the CRDT, exit. No daemon —
+    store-and-forward means transient online windows suffice (work doc #4,
+    #14). An LXMF-only deployment (no rfed node) skips the rfed leg.
     """
     from dacar.cli.rns import announce_identity, boot, ensure_node_identity, register_announce_handler
-    from rfed.client import RFedClient
     from dacar.transport.rns_identity import RnsIdentityResolver
 
     store = Store(args.store, identity_override=args.identity)
@@ -1348,6 +1671,16 @@ def cmd_sync(args) -> int:
         raise CliError("no signing identity (run `dacar init` or `dacar identity new`)")
 
     topic = _resolve_topic(args, store)
+
+    # LXMF leg resolution (work doc #14): runs when a proprietor is configured
+    # or forced with --lxmf (needs --proprietor / [lxmf] proprietor config);
+    # --no-lxmf disables. Auto-when-configured resolves doc #4's open item.
+    lxmf_proprietor = None if getattr(args, "no_lxmf", False) else _resolve_lxmf_proprietor(args, store, aliases)
+    if getattr(args, "lxmf", False) and lxmf_proprietor is None:
+        raise CliError(
+            "--lxmf given but no proprietor configured "
+            "(use --proprietor <hash> or set [lxmf] proprietor in config)"
+        )
 
     # Boot RNS + announce (announce invariant, §11.2.4).
     config_dir = _resolve_rns_config_dir(args)
@@ -1364,24 +1697,60 @@ def cmd_sync(args) -> int:
     register_announce_handler(keyring, on_save=store.save_keyring)
 
     state = store.load_state(config)
-    node_hash = _resolve_rfed_node(args, store, aliases, rns)
-    # Proactively fetch the rfed node's identity: when --node is given (or
-    # --discover derived it), the destination's announce may not yet be in
-    # RNS's recall store. Send a path? request and wait for the announce
-    # rather than failing with "wait for its announce" (work doc #6).
-    ensure_node_identity(
-        node_hash, on_request=lambda: _err("  requesting rfed node identity…")
-    )
+
+    # rfed leg. Optional when the LXMF leg is available (an LXMF-only
+    # deployment has no rfed node); otherwise the unresolvable node is the
+    # error it always was.
+    node_hash = None
+    try:
+        node_hash = _resolve_rfed_node(args, store, aliases, rns)
+    except CliError:
+        if lxmf_proprietor is None:
+            raise
+        _err("  (no rfed node configured — rfed leg skipped, LXMF only)")
+
     resolver = RnsIdentityResolver(fallback=keyring)
     rx = DeltaReceiver(state, resolver)
 
-    client = RFedClient(identity=identity, rns=rns)
-    applied = run_sync(store, state, node_hash, topic, client, rx, verbose=True)
+    applied = 0
+    if node_hash is not None:
+        from rfed.client import RFedClient
+
+        # Proactively fetch the rfed node's identity: when --node is given (or
+        # --discover derived it), the destination's announce may not yet be in
+        # RNS's recall store. Send a path? request and wait for the announce
+        # rather than failing with "wait for its announce" (work doc #6).
+        ensure_node_identity(
+            node_hash, on_request=lambda: _err("  requesting rfed node identity…")
+        )
+
+        client = RFedClient(identity=identity, rns=rns)
+        applied = run_sync(store, state, node_hash, topic, client, rx, verbose=True)
+
+    # LXMF leg (§11.2.3 wake → pull → decrypt → apply, work doc #14).
+    if lxmf_proprietor is not None:
+        from dacar.cli.lxmf import boot_lxmf_router, run_lxmf_sync
+        from dacar.transport.lxmf_sync import LxmfDeltaDelivery
+
+        router = boot_lxmf_router(identity, store.path)
+        delivery = LxmfDeltaDelivery(receiver=rx)
+        try:
+            applied_lxmf = run_lxmf_sync(
+                rx, identity, lxmf_proprietor, router, delivery, verbose=True
+            )
+        except RuntimeError as exc:
+            _err(f"  ⚠ LXMF sync failed: {exc}")
+            applied_lxmf = 0
+        if applied_lxmf > 0:
+            applied += applied_lxmf
+            store.save_state(state)
+        _err(f"  LXMF: {applied_lxmf} delta(s) applied from proprietor")
 
     # Persist the keyring if any announces were observed during the window.
     store.save_keyring(keyring)
 
-    _err(f"✔ synced: applied {applied} delta(s) from rfed channel {topic!r}")
+    _err(f"✔ synced: applied {applied} delta(s)"
+         + (f" from rfed channel {topic!r}" if node_hash is not None else ""))
     return EXIT_OK
 
 
@@ -1491,7 +1860,14 @@ def cmd_publish(args) -> int:
         label_parts.append(f"{len(files)} file(s)")
     _err(f"  publishing {len(to_publish)} delta(s) ({' + '.join(label_parts)})")
 
-    accepted = _publish_delta(args, store, identity, to_publish)
+    if getattr(args, "lxmf", None):
+        # --lxmf <hash|alias> (§11.2, work doc #14): directed store-and-forward
+        # delivery to one recipient via the proprietor instead of the rfed
+        # broadcast — the bootstrap path (``publish --sent --lxmf new-node``).
+        # The rfed leg is untouched: run ``publish`` without ``--lxmf`` for it.
+        accepted = _lxmf_publish_delta(args, store, identity, to_publish)
+    else:
+        accepted = _publish_delta(args, store, identity, to_publish)
     n_sent = _record_publish(store, to_publish, accepted, record_to_sent=record_to_sent)
 
     if use_outbox and not files:

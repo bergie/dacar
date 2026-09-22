@@ -38,8 +38,9 @@
  * await delivery.handleMessage(event.detail.message);
  */
 
-import { LXMessage as LXMFMessage } from "@reticulum/lxmf";
-import { LXMF_DELIVERY_TITLE } from "../naming.js";
+import { LXMessage as LXMFMessage, LXMFConstants } from "@reticulum/lxmf";
+import { MsgPack } from "@reticulum/core";
+import { LXMF_BATCH_TITLE, LXMF_DELIVERY_TITLE } from "../naming.js";
 
 /**
  * Best-effort title of an LXMF message as text.
@@ -81,6 +82,89 @@ export function messageContent(message) {
   if (typeof c === "string") return new TextEncoder().encode(c);
   return new Uint8Array(0);
 }
+
+// -- §11.2 batch envelope (work doc #14) ----------------------------------
+
+/**
+ * Encode signed Delta payloads as one batch envelope (§11.2, work doc #14).
+ *
+ * The wire format is the msgpack array `[payload, …]` (each element the exact
+ * signed §5.3 bytes, `bin` on the wire) under the fixed title
+ * {@link LXMF_BATCH_TITLE} — byte-identical with the Python reference's
+ * `encode_batch`. Pure packing: every element keeps its own signature and is
+ * verified individually at ingest.
+ * @param {Uint8Array[]} payloads
+ * @returns {Uint8Array}
+ */
+export function encodeBatch(payloads) {
+  return MsgPack.encode(payloads.map((p) => new Uint8Array(p)));
+}
+
+/**
+ * Decode a batch envelope into its Delta payloads.
+ *
+ * Strict: the content must be a msgpack array of binary payloads. Throws
+ * `Error` for anything else (not msgpack, not an array, non-binary elements)
+ * so {@link LxmfDeltaDelivery.handleMessage} can drop a malformed batch whole
+ * without ever crashing the transport.
+ * @param {Uint8Array | string} content
+ * @returns {Uint8Array[]}
+ */
+export function decodeBatch(content) {
+  const bytes = content instanceof Uint8Array ? content : new Uint8Array(content);
+  let decoded;
+  try {
+    decoded = MsgPack.decode(bytes);
+  } catch (e) {
+    throw new Error(`batch content is not msgpack: ${e}`);
+  }
+  if (!Array.isArray(decoded) || decoded.length === 0) {
+    throw new Error("batch content must be a non-empty msgpack array");
+  }
+  if (!decoded.every((p) => p instanceof Uint8Array)) {
+    throw new Error("batch elements must be binary payloads");
+  }
+  return decoded;
+}
+
+/**
+ * Greedily split payloads into chunks whose *encoded* batch fits `maxBytes`.
+ *
+ * Each chunk satisfies `encodeBatch(chunk).length <= maxBytes`; payloads stay
+ * in order and are never split. A single payload whose encoded batch exceeds
+ * `maxBytes` becomes an (oversized) singleton chunk — the caller checks the
+ * transport limit (e.g. paper packing throws on `PAPER_MDU` overflow).
+ * @param {Uint8Array[]} payloads
+ * @param {number} maxBytes
+ * @returns {Uint8Array[][]}
+ */
+export function packChunks(payloads, maxBytes) {
+  /** @type {Uint8Array[][]} */
+  const chunks = [];
+  /** @type {Uint8Array[]} */
+  let current = [];
+  for (const payload of payloads) {
+    const candidate = [...current, new Uint8Array(payload)];
+    if (current.length && encodeBatch(candidate).length > maxBytes) {
+      chunks.push(current);
+      current = [new Uint8Array(payload)];
+    } else {
+      current = candidate;
+    }
+  }
+  if (current.length) chunks.push(current);
+  return chunks;
+}
+
+/**
+ * Conservative content budget for paper chunks: `PAPER_MDU` minus the fixed
+ * paper overhead measured against the reference LXMF (16 B destination prefix
+ * + ~92 B identity encryption + ~127 B LXM msgpack framing ≈ 235 B; ratchets
+ * shift it slightly, which `packPaperUris` absorbs by halving).
+ * Cross-implementation chunk *boundaries* are irrelevant — only the batch
+ * codec must interop — so a conservative budget is safe.
+ */
+export const PAPER_CONTENT_BUDGET = LXMFConstants.PAPER_MDU - 240;
 
 /**
  * §11.2 targeted Delta delivery over LXMF; §11.3 Paper Message channel.
@@ -157,6 +241,28 @@ export class LxmfDeltaDelivery {
     return message;
   }
 
+  /**
+   * Builds an LXMF message wrapping multiple Deltas (batch envelope, §11.2,
+   * work doc #14).
+   *
+   * Content is {@link encodeBatch} of `payloads` under the fixed title
+   * `dacar/sync/batch`. Callers pre-chunk with {@link packChunks} so the
+   * encoded content fits the transport limit. The message is *not yet sent*;
+   * submit it to a propagation node or send it like any other.
+   * @param {Uint8Array[]} payloads
+   * @param {Uint8Array} destinationHash The recipient `lxmf.delivery` hash.
+   * @param {Uint8Array} sourceHash The sender's `lxmf.delivery` hash.
+   * @returns {import("@reticulum/lxmf").LXMessage}
+   */
+  makeBatchMessage(payloads, destinationHash, sourceHash) {
+    return new LXMFMessage({
+      destinationHash,
+      sourceHash,
+      content: encodeBatch(payloads),
+      title: LXMF_BATCH_TITLE,
+    });
+  }
+
   // -- §11.2 receive -----------------------------------------------------
 
   /**
@@ -171,9 +277,25 @@ export class LxmfDeltaDelivery {
    * @returns {Promise<boolean>}
    */
   async handleMessage(message) {
-    if (messageTitle(message) !== LxmfDeltaDelivery.TITLE) return false;
+    const title = messageTitle(message);
+    if (title !== LxmfDeltaDelivery.TITLE && title !== LXMF_BATCH_TITLE) {
+      return false;
+    }
     if (!this._receiver) {
       throw new Error("LxmfDeltaDelivery.handleMessage requires a receiver");
+    }
+    if (title === LXMF_BATCH_TITLE) {
+      let payloads;
+      try {
+        payloads = decodeBatch(messageContent(message));
+      } catch {
+        return false; // malformed batch: dropped whole, never crashes
+      }
+      // Apply EVERY element (no short-circuit: a batch is not satisfied by
+      // its first good delta) and report whether any applied.
+      const results = [];
+      for (const p of payloads) results.push(await this._receiver.applyPayload(p));
+      return results.some((ok) => ok);
     }
     return this._receiver.applyPayload(messageContent(message));
   }
@@ -202,6 +324,24 @@ export class LxmfDeltaDelivery {
   }
 
   /**
+   * Builds a §11.3 Paper Message URI wrapping a *chunk* of Deltas (work doc
+   * #14): the batch envelope encrypted to the recipient, as one `lxm://` URI
+   * (one QR). Pre-chunk with {@link packChunks} under
+   * {@link PAPER_CONTENT_BUDGET}. Throws when the packed paper payload
+   * exceeds `PAPER_MDU`.
+   * @param {Uint8Array[]} payloads
+   * @param {Uint8Array} destinationHash The recipient `lxmf.delivery` hash.
+   * @param {Object} opts
+   * @param {import("@reticulum/core").Identity} opts.sourceIdentity
+   * @param {import("@reticulum/core").Destination} opts.outboundDestination
+   * @returns {Promise<string>} The `lxm://` paper URI.
+   */
+  async makeBatchPaperUri(payloads, destinationHash, { sourceIdentity, outboundDestination }) {
+    const message = this.makeBatchMessage(payloads, destinationHash, sourceIdentity.identityHash);
+    return message.toPaperUri(sourceIdentity, outboundDestination);
+  }
+
+  /**
    * Feeds a scanned Paper Message URI back through the bound router (§11.3).
    *
    * The router decrypts it (it must own the delivery Identity) and dispatches
@@ -218,4 +358,48 @@ export class LxmfDeltaDelivery {
     }
     return this._router.ingestUri(uri);
   }
+}
+
+/**
+ * Split payloads into as few paper URIs as the paper MDU allows (§11.3, work
+ * doc #14): greedy {@link packChunks} packing under
+ * {@link PAPER_CONTENT_BUDGET}, then an adaptive pass — any chunk whose
+ * packed paper payload exceeds `PAPER_MDU` (ratchets change the encryption
+ * overhead) is halved and retried until every chunk fits. A lone payload
+ * that still exceeds the MDU propagates the `TypeError`. Returns the list of
+ * `lxm://` URIs (one per QR), unordered and independently verifiable.
+ *
+ * @param {Uint8Array[]} payloads
+ * @param {Uint8Array} destinationHash The recipient `lxmf.delivery` hash.
+ * @param {Object} opts
+ * @param {import("@reticulum/core").Identity} opts.sourceIdentity
+ * @param {import("@reticulum/core").Destination} opts.outboundDestination
+ * @returns {Promise<string[]>}
+ */
+export async function packPaperUris(payloads, destinationHash, { sourceIdentity, outboundDestination }) {
+  const delivery = new LxmfDeltaDelivery();
+
+  /** @param {Uint8Array[]} chunk @returns {Promise<string[]>} */
+  async function build(chunk) {
+    try {
+      return [
+        await delivery.makeBatchPaperUri(chunk, destinationHash, { sourceIdentity, outboundDestination }),
+      ];
+    } catch (e) {
+      if (!(e instanceof TypeError)) throw e;
+      if (chunk.length === 1) throw e;
+      const mid = Math.floor(chunk.length / 2);
+      return [
+        ...(await build(chunk.slice(0, mid))),
+        ...(await build(chunk.slice(mid))),
+      ];
+    }
+  }
+
+  /** @type {string[]} */
+  const uris = [];
+  for (const chunk of packChunks(payloads, PAPER_CONTENT_BUDGET)) {
+    uris.push(...(await build(chunk)));
+  }
+  return uris;
 }

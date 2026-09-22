@@ -66,6 +66,19 @@ def _add_online_flags(parser: argparse.ArgumentParser) -> None:
                         help=f"rfed channel topic (default: {RFED_TOPIC!r} or [rfed] topic in config)")
     parser.add_argument("--rns-config", default=None,
                         help="RNS config directory (default: ~/.reticulum or $DACAR_RNS_CONFIG)")
+    parser.add_argument("--proprietor", default=None,
+                        help="LXMF propagation node hash or alias (default: [lxmf] proprietor in config)")
+
+
+def _add_lxmf_flags(parser: argparse.ArgumentParser) -> None:
+    """Flags for the targeted-LXMF send paths (§11.2, work doc #14)."""
+    parser.add_argument("--lxmf", default=None, metavar="TARGET",
+                        help="deliver to one recipient's lxmf.delivery hash or alias "
+                             "via the proprietor (store-and-forward, §11.2) "
+                             "instead of the rfed broadcast")
+    parser.add_argument("--direct", action="store_true",
+                        help="LXMF: opportunistic direct link delivery instead of "
+                             "propagation (target must be reachable now)")
 
 
 def _store_path(args) -> str:
@@ -164,12 +177,21 @@ def build_parser() -> argparse.ArgumentParser:
                        help="revoke by exact pre-hashed tuple fields from a file (no salt)")
         p.add_argument("--publish", action="store_true",
                        help="publish the signed Delta to the rfed channel (online, §11.1)")
+        _add_lxmf_flags(p)
         _add_online_flags(p)
         _add_global_flags(p)
         p.set_defaults(func=_cmd_grant if name == "grant" else _cmd_revoke)
 
     # -- sync ---------------------------------------------------------------
-    p = sub.add_parser("sync", help="pull pending Deltas from the rfed channel (online, §11.1)")
+    p = sub.add_parser(
+        "sync",
+        help="pull pending Deltas from the rfed channel and/or the LXMF proprietor "
+             "(online, §11.1/§11.2)",
+    )
+    p.add_argument("--lxmf", action="store_true",
+                   help="force the LXMF proprietor sync leg (needs a proprietor)")
+    p.add_argument("--no-lxmf", action="store_true",
+                   help="skip the LXMF leg even when a proprietor is configured")
     _add_online_flags(p)
     _add_global_flags(p)
     p.set_defaults(func=_cmd_sync)
@@ -189,9 +211,53 @@ def build_parser() -> argparse.ArgumentParser:
                    help="publish outbox + sent box (everything this node has issued)")
     p.add_argument("--binary", action="store_true",
                    help="treat file input as raw binary (skip hex auto-detect)")
+    _add_lxmf_flags(p)
     _add_online_flags(p)
     _add_global_flags(p)
     p.set_defaults(func=_cmd_publish)
+
+    # -- paper messages (§11.3, work doc #14) --------------------------------
+    paper = sub.add_parser(
+        "paper",
+        help="export/import Paper Messages (air-gapped optical transport, §11.3)",
+    )
+    paper_sub = paper.add_subparsers(dest="paper_command", metavar="<subcommand>", required=True)
+    pe = paper_sub.add_parser(
+        "export",
+        help="pack Delta(s) as encrypted lxm:// paper message URI(s)",
+    )
+    pe.add_argument("target", help="recipient lxmf.delivery hash or alias")
+    pe.add_argument("--payload", default=None,
+                    help="explicit Delta payload (hex string or file path) instead of a store source")
+    pe.add_argument("--outbox", action="store_true",
+                    help="export every outbox Delta (not just the newest)")
+    pe.add_argument("--sent", action="store_true",
+                    help="export every sent-box Delta")
+    pe.add_argument("--all", action="store_true",
+                    help="export outbox + sent box (the whole issuance — bootstrap)")
+    pe.add_argument("--file", default=None,
+                    help="write all URIs to one file (newline-separated) instead of stdout")
+    pe.add_argument("--out-dir", default=None,
+                    help="write one chunk-NNN.txt file per paper message")
+    pe.add_argument("--manifest", default=None,
+                    help="write the advisory completeness manifest JSON to this path")
+    pe.add_argument("--binary", action="store_true",
+                    help="treat --payload file input as raw binary (skip hex auto-detect)")
+    _add_online_flags(pe)
+    _add_global_flags(pe)
+    pe.set_defaults(func=_cmd_paper_export)
+    pi = paper_sub.add_parser(
+        "import",
+        help="apply scanned lxm:// paper message URI(s) (verify-on-ingest)",
+    )
+    pi.add_argument("inputs", nargs="+",
+                    metavar="URI|FILE",
+                    help="lxm:// URI strings, files of newline-separated URIs, or - for stdin")
+    pi.add_argument("--manifest", default=None,
+                    help="check advisory completeness against this manifest JSON")
+    _add_online_flags(pi)
+    _add_global_flags(pi)
+    pi.set_defaults(func=_cmd_paper_import)
 
     # -- apply --------------------------------------------------------------
     p = sub.add_parser("apply", help="ingest a received delta payload (verify-on-ingest)")
@@ -427,6 +493,18 @@ def _cmd_publish(args):
     from dacar.cli.commands import cmd_publish
     args.store = _store_path(args)
     return cmd_publish(args)
+
+
+def _cmd_paper_export(args):
+    from dacar.cli.commands import cmd_paper_export
+    args.store = _store_path(args)
+    return cmd_paper_export(args)
+
+
+def _cmd_paper_import(args):
+    from dacar.cli.commands import cmd_paper_import
+    args.store = _store_path(args)
+    return cmd_paper_import(args)
 
 
 def main(argv: Optional[List[str]] = None) -> int:

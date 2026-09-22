@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **LXMF delivery, receiving, and Paper Messages in the CLIs** (work doc
+  #14, §11.2/§11.3) — both implementations:
+  - `grant`/`revoke`/`publish` gain `--lxmf <hash|alias>`: one-shot,
+    store-and-forward delivery to one recipient via an LXMF propagation node
+    (new `[lxmf]` config section, `proprietor = <hash>`; `--proprietor`
+    overrides, `--direct` opts into opportunistic direct delivery). The
+    announce invariant is enforced on every online command — load-bearing for
+    LXMF issuer recall, unlike RFed's RTID prelude. Accepted Deltas move
+    outbox → sent box exactly like RFed publishes (doc #11 lifecycle).
+  - `dacar sync` gains an LXMF leg: after the rfed pull, the router
+    (ratchets enabled, state persisted under `<store>/lxmf/`) syncs with the
+    proprietor and routes every message through verify-on-ingest. Runs
+    automatically when a proprietor is configured (`--lxmf` forces,
+    `--no-lxmf` disables); an LXMF-only deployment (no rfed node) now works.
+  - `dacar paper export` / `dacar paper import` (§11.3): multi-Delta
+    `lxm://` Paper Message URIs, greedy chunk packing up to the paper MDU
+    (~a dozen typical Deltas per QR; larger sets spill to multiple unordered,
+    idempotent chunks), advisory completeness manifest (`--manifest`), and
+    `--outbox`/`--sent`/`--all`/`--payload` source selection (default: newest
+    outbox Delta, falling back to newest sent — the bootstrap use is
+    `paper export <target> --all`).
+  - New §11.2 **batch envelope** (title `dacar/sync/batch`): a msgpack array
+    of signed Delta payloads under one LXMF message, applied element-wise
+    through the same verify-on-ingest (per-element drops, never
+    all-or-nothing). `SPEC.md` §11.2 amended normatively; receivers accept
+    both titles (single-delta messages keep `dacar/sync/delta` for wire
+    compatibility). Byte-identical codec across implementations, pinned by
+    cross-implementation test vectors.
+
 ### Changed
 - **Python**: the RFed channel client now ships as its own pip package. The
   `dacar.rfed` subpackage (wire constants, channel derivation, LXMF tail

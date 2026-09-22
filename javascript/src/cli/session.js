@@ -443,3 +443,161 @@ export async function discoverRfedNode({ rns, timeout = 30000 }) {
 }
 
 class CliError extends Error {}
+
+// -- LXMF store-and-forward (§11.2/§11.3, work doc #14) ----------------------
+
+/**
+ * Content budget for propagated LXMF batch chunks. Propagation submits travel
+ * as RNS Resources (no single-packet MDU), but chunks stay modest so a
+ * proprietor never buffers one enormous message and a lost transfer is
+ * retried at chunk granularity. Cross-implementation chunk *boundaries* are
+ * irrelevant — only the batch codec must interop.
+ */
+export const LXMF_CHUNK_BUDGET = 16 * 1024;
+
+/**
+ * Create an initialized `LXMRouter` (delivery destination registered, ratchets
+ * enabled per §11.2.1) bound to the given Reticulum. Mirrors Python's
+ * `boot_lxmf_router` (which additionally persists ratchet state under the
+ * store; JS ratchet persistence follows the `StorageAdapter` the caller wired
+ * into `rns`).
+ * @param {Object} opts
+ * @param {import("@reticulum/core").Identity} opts.identity
+ * @param {import("@reticulum/core").Reticulum} opts.rns
+ * @returns {Promise<import("@reticulum/lxmf").LXMRouter>}
+ */
+export async function bootLxmfRouter({ identity, rns }) {
+  const { LXMRouter } = await import("@reticulum/lxmf");
+  const router = new LXMRouter(identity, rns);
+  await router.init();
+  return router;
+}
+
+/**
+ * Recall the recipient's identity and build its OUT `lxmf.delivery`
+ * destination (for paper export). Throws when the destination is unknown —
+ * the sender must have seen (or been told) the recipient's announce first.
+ * @param {import("@reticulum/core").Reticulum} rns
+ * @param {Uint8Array} targetHash The recipient `lxmf.delivery` hash.
+ * @returns {Promise<import("@reticulum/core").Destination>}
+ */
+export async function lxmfOutDestination(rns, targetHash) {
+  const identity = await rns.transport.recallIdentity(new Uint8Array(targetHash));
+  if (!identity) {
+    throw new Error(
+      `unknown LXMF destination ${toHex(targetHash)} — wait for its announce ` +
+        "(run dacar sync) or verify the hash",
+    );
+  }
+  return await Destination.OUT("lxmf.delivery", DestType.SINGLE, identity, rns);
+}
+
+/**
+ * Send signed Deltas to one recipient via LXMF (§11.2, work doc #14).
+ * Testable core: takes an explicit `router`/`delivery` so tests inject
+ * doubles. PROPAGATED by default (store-and-forward via the proprietor;
+ * `direct` is the explicit exception, mirroring Python's `run_lxmf_publish`).
+ *
+ * Batches multiple Deltas into as few messages as `chunkBudget` allows (a
+ * single-Delta send keeps the wire-compatible `dacar/sync/delta` title).
+ * Returns `{ accepted, messages }` — per-Delta transport-acceptance flags in
+ * original order and the message count.
+ *
+ * @param {Object} opts
+ * @param {Uint8Array[]} opts.payloads
+ * @param {Uint8Array} opts.targetHash Recipient `lxmf.delivery` hash.
+ * @param {Uint8Array | null} opts.proprietor Propagation node destination hash.
+ * @param {import("@reticulum/lxmf").LXMRouter} opts.router
+ * @param {import("../transport/lxmfSync.js").LxmfDeltaDelivery} opts.delivery
+ * @param {import("@reticulum/core").Identity} opts.identity The sender identity.
+ * @param {boolean} [opts.direct] Opportunistic direct delivery (default false).
+ * @param {number} [opts.chunkBudget]
+ * @returns {Promise<{ accepted: boolean[], messages: number }>}
+ */
+export async function runLxmfPublish({
+  payloads, targetHash, proprietor, router, delivery, identity,
+  direct = false, chunkBudget = LXMF_CHUNK_BUDGET,
+}) {
+  const { packChunks } = await import("../transport/lxmfSync.js");
+  const sourceHash = identity.identityHash;
+
+  if (!direct) {
+    if (!proprietor) {
+      throw new Error(
+        "no LXMF proprietor configured (use --proprietor <hash> or set " +
+          "[lxmf] proprietor in config) — or pass --direct for opportunistic " +
+          "direct delivery",
+      );
+    }
+    router.setOutboundPropagationNode(new Uint8Array(proprietor));
+  }
+
+  /** @type {boolean[]} */
+  const accepted = [];
+  let messages = 0;
+
+  /**
+   * @param {import("@reticulum/lxmf").LXMessage} message
+   * @param {number} count
+   */
+  const submit = async (message, count) => {
+    if (direct) {
+      await router.send(message, identity);
+    } else {
+      await router.submitToPropagationNode(message, identity);
+    }
+    messages += 1;
+    accepted.push(...new Array(count).fill(true));
+  };
+
+  if (payloads.length === 1) {
+    await submit(delivery.makeMessage(payloads[0], targetHash, sourceHash), 1);
+  } else {
+    for (const chunk of packChunks(payloads, chunkBudget)) {
+      const message = delivery.makeBatchMessage(chunk, targetHash, sourceHash);
+      await submit(message, chunk.length);
+    }
+  }
+  return { accepted, messages };
+}
+
+/**
+ * Pull pending LXMF messages from the proprietor and apply (§11.2.3, work
+ * doc #14). Registers a `message` listener (title filter → shared `delivery`
+ * receiver, verify-on-ingest), asks the proprietor for pending messages, and
+ * awaits the sync. Returns the number of applied Dacar Deltas.
+ *
+ * @param {Object} opts
+ * @param {import("@reticulum/core").Identity} opts.identity
+ * @param {Uint8Array} opts.proprietor
+ * @param {import("@reticulum/lxmf").LXMRouter} opts.router
+ * @param {import("../transport/lxmfSync.js").LxmfDeltaDelivery} opts.delivery
+ * @returns {Promise<number>}
+ */
+export async function runLxmfSync({ identity, proprietor, router, delivery }) {
+  let applied = 0;
+  // EventTarget dispatch is synchronous, but the listener is async (crypto,
+  // verify-on-ingest) — track in-flight work so the returned count is final.
+  /** @type {Set<Promise<void>>} */
+  const inflight = new Set();
+  /** @param {Event & { detail?: { message?: unknown } }} event */
+  const onMessage = (event) => {
+    const message = /** @type {any} */ (event).detail?.message;
+    if (!message) return;
+    const p = (async () => {
+      if (await delivery.handleMessage(message)) applied += 1;
+    })();
+    inflight.add(p);
+    p.finally(() => inflight.delete(p));
+  };
+  router.addEventListener("message", onMessage);
+  try {
+    router.setOutboundPropagationNode(new Uint8Array(proprietor));
+    await router.syncFromPropagationNode(identity);
+    // Drain any listener work still in flight from the last dispatched event.
+    while (inflight.size) await Promise.all([...inflight]);
+  } finally {
+    router.removeEventListener("message", onMessage);
+  }
+  return applied;
+}

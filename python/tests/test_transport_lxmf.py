@@ -25,7 +25,15 @@ from tests._rns_fixture import ensure_headless
 from dacar import Action, DeltaReceiver, Keyring, Operation, StateVector, Tuple
 from dacar.hlc import pack, physical_now_ms
 from dacar.namespace import HASH_SIZE, NamespaceHasher, SALT_SIZE
-from dacar.transport.lxmf_sync import LxmfDeltaDelivery, lxmf_message_content, lxmf_message_title
+from dacar.transport.lxmf_sync import (
+    LxmfDeltaDelivery,
+    decode_batch,
+    encode_batch,
+    lxmf_message_content,
+    lxmf_message_title,
+    pack_chunks,
+    pack_paper_messages,
+)
 
 HASHER = NamespaceHasher(bytes(range(SALT_SIZE)))
 GRANTEE = bytes(range(HASH_SIZE, HASH_SIZE * 2))
@@ -39,9 +47,9 @@ def _identity_hash(priv: Ed25519PrivateKey) -> bytes:
     return hashlib.sha256(priv.public_key().public_bytes_raw()).digest()[:HASH_SIZE]
 
 
-def _op(issuer: bytes, signers=()):
+def _op(issuer: bytes, signers=(), object_id: str = "sensor:wind"):
     t = Tuple.from_plaintext(
-        object_id="sensor:wind", relation="calibrate", grantee=GRANTEE,
+        object_id=object_id, relation="calibrate", grantee=GRANTEE,
         issuer=issuer, hasher=HASHER,
     )
     base = Operation(tuple=t, action=Action.GRANT, hlc=HLC)
@@ -134,6 +142,147 @@ class LxmfDeltaDeliveryTest(unittest.TestCase):
         plain = LxmfDeltaDelivery(receiver=None).make_message(b"delta", dst, src)
         with self.assertRaises(ValueError):
             LxmfDeltaDelivery.paper_bytes(plain)
+
+
+class BatchEnvelopeTest(unittest.TestCase):
+    """The §11.2 batch envelope (title dacar/sync/batch, work doc #14)."""
+
+    @classmethod
+    def setUpClass(cls):
+        ensure_headless()
+
+    def _dst_src(self):
+        dst = RNS.Destination(
+            RNS.Identity(), RNS.Destination.IN, RNS.Destination.SINGLE, "lxmf", "delivery"
+        )
+        src = RNS.Destination(
+            RNS.Identity(), RNS.Destination.OUT, RNS.Destination.SINGLE, "lxmf", "delivery"
+        )
+        return dst, src
+
+    def test_batch_codec_roundtrip(self):
+        payloads = [bytes([i]) * (1 + i * 37) for i in range(16)]
+        encoded = encode_batch(payloads)
+        self.assertEqual(decode_batch(encoded), payloads)
+        # bin on the wire (not str arrays)
+        self.assertTrue(0x90 <= encoded[0] <= 0x9F or encoded[0] == 0xDC)
+
+    def test_decode_batch_strict(self):
+        import msgpack
+
+        for bad in (b"", b"not-msgpack", msgpack.packb("str"), msgpack.packb([]),
+                    msgpack.packb([b"a", 1]), msgpack.packb({b"a": 1})):
+            with self.assertRaises(ValueError):
+                decode_batch(bad)
+
+    def test_pack_chunks_greedy_and_ordered(self):
+        payloads = [bytes([i]) * 100 for i in range(50)]
+        limit = 500
+        chunks = pack_chunks(payloads, limit)
+        flat = [p for c in chunks for p in c]
+        self.assertEqual(flat, payloads)  # order preserved, none lost
+        self.assertGreater(len(chunks), 1)
+        for c in chunks:
+            self.assertLessEqual(len(encode_batch(c)), limit)
+        # Greedy: every chunk except the last is maximal (adding the next
+        # payload would overflow).
+        for i in range(len(chunks) - 1):
+            nxt = payloads[len([p for c in chunks[:i + 1] for p in c])]
+            self.assertGreater(len(encode_batch(chunks[i] + [nxt])), limit)
+
+    def test_batch_message_roundtrips_through_lxmf_wire(self):
+        dst, src = self._dst_src()
+        payloads = [b"delta-a", b"delta-b", b"delta-c"]
+        msg = LxmfDeltaDelivery(receiver=None).make_batch_message(payloads, dst, src)
+        msg.pack()
+        rt = LXMF.LXMessage.unpack_from_bytes(msg.packed)
+        self.assertEqual(lxmf_message_title(rt), "dacar/sync/batch")
+        self.assertEqual(decode_batch(lxmf_message_content(rt)), payloads)
+
+    def test_handle_delivery_batch_applies_elementwise(self):
+        """A batch with one forged element still applies the good ones."""
+        priv = Ed25519PrivateKey.generate()
+        issuer = _identity_hash(priv)
+        good = _op(issuer, signers=(priv,)).to_payload()
+        forged = _op(bytes(HASH_SIZE), signers=(priv,)).to_payload()  # wrong issuer sig
+        state = StateVector()
+        keyring = Keyring().register_single(issuer, priv.public_key().public_bytes_raw())
+        delivery = LxmfDeltaDelivery(receiver=DeltaReceiver(state, keyring))
+
+        msg = delivery.make_batch_message([good, forged], *self._dst_src())
+        msg.pack()
+        self.assertTrue(delivery.handle_delivery(LXMF.LXMessage.unpack_from_bytes(msg.packed)))
+        self.assertEqual(len(state), 1)  # good applied, forged dropped
+
+    def test_handle_delivery_batch_applies_every_element(self):
+        """No any() short-circuit: every valid element of a batch applies."""
+        priv = Ed25519PrivateKey.generate()
+        issuer = _identity_hash(priv)
+        payloads = [
+            _op(issuer, signers=(priv,), object_id=f"sensor:{i}").to_payload()
+            for i in range(3)
+        ]
+        state = StateVector()
+        keyring = Keyring().register_single(issuer, priv.public_key().public_bytes_raw())
+        delivery = LxmfDeltaDelivery(receiver=DeltaReceiver(state, keyring))
+        self.assertTrue(
+            delivery.handle_delivery(_FakeMsg("dacar/sync/batch", encode_batch(payloads)))
+        )
+        self.assertEqual(len(state), 3)
+
+    def test_handle_delivery_all_forged_batch_is_false(self):
+        priv = Ed25519PrivateKey.generate()
+        forged = _op(bytes(HASH_SIZE), signers=(priv,)).to_payload()
+        state = StateVector()
+        delivery = LxmfDeltaDelivery(receiver=DeltaReceiver(state, Keyring()))
+        self.assertFalse(
+            delivery.handle_delivery(_FakeMsg("dacar/sync/batch", encode_batch([forged])))
+        )
+        self.assertEqual(len(state), 0)
+
+    def test_handle_delivery_malformed_batch_dropped_whole(self):
+        import msgpack
+
+        state = StateVector()
+        delivery = LxmfDeltaDelivery(receiver=DeltaReceiver(state, Keyring()))
+        for bad in (b"garbage", b"", msgpack.packb([1, 2, 3])):
+            self.assertFalse(delivery.handle_delivery(_FakeMsg("dacar/sync/batch", bad)))
+        self.assertEqual(len(state), 0)
+
+
+class PaperBatchTest(unittest.TestCase):
+    """§11.3 multi-Delta paper messages (work doc #14)."""
+
+    @classmethod
+    def setUpClass(cls):
+        ensure_headless()
+
+    def _dst_src(self):
+        dst = RNS.Destination(
+            RNS.Identity(), RNS.Destination.IN, RNS.Destination.SINGLE, "lxmf", "delivery"
+        )
+        src = RNS.Destination(
+            RNS.Identity(), RNS.Destination.OUT, RNS.Destination.SINGLE, "lxmf", "delivery"
+        )
+        return dst, src
+
+    def test_paper_batch_within_mdu_and_chunked(self):
+        dst, src = self._dst_src()
+        payloads = [bytes([i]) * 170 for i in range(40)]  # 40 typical deltas
+        messages = pack_paper_messages(payloads, dst, src)
+        self.assertGreater(len(messages), 1)  # spills to multiple QRs
+        for m in messages:
+            self.assertLessEqual(len(m.paper_packed), LXMF.LXMessage.PAPER_MDU)
+            self.assertTrue(m.as_uri().startswith("lxm://"))
+        # Every payload appears in exactly one chunk (order + coverage)
+        flat = [p for m in messages for p in m.dacar_batch_payloads]
+        self.assertEqual(flat, payloads)
+
+    def test_single_oversized_payload_propagates_type_error(self):
+        dst, src = self._dst_src()
+        huge = [b"x" * (LXMF.LXMessage.PAPER_MDU + 512)]
+        with self.assertRaises(TypeError):
+            pack_paper_messages(huge, dst, src)
 
 
 class CorePurityTest(unittest.TestCase):

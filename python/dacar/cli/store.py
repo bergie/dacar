@@ -422,6 +422,7 @@ class Store:
         horizon_days: int,
         rfed_topic: str = RFED_TOPIC,
         rfed_node: Optional[bytes] = None,
+        lxmf_proprietor: Optional[bytes] = None,
     ) -> None:
         parser = configparser.ConfigParser()
         parser["salt"] = {"primary": primary_salt.hex()}
@@ -434,6 +435,8 @@ class Store:
         parser["rfed"] = {"topic": rfed_topic}
         if rfed_node is not None:
             parser["rfed"]["node"] = rfed_node.hex()
+        if lxmf_proprietor is not None:
+            parser["lxmf"] = {"proprietor": lxmf_proprietor.hex()}
         with open(self.config_path, "w") as fh:
             parser.write(fh)
         os.chmod(self.config_path, SECRET_MODE)
@@ -463,6 +466,11 @@ class Store:
                 node_hex = parser.get("rfed", "node").strip()
                 if node_hex:
                     rfed_node = _hex(node_hex, 16)
+        lxmf_proprietor: Optional[bytes] = None
+        if parser.has_section("lxmf") and parser.has_option("lxmf", "proprietor"):
+            proprietor_hex = parser.get("lxmf", "proprietor").strip()
+            if proprietor_hex:
+                lxmf_proprietor = _hex(proprietor_hex, 16)
         return {
             "primary_salt": primary,
             "legacy_salts": tuple(legacy),
@@ -471,6 +479,7 @@ class Store:
             "horizon_days": horizon,
             "rfed_topic": rfed_topic,
             "rfed_node": rfed_node,
+            "lxmf_proprietor": lxmf_proprietor,
         }
 
     def load_config(self) -> Config:
@@ -504,6 +513,7 @@ class Store:
         horizon_days: Optional[int] = None,
         rfed_topic: Optional[str] = None,
         rfed_node: Optional[bytes] = None,
+        lxmf_proprietor: Optional[bytes] = None,
     ) -> None:
         """Write the INI config, preserving unspecified fields from disk."""
         raw = self.load_config_raw() if self.exists() else {}
@@ -517,6 +527,10 @@ class Store:
             ),
             rfed_topic=rfed_topic if rfed_topic is not None else raw.get("rfed_topic", RFED_TOPIC),
             rfed_node=rfed_node if rfed_node is not None else raw.get("rfed_node"),
+            lxmf_proprietor=(
+                lxmf_proprietor if lxmf_proprietor is not None
+                else raw.get("lxmf_proprietor")
+            ),
         )
 
     # -- identity -----------------------------------------------------------

@@ -46,7 +46,11 @@ import { NamespaceHasher, DEFAULT_SALT, SALT_SIZE, HASH_SIZE } from "../namespac
 import { Keyring, IssuerKeyset } from "../verifier.js";
 
 import { DacarStore, SELF_ALIAS, AliasRegistry } from "./store.js";
-import { announceIdentity, discoverRfedNode, ensureNodeIdentity, runPublishMany, runSync, registerAnnounceHandler } from "./session.js";
+import {
+  announceIdentity, discoverRfedNode, ensureNodeIdentity, runPublishMany, runSync,
+  registerAnnounceHandler, bootLxmfRouter, lxmfOutDestination, runLxmfPublish, runLxmfSync,
+} from "./session.js";
+import { LxmfDeltaDelivery, packPaperUris } from "../transport/lxmfSync.js";
 
 const SHORT_HASH = 7;
 
@@ -167,6 +171,34 @@ async function resolveTopic(args, store) {
   return raw.rfedTopic || RFED_TOPIC;
 }
 
+/**
+ * Resolve the LXMF proprietor (propagation node) from `--proprietor` or the
+ * `[lxmf] proprietor` config (§11.2, work doc #14) — the store-and-forward
+ * queue both send legs (outbound propagation) and the receive leg (sync)
+ * talk to. Returns `null` when unconfigured.
+ * @param {any} args
+ * @param {DacarStore} store
+ * @param {AliasRegistry} aliases
+ * @returns {Promise<Uint8Array | null>}
+ */
+async function resolveLxmfProprietor(args, store, aliases) {
+  if (args.proprietor) return resolveIdentityHash(args.proprietor, aliases);
+  const raw = await store.loadConfig();
+  return raw.lxmfProprietor ?? null;
+}
+
+/**
+ * Resolve the recipient `lxmf.delivery` hash from `--lxmf <hash|alias>`.
+ * @param {any} args
+ * @param {DacarStore} store
+ * @param {AliasRegistry} aliases
+ * @returns {Promise<Uint8Array>}
+ */
+async function resolveLxmfTarget(args, store, aliases) {
+  if (!args.lxmf) throw new CliError("no LXMF target given (use --lxmf <hash|alias>)");
+  return resolveIdentityHash(args.lxmf, aliases);
+}
+
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
@@ -202,6 +234,8 @@ async function cmdConfigShow(args) {
   err("[rfed]");
   err("  topic : " + raw.rfedTopic);
   err("  node  : " + (raw.rfedNode ? shortHash(raw.rfedNode, args.fullHashes) : "(not set)"));
+  err("[lxmf]");
+  err("  proprietor : " + (raw.lxmfProprietor ? shortHash(raw.lxmfProprietor, args.fullHashes) : "(not set)"));
   return 0;
 }
 
@@ -247,7 +281,7 @@ async function _issue(args, action) {
   err(`  hlc     : 0x${hlc.toString(16)}`);
   err(`  payload : hex on stdout (${payload.length} bytes)`);
 
-  if (args.publish) {
+  if (args.publish || args.lxmf) {
     // Durability (work doc #11): enqueue the signed payload to the outbox
     // *before* the risky network send, so it survives a crash or failed
     // transport and can be retried via `publish --outbox`. On send it moves
@@ -256,8 +290,21 @@ async function _issue(args, action) {
     const ob = await store.loadOutbox();
     ob.push(payload);
     await store.saveOutbox(ob);
-    const accepted = await publishDelta(args, store, identity, [payload]);
-    await recordPublish(store, [payload], accepted, { recordToSent: true });
+    let accepted;
+    if (args.lxmf) {
+      // --lxmf (§11.2, work doc #14): targeted delivery to one recipient via
+      // the proprietor. With --publish *both* transports run (rfed broadcast
+      // + targeted LXMF); alone, --lxmf is LXMF-only.
+      accepted = await publishDeltaLxmf(args, store, identity, [payload]);
+      await recordPublish(store, [payload], accepted, { recordToSent: true });
+      if (args.publish) {
+        accepted = await publishDelta(args, store, identity, [payload]);
+        await recordPublish(store, [payload], accepted, { recordToSent: true });
+      }
+    } else {
+      accepted = await publishDelta(args, store, identity, [payload]);
+      await recordPublish(store, [payload], accepted, { recordToSent: true });
+    }
     if (accepted[0]) {
       err("  (published + logged to sent box)");
     } else {
@@ -315,6 +362,55 @@ async function publishDelta(args, store, identity, payloads) {
       "(fire-and-forget: node storage is not confirmed)");
   }
   err(`  sent ${sent}/${total} delta(s) to rfed channel ${JSON.stringify(topic)} via ${shortHash(nodeHash, args.fullHashes)}`);
+  return accepted;
+}
+
+/**
+ * Online LXMF delivery hook for the `--lxmf` paths (§11.2, work doc #14) —
+ * the sibling of `publishDelta` and the seam tests patch with a fake router.
+ *
+ * Boots RNS once, announces the node identity (the announce invariant is
+ * *load-bearing* for LXMF: receiving nodes recall the issuer from the
+ * announce store, §11.2.4), seeds the durable keyring, then pushes the
+ * Deltas to one recipient via the proprietor (PROPAGATED, store-and-forward;
+ * `--direct` opts into opportunistic direct delivery). Multi-Delta sends
+ * batch into as few messages as possible. Returns per-Delta acceptance flags
+ * for `recordPublish` (work doc #11 — same outbox → sent lifecycle regardless
+ * of transport).
+ */
+async function publishDeltaLxmf(args, store, identity, payloads) {
+  const aliases = await store.loadAliases();
+  const configDir = await resolveRnsConfigDir(args);
+  const rns = await bootRns(configDir, args.interface || "shared", {
+    verbose: !!args.verbose,
+  });
+  await announceIdentity(identity, rns);
+
+  const keyring = await store.loadKeyring();
+  keyring.registerSingle(identity.identityHash, await identity.getPublicKey());
+  await registerAnnounceHandler({ rns, keyring, onSave: (kr) => store.saveKeyring(kr) });
+  await store.saveKeyring(keyring);
+
+  const target = await resolveLxmfTarget(args, store, aliases);
+  const proprietor = await resolveLxmfProprietor(args, store, aliases);
+  const router = await bootLxmfRouter({ identity, rns });
+  const delivery = new LxmfDeltaDelivery();
+  const { accepted, messages } = await runLxmfPublish({
+    payloads,
+    targetHash: target,
+    proprietor,
+    router,
+    delivery,
+    identity,
+    direct: !!args.direct,
+  });
+  const total = payloads.length;
+  const sent = accepted.filter((ok) => ok).length;
+  const method = args.direct ? "direct link" : "proprietor";
+  err(`  sent ${sent}/${total} delta(s) in ${messages} LXMF message(s) via ${method} to ${shortHash(target, args.fullHashes)}`);
+  if (sent < total) {
+    err("  ⚠ failed delta(s) retained in the outbox for retry (`dacar publish --outbox`)");
+  }
   return accepted;
 }
 
@@ -377,6 +473,19 @@ async function cmdSync(args) {
   const identity = await store.loadIdentity();
   if (!identity) throw new CliError("no signing identity (run `dacar init`)");
 
+  // LXMF leg resolution (work doc #14): runs when a proprietor is configured
+  // or forced with --lxmf (needs --proprietor / [lxmf] proprietor config);
+  // --no-lxmf disables. Auto-when-configured resolves doc #4's open item.
+  const lxmfProprietor = args["no-lxmf"]
+    ? null
+    : await resolveLxmfProprietor(args, store, aliases);
+  if (args.lxmf && !lxmfProprietor) {
+    throw new CliError(
+      "--lxmf given but no proprietor configured " +
+        "(use --proprietor <hash> or set [lxmf] proprietor in config)",
+    );
+  }
+
   // RNS must be booted before discover if we're autodiscovering
   const configDir = await resolveRnsConfigDir(args);
   const rns = await bootRns(configDir, args.interface || "shared", {
@@ -389,25 +498,57 @@ async function cmdSync(args) {
   keyring.registerSingle(identity.identityHash, await identity.getPublicKey());
   await registerAnnounceHandler({ rns, keyring, onSave: (kr) => store.saveKeyring(kr) });
 
-  const nodeHash = await resolveRfedNode(args, store, aliases, rns);
-  // Proactively fetch the rfed node's identity: when --node is given (or
-  // --discover derived it), the destination's announce may not yet be in
-  // the recall store. Send a path? request and wait for the announce rather
-  // than failing with "wait for its announce" (work doc #6).
-  await ensureNodeIdentity(rns, nodeHash, {
-    onRequest: () => err("  requesting rfed node identity…"),
-  });
-  const topic = await resolveTopic(args, store);
+  // rfed leg. Optional when the LXMF leg is available (an LXMF-only
+  // deployment has no rfed node); otherwise the unresolvable node is the
+  // error it always was.
+  let nodeHash = null;
+  try {
+    nodeHash = await resolveRfedNode(args, store, aliases, rns);
+  } catch (e) {
+    if (!lxmfProprietor) throw e;
+    err("  (no rfed node configured — rfed leg skipped, LXMF only)");
+  }
+
   const state = await store.loadState(config);
   const resolver = new RnsIdentityResolver(rns, keyring);
   const rx = new DeltaReceiver(state, resolver);
 
-  const client = new RFedClient({ identity, rns });
-  const applied = await runSync({ nodeHash, topic, client, receiver: rx, rns });
+  let applied = 0;
+  let topic = null;
+  if (nodeHash) {
+    // Proactively fetch the rfed node's identity: when --node is given (or
+    // --discover derived it), the destination's announce may not yet be in
+    // the recall store. Send a path? request and wait for the announce rather
+    // than failing with "wait for its announce" (work doc #6).
+    await ensureNodeIdentity(rns, nodeHash, {
+      onRequest: () => err("  requesting rfed node identity…"),
+    });
+    topic = await resolveTopic(args, store);
+    const client = new RFedClient({ identity, rns });
+    applied = await runSync({ nodeHash, topic, client, receiver: rx, rns });
+  }
+
+  // LXMF leg (§11.2.3 wake → pull → decrypt → apply, work doc #14).
+  if (lxmfProprietor) {
+    const router = await bootLxmfRouter({ identity, rns });
+    const delivery = new LxmfDeltaDelivery({ receiver: rx });
+    let appliedLxmf = 0;
+    try {
+      appliedLxmf = await runLxmfSync({ identity, proprietor: lxmfProprietor, router, delivery });
+    } catch (e) {
+      err(`  ⚠ LXMF sync failed: ${e?.message ?? e}`);
+    }
+    applied += appliedLxmf;
+    err(`  LXMF: ${appliedLxmf} delta(s) applied from proprietor`);
+  }
+
   await store.saveState(state);
   await store.saveKeyring(keyring);
 
-  err(`✔ synced: applied ${applied} delta(s) from rfed channel ${JSON.stringify(topic)}`);
+  err(
+    "✔ synced: applied " + applied + " delta(s)" +
+      (topic !== null ? ` from rfed channel ${JSON.stringify(topic)}` : "")
+  );
   return 0;
 }
 
@@ -480,6 +621,259 @@ function coercePayload(data, forceBinary) {
 }
 
 export { coercePayload, recordPublish };
+
+// ---------------------------------------------------------------------------
+// paper messages (§11.3, work doc #14)
+// ---------------------------------------------------------------------------
+
+/**
+ * Select the Delta payload(s) a `paper export` packs (work doc #14).
+ * `--payload` (hex string or file) takes precedence; then the store flags
+ * `--outbox`/`--sent`/`--all`; the default is the newest outbox Delta, falling
+ * back to the newest sent ("re-deliver this one grant to an air-gapped
+ * node"). Deduplicated by exact bytes, first-seen order preserved.
+ * @param {any} args
+ * @param {DacarStore} store
+ * @returns {Promise<Uint8Array[]>}
+ */
+async function paperSourcePayloads(args, store) {
+  if (args.payload) {
+    const data = await readPayloadInput(String(args.payload), !!args.binary);
+    if (!data.length) throw new CliError(`empty payload: ${args.payload}`);
+    return [data];
+  }
+  const outbox = (await store.loadOutbox()).map((p) => new Uint8Array(p));
+  const sent = (await store.loadSent()).map((p) => new Uint8Array(p));
+  let selected;
+  if (args.all) selected = [...outbox, ...sent];
+  else if (args.outbox) selected = outbox;
+  else if (args.sent) selected = sent;
+  else selected = (outbox.length ? outbox : sent).slice(-1);
+  if (!selected.length) {
+    throw new CliError("nothing to export (outbox/sent empty; use --payload <hex|file>)");
+  }
+  const seen = new Set();
+  /** @type {Uint8Array[]} */
+  const deduped = [];
+  for (const p of selected) {
+    const h = toHex(p);
+    if (!seen.has(h)) {
+      seen.add(h);
+      deduped.push(p);
+    }
+  }
+  return deduped;
+}
+
+/**
+ * SHA-256 hex digest helper (WebCrypto — portable across Node/Deno/Bun).
+ * @param {Uint8Array} data
+ * @returns {Promise<string>}
+ */
+async function sha256Hex(data) {
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  return toHex(new Uint8Array(digest));
+}
+
+/**
+ * Build the advisory completeness manifest for a paper export (work doc #14).
+ * Unsigned by design: a tampered manifest can at worst report false-missing,
+ * never false-accept — every Delta passes per-element Ed25519 verify-on-ingest
+ * regardless. Digests key on the exact signed bytes (Python-parity JSON).
+ * @param {Uint8Array[]} payloads
+ * @param {Uint8Array} target
+ * @param {number} chunks
+ */
+async function paperManifest(payloads, target, chunks) {
+  const digests = [];
+  for (const p of payloads) digests.push(await sha256Hex(p));
+  const setDigest = await sha256Hex(
+    payloads.reduce((acc, p) => {
+      const next = new Uint8Array(acc.length + p.length);
+      next.set(acc); next.set(p, acc.length);
+      return next;
+    }, new Uint8Array(0)),
+  );
+  return {
+    version: 1,
+    target: toHex(target),
+    chunks,
+    delta_count: payloads.length,
+    delta_digests: digests,
+    set_digest: setDigest,
+  };
+}
+
+/**
+ * `dacar paper export` — pack Delta(s) as §11.3 Paper Message URI(s).
+ *
+ * Emits one `lxm://` URI per paper message (greedy batch packing up to the
+ * paper MDU; a larger set spills to several URIs — unordered, independently
+ * verifiable chunks). URIs go to stdout (one per line), `--file` collects them
+ * into one artifact, or `--out-dir` writes `chunk-NNN.txt` per QR.
+ * `--manifest` writes the advisory completeness JSON sidecar. QR rendering
+ * itself is out of scope — any QR tool handles the URI.
+ */
+async function cmdPaperExport(args) {
+  const store = await openStore(args);
+  const aliases = await store.loadAliases();
+  const identity = await store.loadIdentity();
+  if (!identity) throw new CliError("no signing identity (run `dacar init`)");
+
+  const payloads = await paperSourcePayloads(args, store);
+  const target = resolveIdentityHash(args.target, aliases);
+
+  const configDir = await resolveRnsConfigDir(args);
+  const rns = await bootRns(configDir, args.interface || "shared", {
+    verbose: !!args.verbose,
+  });
+  const outboundDestination = await lxmfOutDestination(rns, target);
+  const delivery = new LxmfDeltaDelivery();
+
+  /** @type {string[]} */
+  let uris;
+  if (payloads.length === 1) {
+    uris = [await delivery.makePaperUri(payloads[0], target, { sourceIdentity: identity, outboundDestination })];
+  } else {
+    try {
+      uris = await packPaperUris(payloads, target, { sourceIdentity: identity, outboundDestination });
+    } catch (e) {
+      if (e instanceof TypeError) throw new CliError(`paper export: ${e.message}`);
+      throw e;
+    }
+  }
+
+  if (args["out-dir"]) {
+    const outDir = String(args["out-dir"]);
+    await mkdir(outDir, { recursive: true });
+    for (let i = 0; i < uris.length; i++) {
+      await writeFile(join(outDir, `chunk-${String(i + 1).padStart(3, "0")}.txt`), uris[i] + "\n");
+    }
+    err(`  wrote ${uris.length} chunk file(s) to ${outDir}`);
+  } else if (args.file) {
+    await writeFile(String(args.file), uris.join("\n") + "\n");
+    err(`  wrote ${uris.length} URI(s) to ${args.file}`);
+  } else {
+    for (const uri of uris) out(uri);
+  }
+
+  const manifest = await paperManifest(payloads, target, uris.length);
+  if (args.manifest) {
+    await writeFile(String(args.manifest), JSON.stringify(manifest, null, 2) + "\n");
+  }
+  err(
+    `✔ exported ${payloads.length} delta(s) as ${uris.length} paper message(s) to ` +
+      shortHash(target, args.fullHashes) +
+      (args.manifest ? ` (manifest: ${args.manifest})` : "")
+  );
+  return 0;
+}
+
+/**
+ * `dacar paper import` — apply scanned Paper Message URI(s) (§11.3).
+ *
+ * Accepts `lxm://` URI strings, files containing newline-separated URIs (as
+ * emitted by `paper export --file`/`--out-dir`), or `-` for stdin. Chunks are
+ * unordered and idempotent (CRDT merge); every decrypted payload passes
+ * verify-on-ingest exactly like any other transport. `--manifest` checks
+ * advisory completeness. This node must own the delivery identity the export
+ * targeted.
+ */
+async function cmdPaperImport(args) {
+  const store = await openStore(args);
+  const config = await store.loadConfigValidated();
+  const identity = await store.loadIdentity();
+  if (!identity) throw new CliError("no signing identity (run `dacar init`)");
+
+  /** @type {string[]} */
+  const uris = [];
+  for (const item of args._positionals ?? []) {
+    if (item === "-") {
+      uris.push(...(await readStdin()).toString().split("\n"));
+    } else if (String(item).toLowerCase().startsWith("lxm://")) {
+      uris.push(String(item).trim());
+    } else {
+      uris.push(...(await readFile(String(item))).toString().split("\n"));
+    }
+  }
+  const clean = uris.map((u) => u.trim()).filter((u) => u && !u.startsWith("#"));
+  if (!clean.length) {
+    throw new CliError("no lxm:// URIs given (pass URIs, files, or - for stdin)");
+  }
+
+  const configDir = await resolveRnsConfigDir(args);
+  const rns = await bootRns(configDir, args.interface || "shared", {
+    verbose: !!args.verbose,
+  });
+  const keyring = await store.loadKeyring();
+  keyring.registerSingle(identity.identityHash, await identity.getPublicKey());
+  const state = await store.loadState(config);
+  const resolver = new RnsIdentityResolver(rns, keyring);
+  const rx = new DeltaReceiver(state, resolver);
+
+  // Record the exact bytes that applied so the manifest check can tell
+  // applied from missing (verify-on-ingest is untouched — this only observes).
+  /** @type {Uint8Array[]} */
+  const appliedPayloads = [];
+  const innerApply = rx.applyPayload.bind(rx);
+  rx.applyPayload = async (/** @type {Uint8Array} */ payload, /** @type {any} */ opts) => {
+    const ok = await innerApply(payload, opts);
+    if (ok) appliedPayloads.push(new Uint8Array(payload));
+    return ok;
+  };
+
+  const router = await bootLxmfRouter({ identity, rns });
+  const delivery = new LxmfDeltaDelivery({ receiver: rx });
+  // EventTarget dispatch is synchronous but the listener is async (crypto,
+  // verify-on-ingest) — track in-flight work so the applied count is final
+  // before the manifest check reports.
+  /** @type {Set<Promise<void>>} */
+  const inflight = new Set();
+  /** @param {Event & { detail?: { message?: unknown } }} event */
+  const onMessage = (event) => {
+    const message = /** @type {any} */ (event).detail?.message;
+    if (!message) return;
+    const p = (async () => { await delivery.handleMessage(message); })();
+    inflight.add(p);
+    p.finally(() => inflight.delete(p));
+  };
+  router.addEventListener("message", onMessage);
+
+  let ingested = 0;
+  for (const uri of clean) {
+    try {
+      const result = await delivery.ingestPaperUri(uri);
+      if (result) ingested += 1;
+    } catch {
+      err(`  ⚠ skipping invalid URI: ${uri.slice(0, 64)}…`);
+    }
+  }
+  while (inflight.size) await Promise.all([...inflight]);
+  router.removeEventListener("message", onMessage);
+
+  if (appliedPayloads.length) await store.saveState(state);
+  await store.saveKeyring(keyring);
+
+  err(
+    `✔ imported ${appliedPayloads.length} delta(s) from ${ingested}/${clean.length} paper message(s)`
+  );
+
+  if (args.manifest) {
+    const manifest = JSON.parse((await readFile(String(args.manifest))).toString());
+    const appliedDigests = new Set();
+    for (const p of appliedPayloads) appliedDigests.add(await sha256Hex(p));
+    const missing = (manifest.delta_digests ?? []).filter((/** @type {string} */ d) => !appliedDigests.has(d));
+    if (missing.length) {
+      err(
+        `  ⚠ manifest: ${missing.length} of ${manifest.delta_count ?? "?"} ` +
+          "delta(s) missing — scan/import the remaining chunk(s)"
+      );
+    } else {
+      err("  manifest: complete — all exported delta(s) applied");
+    }
+  }
+  return 0;
+}
 
 /**
  * `dacar publish` — push signed delta(s) to the rfed channel (§11.1, docs #8/#11).
@@ -573,7 +967,16 @@ async function cmdPublish(args) {
   if (files.length) labelParts.push(`${files.length} file(s)`);
   err(`  publishing ${deduped.length} delta(s) (${labelParts.join(" + ")})`);
 
-  const accepted = await publishDelta(args, store, identity, deduped);
+  let accepted;
+  if (args.lxmf) {
+    // --lxmf <hash|alias> (§11.2, work doc #14): directed store-and-forward
+    // delivery to one recipient via the proprietor instead of the rfed
+    // broadcast — the bootstrap path (`publish --sent --lxmf new-node`).
+    // The rfed leg is untouched: run `publish` without `--lxmf` for it.
+    accepted = await publishDeltaLxmf(args, store, identity, deduped);
+  } else {
+    accepted = await publishDelta(args, store, identity, deduped);
+  }
   const nSent = await recordPublish(store, deduped, accepted, { recordToSent });
 
   if (useOutbox && !files.length) {
@@ -724,26 +1127,42 @@ const SUBCOMMANDS = {
   },
   grant: {
     run: cmdGrant,
-    opts: { publish: "boolean", node: "string", discover: "boolean", topic: "string", "rns-dir": "string", interface: "string" },
+    opts: { publish: "boolean", lxmf: "string", direct: "boolean", node: "string", discover: "boolean", topic: "string", proprietor: "string", "rns-dir": "string", interface: "string" },
     positional: ["grantee", "relation", "object"],
     online: true,
   },
   revoke: {
     run: cmdRevoke,
-    opts: { publish: "boolean", node: "string", discover: "boolean", topic: "string", "rns-dir": "string", interface: "string" },
+    opts: { publish: "boolean", lxmf: "string", direct: "boolean", node: "string", discover: "boolean", topic: "string", proprietor: "string", "rns-dir": "string", interface: "string" },
     positional: ["grantee", "relation", "object"],
     online: true,
   },
   sync: {
     run: cmdSync,
-    opts: { node: "string", discover: "boolean", topic: "string", "rns-dir": "string", interface: "string" },
+    opts: { lxmf: "boolean", "no-lxmf": "boolean", node: "string", discover: "boolean", topic: "string", proprietor: "string", "rns-dir": "string", interface: "string" },
     online: true,
   },
   publish: {
     run: cmdPublish,
-    opts: { all: "boolean", outbox: "boolean", sent: "boolean", binary: "boolean", node: "string", discover: "boolean", topic: "string", "rns-dir": "string", interface: "string" },
+    opts: { all: "boolean", outbox: "boolean", sent: "boolean", binary: "boolean", lxmf: "string", direct: "boolean", node: "string", discover: "boolean", topic: "string", proprietor: "string", "rns-dir": "string", interface: "string" },
     // variable file list (0..N) accessed via args._positionals
     online: true,
+  },
+  paper: {
+    sub: {
+      export: {
+        run: cmdPaperExport,
+        opts: { payload: "string", outbox: "boolean", sent: "boolean", all: "boolean", file: "string", "out-dir": "string", manifest: "string", binary: "boolean", "rns-dir": "string", interface: "string" },
+        positional: ["target"],
+        online: true,
+      },
+      import: {
+        run: cmdPaperImport,
+        opts: { manifest: "string", "rns-dir": "string", interface: "string" },
+        // variable URI/file list (1..N) accessed via args._positionals
+        online: true,
+      },
+    },
   },
   apply: { run: cmdApply, opts: { binary: "boolean" }, positional: ["payload"], online: false },
   check: { run: cmdCheck, opts: {}, positional: ["grantee", "relation", "object"], online: false },
