@@ -1,0 +1,61 @@
+{
+	"name": "Dacar",
+	"version": "0.1.0",
+	"description": "C++ port of Dacar, a decentralized, offline-first authorization policy plane for Reticulum networks. Targets microReticulum-class MCU nodes (ESP32, nRF52) and native platforms.",
+	"keywords": "reticulum, rns, dacar, access-control, authorization, crdt, mesh, embedded, mcu",
+	"repository":
+	{
+		"type": "git",
+		"url": "https://github.com/bergie/dacar.git"
+	},
+	"authors":
+	[
+		{
+			"name": "Henri Bergius",
+			"maintainer": true
+		}
+	],
+	"license": "EUPL-1.2",
+	"homepage": "https://github.com/bergie/dacar",
+	"dependencies":
+	[
+		{
+			"name": "microReticulum",
+			"version": "https://github.com/attermann/microReticulum.git#40fa628809d57140180c1c833559ab96fec992c1"
+		},
+		{
+			"name": "microStore",
+			"version": "https://github.com/attermann/microStore.git"
+		},
+		{
+			"name": "MsgPack",
+			"owner": "hideakitai",
+			"version": "~0.4.2"
+		},
+		{
+			"name": "Crypto",
+			"url": "https://github.com/attermann/Crypto.git"
+		}
+	],
+	"frameworks": "*",
+	"platforms": "*",
+	"export":
+	{
+		"include":
+		[
+			"library.json",
+			"platformio.ini",
+			"CMakeLists.txt",
+			"src",
+			"test"
+		]
+	},
+	"include":
+	[
+		"library.json",
+		"platformio.ini",
+		"CMakeLists.txt",
+		"src",
+		"test"
+	]
+}

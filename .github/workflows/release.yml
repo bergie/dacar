@@ -6,7 +6,7 @@
 #
 #   * PyPI  build sdist+wheel (make release-python-dry) + upload via OIDC
 #           trusted publishing (pypa/gh-action-pypi-publish). No API token.
-#   * npm   npm publish --provenance with an NPM_TOKEN secret. Prereleases are
+#   * npm   npm publish --provenance with OIDC trusted publishing. Prereleases are
 #           dist-tagged (NPM_DIST_TAG) — a stable release sets NPM_DIST_TAG=latest.
 #   * JSR   deno publish; JSR authenticates to this repo via GitHub OIDC.
 #
@@ -14,7 +14,7 @@
 #   python/pyproject.toml, javascript/package.json, javascript/jsr.json
 #
 # One-time registry setup (see file header of each job below for details):
-#   PyPI trusted publisher, npm NPM_TOKEN secret (+ provenance for the org),
+#   PyPI trusted publisher, npm trusted publisher (+ provenance for the org),
 #   and link the @reticulum JSR scope to this repo.
 #
 # Releases assume the tagged commit already passed test.yml.
@@ -66,8 +66,9 @@ jobs:
           packages-dir: python/dist/
 
   npm:
-    # Needs secret NPM_TOKEN (automation/granular publish token for the
-    # @reticulum scope) and provenance enabled for the npm org.
+    # OIDC trusted publishing (no token). Configure once at https://www.npmjs.com:
+    # @reticulum/dacar -> Settings -> Trusted Publisher -> GitHub ->
+    # repository: <this repo>, workflow: release.yml, environment: (leave blank).
     name: npm
     runs-on: ubuntu-latest
     permissions:
@@ -89,8 +90,6 @@ jobs:
       - name: Publish to npm (provenance, dist-tag rc)
         if: ${{ github.event.inputs.dry_run != 'true' }}
         run: make release-js NPM_PUBLISH_FLAGS="--access public --provenance"
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Validate packaging (dry-run)
         if: ${{ github.event.inputs.dry_run == 'true' }}

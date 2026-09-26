@@ -1,0 +1,4 @@
+# Build artifacts + dependency caches
+.deps/
+build/
+.pio/

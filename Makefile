@@ -16,6 +16,7 @@ PYTHON ?= python3
 .PHONY: help install test clean release release-dry
 .PHONY: install-python test-python clean-python
 .PHONY: install-js test-js clean-js
+.PHONY: install-cpp test-cpp clean-cpp
 .PHONY: release-python release-python-dry
 .PHONY: release-js release-js-dry
 .PHONY: release-jsr release-jsr-dry
@@ -33,6 +34,8 @@ help: ## Show this help
 	@echo "  test-python      $(PYTHON) -m unittest discover -s tests"
 	@echo "  install-js       npm install"
 	@echo "  test-js          node/deno/bun (whichever are installed)"
+	@echo "  install-cpp      cmake configure (fetches native deps)"
+	@echo "  test-cpp         cmake build + ctest (native Unity suites)"
 	@echo
 	@echo "  release          publish PyPI + npm + JSR"
 	@echo "  release-dry      validate all three without uploading"
@@ -41,9 +44,9 @@ help: ## Show this help
 	@echo "  release-jsr      deno publish         (release-jsr-dry validates)"
 
 # --- aggregators (append new -<lang> targets here) -------------------------
-install: install-python install-js
-test: test-python test-js
-clean: clean-python clean-js
+install: install-python install-js install-cpp
+test: test-python test-js test-cpp
+clean: clean-python clean-js clean-cpp
 
 # --- python ----------------------------------------------------------------
 install-python: ## Install Python dependencies (core + transport extra)
@@ -65,6 +68,26 @@ test-js: ## Run JavaScript tests (node, deno, bun — whichever are installed)
 
 clean-js: ## Remove JavaScript build/test artifacts
 	cd javascript && rm -rf node_modules
+
+# --- cpp (C++ port for microReticulum-class MCU nodes) ----------------------
+# Native tests run the Unity suites via CMake (dependency fetches happen on
+# first configure; a local ../reticulum.js/microReticulum checkout is used
+# automatically when present). Embedded builds: cd cpp && pio test -e <env>.
+
+ifneq ($(wildcard ../reticulum.js/microReticulum),)
+CMAKE_CONFIGURE_FLAGS += -DDACAR_MICRORETICULUM_SOURCE_DIR=../reticulum.js/microReticulum
+endif
+
+install-cpp: ## Configure the C++ native build (fetches dependencies)
+	cd cpp && cmake -B build -S . $(CMAKE_CONFIGURE_FLAGS)
+
+test-cpp: ## Build and run the C++ (native) tests
+	cd cpp && cmake -B build -S . $(CMAKE_CONFIGURE_FLAGS) \
+		&& cmake --build build -j \
+		&& ctest --test-dir build --output-on-failure
+
+clean-cpp: ## Remove C++ build/test artifacts
+	rm -rf cpp/build cpp/.pio cpp/.deps
 
 # --- release ---------------------------------------------------------------
 # Publish per implementation. Each has a -dry twin that validates packaging
