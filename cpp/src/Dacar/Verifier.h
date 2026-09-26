@@ -86,7 +86,14 @@ namespace Dacar {
 		Keyring() = default;
 		~Keyring() = default;
 
-		// Map a 16-byte Issuer hash to its IssuerKeyset.
+		/*
+		Map a 16-byte Issuer hash to its IssuerKeyset.
+
+		Re-registering an existing hash replaces the keyset in place (insertion
+		position is kept — Python dict / JS Map parity, so entries() ordering is
+		stable across implementations; identities.msgpack (§13.7) serializes in
+		that order).
+		*/
 		Keyring& register_keyset(const RNS::Bytes& issuer_hash, IssuerKeyset keyset);
 
 		Keyring& register_single(const RNS::Bytes& issuer_hash, const RNS::Bytes& public_key) {
@@ -107,11 +114,12 @@ namespace Dacar {
 		// Remove an Issuer from the keyring. Returns true if it existed.
 		bool forget(const RNS::Bytes& issuer_hash);
 
-		// (issuer_hash, keyset) pairs for all registered Issuers.
+		// (issuer_hash, keyset) pairs for all registered Issuers, in
+		// registration order (Python dict parity).
 		Vector<std::pair<RNS::Bytes, IssuerKeyset>> entries() const;
 
-		size_t size() const { return _map.size(); }
-		bool contains(const RNS::Bytes& issuer_hash) const { return _map.find(issuer_hash) != _map.end(); }
+		size_t size() const { return _entries.size(); }
+		bool contains(const RNS::Bytes& issuer_hash) const { return _index.find(issuer_hash) != _index.end(); }
 
 		// Make a Keyring directly usable as a KeyResolver.
 		const IssuerKeyset* operator () (const RNS::Bytes& issuer_hash) const {
@@ -119,7 +127,11 @@ namespace Dacar {
 		}
 
 	private:
-		Map<RNS::Bytes, IssuerKeyset> _map;
+		// Insertion-ordered entries (Python dict parity: identities.msgpack
+		// §13.7 writes single-identity entries in registration order) plus a
+		// hash -> position index for O(log n) lookups.
+		Vector<std::pair<RNS::Bytes, IssuerKeyset>> _entries;
+		Map<RNS::Bytes, size_t> _index;
 
 	};
 

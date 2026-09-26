@@ -13,6 +13,11 @@
 
 PYTHON ?= python3
 
+# Parallel build jobs for the C++ target. A bare `cmake --build -j` means
+# UNLIMITED jobs, which OOMs small machines on a clean build (the fetched
+# dependency tree is large); default to the core count instead.
+J ?= $(shell nproc 2>/dev/null || echo 2)
+
 .PHONY: help install test clean release release-dry
 .PHONY: install-python test-python clean-python
 .PHONY: install-js test-js clean-js
@@ -83,7 +88,7 @@ install-cpp: ## Configure the C++ native build (fetches dependencies)
 
 test-cpp: ## Build and run the C++ (native) tests
 	cd cpp && cmake -B build -S . $(CMAKE_CONFIGURE_FLAGS) \
-		&& cmake --build build -j \
+		&& cmake --build build -j$(J) \
 		&& ctest --test-dir build --output-on-failure
 
 clean-cpp: ## Remove C++ build/test artifacts

@@ -29,24 +29,44 @@ IssuerKeyset::IssuerKeyset(Vector<RNS::Bytes> member_public_keys, int threshold)
 }
 
 Keyring& Keyring::register_keyset(const RNS::Bytes& issuer_hash, IssuerKeyset keyset) {
-	_map[issuer_hash] = std::move(keyset);
+	auto it = _index.find(issuer_hash);
+	if (it != _index.end()) {
+		// Python dict semantics: overwrite the value, keep the position.
+		_entries[it->second].second = std::move(keyset);
+		return *this;
+	}
+	_index[issuer_hash] = _entries.size();
+	_entries.emplace_back(issuer_hash, std::move(keyset));
 	return *this;
 }
 
 const IssuerKeyset* Keyring::resolve(const RNS::Bytes& issuer_hash) const {
-	auto it = _map.find(issuer_hash);
-	if (it == _map.end()) {
+	auto it = _index.find(issuer_hash);
+	if (it == _index.end()) {
 		return nullptr;
 	}
-	return &it->second;
+	return &_entries[it->second].second;
 }
 
 bool Keyring::forget(const RNS::Bytes& issuer_hash) {
-	return _map.erase(issuer_hash) > 0;
+	auto it = _index.find(issuer_hash);
+	if (it == _index.end()) {
+		return false;
+	}
+	// Keyrings are small; shifting keeps the positions in _index valid.
+	size_t pos = it->second;
+	_entries.erase(_entries.begin() + pos);
+	_index.erase(it);
+	for (auto& kv : _index) {
+		if (kv.second > pos) {
+			kv.second--;
+		}
+	}
+	return true;
 }
 
 Vector<std::pair<RNS::Bytes, IssuerKeyset>> Keyring::entries() const {
-	return {_map.begin(), _map.end()};
+	return _entries;
 }
 
 /*static*/ bool Dacar::verify_operation(const Operation& operation, const KeyResolver& resolver) {

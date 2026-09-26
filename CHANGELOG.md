@@ -8,6 +8,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **C++**: §13 persistence + configuration (work doc #16, Phase 2). A
+  backend-neutral `Store` (`cpp/src/Dacar/Store.h`) holds the node's INI
+  config, HLC, CRDT state, aliases, plaintext ledger, issuer public-key
+  cache, and outbox/sent Delta logs over a `RecordIo` backend:
+  - `PosixRecordIo` writes the §13 loose-file layout byte-identical to the
+    canonical Python/JS stores (§13.1 file modes included, lazy records
+    lazy), so a store directory moves between implementations by mounted
+    volume or sneakernet — including the 64-byte `identity` record, which
+    microReticulum reads/writes in the same format as Python RNS.
+  - `MicroStoreRecordIo` keeps the same logical records in microStore's
+    `BasicFileStore` for MCU flash targets (spec §13 permits alternative
+    backends that preserve logical records).
+  - The `dacar` Provisioning namespace (id 100) exposes salts, anchors,
+    authoritative identity, deletion horizon, and rfed topic over
+    microReticulum's standard provisioning transport for out-of-band
+    MCU provisioning; salts are FF_SECRET, anchor changes apply live.
+  - `Keyring` is now insertion-ordered (Python dict / JS Map parity) so
+    `identities.msgpack` serializes identically across implementations.
+  - Unity suite `test_store` validates every record codec against bytes
+    produced by the canonical Python `Store` (INI encode/decode, clock,
+    ledger, identities, aliases, outbox/sent), plus POSIX layout/mode/lazy
+    checks, microStore record equivalence, and a provisioning boot-cycle
+    test. Cross-verified bidirectionally against the Python CLI on a live
+    store directory. `USTORE_MAX_VALUE_LEN` is raised to 16384 tree-wide
+    (Dacar records exceed microStore's 1 KB default). `cpp/README.md`
+    documents the build dependencies.
 - **C++**: a C++ implementation of the Dacar core (`cpp/`) targeting
   microReticulum-class MCU nodes (ESP32, nRF52 — the constrained tier) and
   native platforms, structured as a PlatformIO library + CMake native build

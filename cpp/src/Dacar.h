@@ -28,3 +28,7 @@
 #include "Dacar/Crdt.h"
 #include "Dacar/Engine.h"
 #include "Dacar/Delta.h"
+#include "Dacar/Store.h"
+#include "Dacar/PosixStore.h"
+#include "Dacar/MicroStoreIo.h"
+#include "Dacar/Provisioning.h"

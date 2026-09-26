@@ -30,6 +30,24 @@ set(DACAR_MICRORETICULUM_GIT_TAG
 #   cmake -B build -DDACAR_MICRORETICULUM_SOURCE_DIR=../reticulum.js/microReticulum
 set(DACAR_MICRORETICULUM_SOURCE_DIR "" CACHE PATH "Use a local microReticulum checkout instead of FetchContent")
 
+#-----------------------------------------------------------------------------
+# Toolchain compatibility
+#-----------------------------------------------------------------------------
+# GCC 15 / libstdc++ 15 dropped transitive <cstdint> includes that the pinned
+# microReticulum revision (and possibly other fetched deps) relied on.
+# Force-include <cstdint> for every C++ source compiled in this tree.
+add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:-include;cstdint>")
+
+# Dacar state / outbox records exceed microStore's default 1 KB value cap.
+# Raise it tree-wide so every TU (Dacar + microReticulum's header-only
+# BasicFileStore instantiations) agrees on the limit — a build mixing values
+# would ODR-diverge, and records larger than a build's limit drop as corrupt.
+add_compile_definitions(USTORE_MAX_VALUE_LEN=16384)
+
+# The §13 loose-file backend (native targets). Embedded builds use the
+# microStore backend (MicroStoreIo.h) instead.
+add_compile_definitions(DACAR_POSIX_STORE)
+
 # -----------------------------------------------------------------------------
 # Dependencies
 # -----------------------------------------------------------------------------

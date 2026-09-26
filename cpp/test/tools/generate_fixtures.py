@@ -20,6 +20,8 @@ from __future__ import annotations
 import hashlib
 import os
 import sys
+import tempfile
+from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PYTHON_IMPL = os.path.normpath(os.path.join(HERE, "..", "..", "python"))
@@ -28,14 +30,16 @@ sys.path.insert(0, PYTHON_IMPL)
 from cryptography.hazmat.primitives import serialization as cryptography_serialization  # noqa: E402
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey  # noqa: E402
 
+from dacar.cli.store import AliasRegistry, Ledger, Store  # noqa: E402
 from dacar.config import Config  # noqa: E402
 from dacar.crdt import StateVector  # noqa: E402
 from dacar.engine import Engine  # noqa: E402
-from dacar.hlc import pack  # noqa: E402
-from dacar.namespace import NamespaceHasher  # noqa: E402
+from dacar.hlc import Clock, pack  # noqa: E402
+from dacar.namespace import DEFAULT_SALT, NamespaceHasher  # noqa: E402
 from dacar.operation import Action, Operation  # noqa: E402
 from dacar.threshold import ThresholdGroup, group_id as threshold_group_id  # noqa: E402
 from dacar.tuple import Tuple  # noqa: E402
+from dacar.verifier import Keyring  # noqa: E402
 from dacar import serialization  # noqa: E402
 
 # --- fixture identities and salts -------------------------------------------
@@ -86,6 +90,13 @@ op_cases = []       # (comment, salt, object, relation, grantee_idx, issuer_idx,
 state_cases = []    # dicts
 engine_cases = []   # dicts
 batch_cases = []    # (comment, payload_hexs, expected_hex)
+ini_encode_cases = []  # (comment, config kwargs, expected ini hex)
+ini_decode_cases = []  # (comment, ini text, expected raw fields)
+clock_file_cases = []  # (last_ms, logical, expected hex)
+ledger_file_cases = []  # (comment, row specs, expected hex)
+identities_file_cases = []  # (comment, [(hash, pub)], expected hex)
+aliases_rt_cases = []  # (comment, [(hash, [names], note)], expected text hex)
+aliases_parse_cases = []  # (comment, text, [(hash, [names], note)])
 
 
 # --- §3.3 namespace cases ----------------------------------------------------
@@ -578,6 +589,278 @@ batch_cases.append((
     hx(serialization.packb(_payloads)),
 ))
 
+# --- §13 store cases ------------------------------------------------------------
+# Every expected byte string is produced by the canonical Python Store itself
+# (writing records into a scratch directory and reading the files back), so
+# the C++ persistence layer is validated against the reference store bytes
+# (work doc #16 Phase 2: byte-identical §13 loose-file layout).
+
+_scratch = Path(tempfile.mkdtemp(prefix="dacar-fixtures-"))
+_ref_store = Store(_scratch)
+
+
+def _ref_ini(**kwargs) -> bytes:
+    _ref_store._write_config(**kwargs)
+    return (_scratch / "config").read_bytes()
+
+
+def _ref_raw(ini_text: bytes) -> dict:
+    (_scratch / "config").write_bytes(ini_text)
+    return _ref_store.load_config_raw()
+
+
+def _raw_tuple(raw: dict):
+    return (
+        hx(raw["primary_salt"]),
+        hxs(raw["legacy_salts"]),
+        hxs(raw["anchors"]),
+        hx(raw["authoritative"]) if raw["authoritative"] else "",
+        raw["horizon_days"],
+        raw["rfed_topic"],
+        hx(raw["rfed_node"]) if raw["rfed_node"] else "",
+        hx(raw["lxmf_proprietor"]) if raw["lxmf_proprietor"] else "",
+    )
+
+
+# INI encode cases: every optional field combination the writer can emit.
+ini_encode_cases.append((
+    "full",
+    dict(
+        primary_salt=SALT,
+        legacy_salts=(LEGACY_SALT,),
+        anchors=[HASHES[0], HASHES[1]],
+        authoritative=HASHES[2],
+        horizon_days=90,
+        rfed_topic="dacar.policy.v1",
+        rfed_node=HASHES[3],
+        lxmf_proprietor=HASHES[4],
+    ),
+    hx(_ref_ini(
+        primary_salt=SALT,
+        legacy_salts=(LEGACY_SALT,),
+        anchors=[HASHES[0], HASHES[1]],
+        authoritative=HASHES[2],
+        horizon_days=90,
+        rfed_topic="dacar.policy.v1",
+        rfed_node=HASHES[3],
+        lxmf_proprietor=HASHES[4],
+    )),
+))
+ini_encode_cases.append((
+    "minimal",
+    dict(
+        primary_salt=SALT,
+        legacy_salts=(),
+        anchors=[HASHES[0]],
+        authoritative=None,
+        horizon_days=180,
+        rfed_topic="dacar.policy.v1",
+        rfed_node=None,
+        lxmf_proprietor=None,
+    ),
+    hx(_ref_ini(
+        primary_salt=SALT,
+        legacy_salts=(),
+        anchors=[HASHES[0]],
+        authoritative=None,
+        horizon_days=180,
+    )),
+))
+ini_encode_cases.append((
+    "two_legacy_salts",
+    dict(
+        primary_salt=SALT,
+        legacy_salts=(LEGACY_SALT, SALT2),
+        anchors=[HASHES[5], HASHES[6], HASHES[7]],
+        authoritative=None,
+        horizon_days=30,
+        rfed_topic="fleet.policy.v9",
+        rfed_node=None,
+        lxmf_proprietor=None,
+    ),
+    hx(_ref_ini(
+        primary_salt=SALT,
+        legacy_salts=(LEGACY_SALT, SALT2),
+        anchors=[HASHES[5], HASHES[6], HASHES[7]],
+        authoritative=None,
+        horizon_days=30,
+        rfed_topic="fleet.policy.v9",
+    )),
+))
+
+# INI decode cases: configparser-compatible parses the C++ reader must match.
+ini_decode_cases.append((
+    "writer_output",
+    _ref_ini(
+        primary_salt=SALT,
+        legacy_salts=(LEGACY_SALT,),
+        anchors=[HASHES[0], HASHES[1]],
+        authoritative=HASHES[2],
+        horizon_days=90,
+        rfed_topic="dacar.policy.v1",
+        rfed_node=HASHES[3],
+        lxmf_proprietor=HASHES[4],
+    ),
+    None,  # expected: derived from the reference reader below
+))
+ini_decode_cases.append((
+    "colon_delims_comments_case",
+    (
+        "# a full-line comment\n"
+        "; another comment style\n"
+        "\n"
+        "[salt]\n"
+        "PRIMARY: " + hx(SALT) + "\n"
+        "legacy0 : " + hx(LEGACY_SALT) + "\n"
+        "\n"
+        "[trust]\n"
+        "Anchors = " + hx(HASHES[0]) + " ,  " + hx(HASHES[1]) + "\n"
+        "authoritative=" + hx(HASHES[2]) + "\n"
+        "\n"
+        "[policy]\n"
+        "deletion_horizon_days = 45\n"
+        "\n"
+        "[rfed]\n"
+        "topic: boat.policy.v2\n"
+        "node = " + hx(HASHES[3]) + "\n"
+        "\n"
+        "[lxmf]\n"
+        "proprietor = " + hx(HASHES[4]) + "\n"
+        "\n"
+        "[unknown_section]\n"
+        "ignored = 1\n"
+        "\n"
+    ).encode(),
+    None,
+))
+ini_decode_cases.append((
+    "missing_optionals_default",
+    (
+        "[salt]\n"
+        "primary = " + hx(SALT) + "\n"
+        "\n"
+        "[trust]\n"
+        "anchors = " + hx(HASHES[0]) + "\n"
+        "\n"
+        "[policy]\n"
+        "\n"
+        "[rfed]\n"
+    ).encode(),
+    None,
+))
+ini_decode_cases.append((
+    "missing_primary_uses_default_salt",
+    (
+        "[salt]\n"
+        "legacy0 = " + hx(LEGACY_SALT) + "\n"
+        "\n"
+        "[trust]\n"
+        "anchors = \n"
+        "\n"
+    ).encode(),
+    None,
+))
+ini_decode_cases = [
+    (comment, ini_text, _raw_tuple(_ref_raw(ini_text)))
+    for comment, ini_text, _ in ini_decode_cases
+]
+
+# clock.msgpack cases (§13.3).
+for ms, logical in (
+    (0, 0),
+    (1, 1),
+    (0x0000123456789ABC, 42),
+    (0xFFFFFFFFFFFF, 0xFFFF),
+):
+    clock_file_cases.append((
+        ms,
+        logical,
+        hx(serialization.packb({"last_ms": ms, "logical": logical})),
+    ))
+
+# ledger.msgpack cases (§13.6), built through the canonical Ledger.
+_th_full = hashlib.sha256(b"ledger-full").digest()
+_th_ensured = hashlib.sha256(b"ledger-ensured").digest()
+_led = Ledger()
+_led.record(_th_full, object_id="vessel:2301234:buzzer", relation="sound", wildcard=True, first_seen=0x0000ABCD1234)
+_led.ensure(_th_ensured)
+_led.annotate(_th_ensured, relation="read")
+ledger_file_cases.append((
+    "recorded_and_annotated",
+    [
+        (hx(_th_full), "vessel:2301234:buzzer", "sound", 1, 0x0000ABCD1234),
+        (hx(_th_ensured), "", "read", -1, 0),
+    ],
+    hx(serialization.packb(_led.rows)),
+))
+_led2 = Ledger()
+ledger_file_cases.append((
+    "empty",
+    [],
+    hx(serialization.packb(_led2.rows)),
+))
+
+# identities.msgpack cases (§13.7): insertion order is the wire order; a
+# Threshold Group keyset is present in the keyring but MUST be skipped.
+_keyring = Keyring()
+_keyring.register_single(HASHES[4], KEYS[0][2])
+_keyring.register_single(HASHES[2], KEYS[3][2])
+_keyring.register_group(threshold_group_id([HASHES[0], HASHES[1]], 1), [KEYS[1][2], KEYS[2][2]], 1)
+_id_obj = {}
+for issuer_hash, keyset in _keyring.entries():
+    if keyset.threshold == 1 and len(keyset.member_public_keys) == 1:
+        _id_obj[issuer_hash.hex()] = bytes(keyset.member_public_keys[0])
+identities_file_cases.append((
+    "singles_insertion_order_group_skipped",
+    [
+        (hx(HASHES[4]), hx(KEYS[0][2])),
+        (hx(HASHES[2]), hx(KEYS[3][2])),
+    ],
+    hx(serialization.packb(_id_obj)),
+))
+
+# aliases round-trip (§13.5): canonical serialize bytes.
+_ar = AliasRegistry()
+_ar.add("self", HASHES[0])
+_ar.add("boat", HASHES[1], note="mmsi 2301234")
+_ar.add("skipper", HASHES[1])
+aliases_rt_cases.append((
+    "named_with_note",
+    [
+        (hx(HASHES[0]), "self", ""),
+        (hx(HASHES[1]), "boat skipper", "mmsi 2301234"),
+    ],
+    hx(_ar.serialize().encode()),
+))
+_ar2 = AliasRegistry()
+aliases_rt_cases.append((
+    "empty_registry_zero_bytes",
+    [],
+    hx(_ar2.serialize().encode()),
+))
+
+# aliases parse cases: junk lines skipped, duplicate hashes merged.
+_aliases_text = (
+    "# registry\n"
+    "notahash bogus\n"
+    "\n"
+    + hx(HASHES[0]) + " self\n"
+    + hx(HASHES[1]) + " boat  # the ferry\n"
+    + hx(HASHES[1]) + " skipper\n"
+    + hx(HASHES[2]) + "\n"  # hash with no names -> ignored
+    "zzzz stray line\n"
+)
+_parsed = AliasRegistry.parse(_aliases_text)
+aliases_parse_cases.append((
+    "junk_and_merge",
+    _aliases_text,
+    [
+        (hx(e.hash), " ".join(e.names), e.note or "")
+        for e in _parsed.entries
+    ],
+    hx(_parsed.serialize().encode()),
+))
+
 # ==============================================================================
 # C++ emission
 # ==============================================================================
@@ -732,6 +1015,80 @@ namespace DacarFixtures {{
 		const char* expected_hex; // §11.1 batch encoding
 	}};
 
+	struct IniEncodeCase {{
+		const char* comment;
+		const char* primary_hex;    // 32-byte Privacy Salt
+		const char* legacy_hex;     // ';'-joined legacy salts ("" for none)
+		const char* anchors_hex;    // ';'-joined 16-byte anchor hashes
+		const char* authoritative_hex; // "" for not configured
+		int horizon_days;
+		const char* rfed_topic;
+		const char* rfed_node_hex;      // "" for not configured
+		const char* lxmf_proprietor_hex; // "" for not configured
+		const char* expected_hex;   // canonical INI bytes
+	}};
+
+	struct IniDecodeCase {{
+		const char* comment;
+		const char* ini_hex;        // INI text bytes to parse
+		const char* primary_hex;
+		const char* legacy_hex;     // ';'-joined legacy salts
+		const char* anchors_hex;    // ';'-joined anchor hashes
+		const char* authoritative_hex;
+		int horizon_days;
+		const char* rfed_topic;
+		const char* rfed_node_hex;
+		const char* lxmf_proprietor_hex;
+	}};
+
+	struct ClockFileCase {{
+		uint64_t last_ms;
+		uint64_t logical;
+		const char* expected_hex; // §13.3 msgpack bytes
+	}};
+
+	struct LedgerRowSpec {{
+		const char* tuple_hash_hex; // 32-byte Tuple Hash
+		const char* object;        // "" for nil
+		const char* relation;      // "" for nil
+		int wildcard;              // -1 nil / 0 false / 1 true
+		uint64_t first_seen;       // physical (high-48) HLC timestamp
+	}};
+
+	struct LedgerFileCase {{
+		const char* comment;
+		const LedgerRowSpec* rows;
+		size_t row_count;
+		const char* expected_hex; // §13.6 msgpack bytes
+	}};
+
+	struct IdentitiesFileCase {{
+		const char* comment;
+		const char* hash_pubs_hex; // ';'-joined 48-byte hash(16)|pub(32) blobs
+		const char* expected_hex;  // §13.7 msgpack bytes
+	}};
+
+	struct AliasEntrySpec {{
+		const char* hash_hex;
+		const char* names;   // space-joined
+		const char* note;    // "" for none
+	}};
+
+	struct AliasesFileCase {{
+		const char* comment;
+		const AliasEntrySpec* entries;
+		size_t entry_count;
+		const char* expected_hex; // §13.5 text bytes
+	}};
+
+	struct AliasesParseCase {{
+		const char* comment;
+		const char* text_hex;      // rnns text bytes to parse
+		const AliasEntrySpec* entries; // expected parsed entries
+		size_t entry_count;
+		const char* reserialized_hex; // parse -> serialize round-trip bytes
+	}};
+
 ''')
         # Keys
         w.write(f"\tconstexpr size_t KEY_COUNT = {KEY_COUNT};\n")
@@ -817,6 +1174,83 @@ namespace DacarFixtures {{
                         lambda c: f'{{{cpp_str(c[0])}, {cpp_str(";".join(c[1]))}, {cpp_str(c[2])}}}')
         w.write(f"\tconstexpr size_t BATCH_CASE_COUNT = {len(batch_cases)};\n")
 
+        emit_case_array(w, "IniEncodeCase", "INI_ENCODE_CASES", ini_encode_cases,
+                        lambda c: (
+                            f'{{{cpp_str(c[0])}, {cpp_str(hx(c[1]["primary_salt"]))}, '
+                            f'{cpp_str(hxs(c[1]["legacy_salts"]))}, {cpp_str(hxs(c[1]["anchors"]))}, '
+                            f'{cpp_str(hx(c[1]["authoritative"]) if c[1]["authoritative"] else "")}, '
+                            f'{c[1]["horizon_days"]}, {cpp_str(c[1]["rfed_topic"])}, '
+                            f'{cpp_str(hx(c[1]["rfed_node"]) if c[1]["rfed_node"] else "")}, '
+                            f'{cpp_str(hx(c[1]["lxmf_proprietor"]) if c[1]["lxmf_proprietor"] else "")}, '
+                            f'{cpp_str(c[2])}}}'
+                        ))
+        w.write(f"\tconstexpr size_t INI_ENCODE_CASE_COUNT = {len(ini_encode_cases)};\n")
+
+        emit_case_array(w, "IniDecodeCase", "INI_DECODE_CASES", ini_decode_cases,
+                        lambda c: (
+                            f'{{{cpp_str(c[0])}, {cpp_str(hx(c[1]))}, {cpp_str(c[2][0])}, '
+                            f'{cpp_str(c[2][1])}, {cpp_str(c[2][2])}, {cpp_str(c[2][3])}, '
+                            f'{c[2][4]}, {cpp_str(c[2][5])}, {cpp_str(c[2][6])}, {cpp_str(c[2][7])}}}'
+                        ))
+        w.write(f"\tconstexpr size_t INI_DECODE_CASE_COUNT = {len(ini_decode_cases)};\n")
+
+        emit_case_array(w, "ClockFileCase", "CLOCK_FILE_CASES", clock_file_cases,
+                        lambda c: f'{{{c[0]}ULL, {c[1]}ULL, {cpp_str(c[2])}}}')
+        w.write(f"\tconstexpr size_t CLOCK_FILE_CASE_COUNT = {len(clock_file_cases)};\n")
+
+        for idx, (comment, rows, expected) in enumerate(ledger_file_cases):
+            arr = f"LEDGER_ROWS_{idx}"
+            emit_case_array(w, "LedgerRowSpec", arr, rows,
+                            lambda r: (
+                                f'{{{cpp_str(r[0])}, {cpp_str(r[1])}, {cpp_str(r[2])}, '
+                                f'{r[3]}, {r[4]}ULL}}'
+                            ))
+            w.write(
+                f"\tstatic const LedgerFileCase LEDGER_FILE_CASES_{idx} = "
+                f'{{{cpp_str(comment)}, {arr}, {len(rows)}, {cpp_str(expected)}}};\n'
+            )
+        w.write("\tstatic const LedgerFileCase* const LEDGER_FILE_CASES[] = {\n")
+        for idx in range(len(ledger_file_cases)):
+            w.write(f"\t\t&LEDGER_FILE_CASES_{idx},\n")
+        w.write("\t};\n")
+        w.write(f"\tconstexpr size_t LEDGER_FILE_CASE_COUNT = {len(ledger_file_cases)};\n")
+
+        emit_case_array(w, "IdentitiesFileCase", "IDENTITIES_FILE_CASES", identities_file_cases,
+                        lambda c: (
+                            f'{{{cpp_str(c[0])}, {cpp_str(";".join(h + p for h, p in c[1]))}, '
+                            f'{cpp_str(c[2])}}}'
+                        ))
+        w.write(f"\tconstexpr size_t IDENTITIES_FILE_CASE_COUNT = {len(identities_file_cases)};\n")
+
+        for idx, (comment, entries, expected) in enumerate(aliases_rt_cases):
+            arr = f"ALIASES_RT_ENTRIES_{idx}"
+            emit_case_array(w, "AliasEntrySpec", arr, entries,
+                            lambda e: f'{{{cpp_str(e[0])}, {cpp_str(e[1])}, {cpp_str(e[2])}}}')
+            w.write(
+                f"\tstatic const AliasesFileCase ALIASES_FILE_CASES_{idx} = "
+                f'{{{cpp_str(comment)}, {arr}, {len(entries)}, {cpp_str(expected)}}};\n'
+            )
+        w.write("\tstatic const AliasesFileCase* const ALIASES_FILE_CASES[] = {\n")
+        for idx in range(len(aliases_rt_cases)):
+            w.write(f"\t\t&ALIASES_FILE_CASES_{idx},\n")
+        w.write("\t};\n")
+        w.write(f"\tconstexpr size_t ALIASES_FILE_CASE_COUNT = {len(aliases_rt_cases)};\n")
+
+        for idx, (comment, text, entries, reserialized) in enumerate(aliases_parse_cases):
+            arr = f"ALIASES_PARSE_ENTRIES_{idx}"
+            emit_case_array(w, "AliasEntrySpec", arr, entries,
+                            lambda e: f'{{{cpp_str(e[0])}, {cpp_str(e[1])}, {cpp_str(e[2])}}}')
+            w.write(
+                f"\tstatic const AliasesParseCase ALIASES_PARSE_CASES_{idx} = "
+                f'{{{cpp_str(comment)}, {cpp_str(hx(text.encode()))}, {arr}, '
+                f'{len(entries)}, {cpp_str(reserialized)}}};\n'
+            )
+        w.write("\tstatic const AliasesParseCase* const ALIASES_PARSE_CASES[] = {\n")
+        for idx in range(len(aliases_parse_cases)):
+            w.write(f"\t\t&ALIASES_PARSE_CASES_{idx},\n")
+        w.write("\t};\n")
+        w.write(f"\tconstexpr size_t ALIASES_PARSE_CASE_COUNT = {len(aliases_parse_cases)};\n")
+
         w.write("""
 }
 """)
@@ -825,6 +1259,11 @@ namespace DacarFixtures {{
     print(f"  covers={len(covers_cases)} hlc={len(hlc_cases)} tuples={len(tuple_cases)}")
     print(f"  groups={len(group_cases)} ops={len(op_cases)} state={len(state_cases)}")
     print(f"  engine={len(engine_cases)} batch={len(batch_cases)}")
+    print(
+        f"  store: ini_enc={len(ini_encode_cases)} ini_dec={len(ini_decode_cases)} "
+        f"clock={len(clock_file_cases)} ledger={len(ledger_file_cases)} "
+        f"identities={len(identities_file_cases)} aliases={len(aliases_rt_cases) + len(aliases_parse_cases)}"
+    )
 
 
 def emit_state_step(step) -> str:
