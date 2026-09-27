@@ -34,6 +34,7 @@ from dacar.cli.store import AliasRegistry, Ledger, Store  # noqa: E402
 from dacar.config import Config  # noqa: E402
 from dacar.crdt import StateVector  # noqa: E402
 from dacar.engine import Engine  # noqa: E402
+from dacar.challenge import AuthoritativeServer, Challenge, Receipt, Verdict  # noqa: E402
 from dacar.hlc import Clock, pack  # noqa: E402
 from dacar.namespace import DEFAULT_SALT, NamespaceHasher  # noqa: E402
 from dacar.operation import Action, Operation  # noqa: E402
@@ -97,6 +98,10 @@ ledger_file_cases = []  # (comment, row specs, expected hex)
 identities_file_cases = []  # (comment, [(hash, pub)], expected hex)
 aliases_rt_cases = []  # (comment, [(hash, [names], note)], expected text hex)
 aliases_parse_cases = []  # (comment, text, [(hash, [names], note)])
+challenge_cases = []  # (comment, object, relation, grantee_idx, nonce_hex, salt, legacy, expected payload hex)
+receipt_cases = []  # (comment, verdict, server_hlc, nonce_hex, key_idx, preimage hex, payload hex)
+server_cases = []  # dicts (§8 authoritative evaluation)
+challenge_malformed_cases = []  # (comment, payload hex)
 
 
 # --- §3.3 namespace cases ----------------------------------------------------
@@ -861,6 +866,181 @@ aliases_parse_cases.append((
     hx(_parsed.serialize().encode()),
 ))
 
+# --- §8 strict consistency challenge cases -------------------------------------
+
+# Challenge payload cases (§8.3): hashed hypotheses across Primary + Legacy
+# salts. Bytes are produced by the canonical Python Challenge.to_payload.
+_ch_nonce = bytes(range(32))
+for comment, obj, rel, g, salt, legacy in (
+    ("single_salt", "sensor:wind", "calibrate", 2, SALT, ()),
+    ("with_legacy_salt", "vessel:2301234:buzzer", "sound", 3, SALT, (LEGACY_SALT,)),
+    ("two_legacy_salts", "*", "admin", 0, SALT, (LEGACY_SALT, SALT2)),
+):
+    hashers = tuple(NamespaceHasher(s) for s in [salt, *legacy])
+    challenge = Challenge.generate(obj, rel, HASHES[g], hashers, nonce=_ch_nonce)
+    challenge_cases.append((
+        comment,
+        obj,
+        rel,
+        g,
+        hx(_ch_nonce),
+        hx(salt),
+        hxs(legacy),
+        hx(challenge.to_payload()),
+    ))
+
+# Receipt cases (§8.5): preimage, signed payload. server_hlc values are fixed.
+for comment, verdict, server_hlc, nonce_bytes, key_idx in (
+    ("allow", Verdict.ALLOW, 0x0000123456789ABC, _ch_nonce, 0),
+    ("deny", Verdict.DENY, 0, bytes(32), 1),
+    ("allow_max_hlc", Verdict.ALLOW, 0xFFFFFFFFFFFFFFFF, _ch_nonce, 2),
+):
+    receipt = Receipt(verdict, server_hlc, nonce_bytes).sign(KEYS[key_idx][1])
+    assert receipt.verify(KEYS[key_idx][2]), comment
+    receipt_cases.append((
+        comment,
+        int(verdict),
+        server_hlc,
+        hx(nonce_bytes),
+        key_idx,
+        hx(receipt.preimage()),
+        hx(receipt.to_payload()),
+    ))
+
+# AuthoritativeServer cases (§8.4): handle() a client challenge against a
+# seeded state and verify the signed receipt bytes. The server clock is
+# seeded far in the future so now() is purely logical (deterministic bytes).
+SEED_HLC_MS = 0xFFFFFFFFFFF0
+E8 = 1_700_000_000_000
+
+
+def server_case(name, anchors, steps, obj, rel, g, salt, legacy):
+    """Run Python AuthoritativeServer.handle() and capture canonical bytes."""
+    config_anchors = frozenset(anchors)
+    state = StateVector()
+    hashers = [NamespaceHasher(s) for s in [salt, *legacy]]
+    for step in steps:
+        op = Operation(
+            tuple=Tuple.from_plaintext(
+                object_id=step["object"],
+                relation=step["relation"],
+                grantee=step["grantee"],
+                issuer=step["issuer"],
+                hasher=hashers[step["salt_index"]],
+            ),
+            action=Action(step["action"]),
+            hlc=step["hlc"],
+        )
+        now = step["now"] if step["now"] is not None else (step["hlc"] >> 16) + 10_000
+        assert state.apply(op, now_ms=now), name
+    server = AuthoritativeServer(
+        Config(
+            root_trust_anchors=config_anchors,
+            primary_salt=salt,
+            legacy_salts=tuple(legacy),
+            authoritative_identity=anchors[0],
+        ),
+        state,
+        KEYS[0][1],
+        clock=Clock(SEED_HLC_MS, 0),
+    )
+    challenge = Challenge.generate(obj, rel, HASHES[g], tuple(hashers), nonce=_ch_nonce)
+    payload = challenge.to_payload()
+    receipt_payload = server.handle(payload)
+    receipt = Receipt.from_payload(receipt_payload)
+    assert receipt.nonce == _ch_nonce, name
+    return {
+        "name": name,
+        "salt": hx(salt),
+        "legacy": hxs(legacy),
+        "anchors": hxs(anchors),
+        "authoritative": hx(anchors[0]),
+        "steps": steps,
+        "object": obj,
+        "relation": rel,
+        "grantee": g,
+        "challenge_hex": hx(payload),
+        "verdict": int(receipt.verdict),
+        "receipt_hex": hx(receipt_payload),
+    }
+
+
+# 1: direct grant from the authoritative anchor -> ALLOW
+server_cases.append(server_case(
+    "anchor_grant_allows",
+    [ROOT],
+    [make_step("buzzer", "sound", BOB, ROOT, Action.GRANT, fix_hlc(E8 + 1))],
+    "buzzer", "sound", 3, SALT, (),
+))
+
+# 2: no matching grant -> DENY
+server_cases.append(server_case(
+    "no_grant_denies",
+    [ROOT],
+    [make_step("buzzer", "sound", ALICE, ROOT, Action.GRANT, fix_hlc(E8 + 1))],
+    "buzzer", "sound", 3, SALT, (),
+))
+
+# 3: delegation chain via admin -> ALLOW
+server_cases.append(server_case(
+    "delegated_chain_allows",
+    [ROOT],
+    [
+        make_step("buzzer", "admin", A1, ROOT, Action.GRANT, fix_hlc(E8 + 1)),
+        make_step("buzzer", "sound", BOB, A1, Action.GRANT, fix_hlc(E8 + 2)),
+    ],
+    "buzzer", "sound", 3, SALT, (),
+))
+
+# 4: explicit deny beats allow -> DENY
+server_cases.append(server_case(
+    "deny_beats_allow",
+    [ROOT],
+    [
+        make_step("buzzer", "sound", BOB, ROOT, Action.GRANT, fix_hlc(E8 + 1)),
+        make_step("buzzer", "-sound", BOB, ROOT, Action.GRANT, fix_hlc(E8 + 2)),
+    ],
+    "buzzer", "sound", 3, SALT, (),
+))
+
+# 5: legacy-salt tuple + challenge hashed across both salts -> ALLOW
+server_cases.append(server_case(
+    "legacy_salt_hypothesis_allows",
+    [ROOT],
+    [make_step("o", "r", BOB, ROOT, Action.GRANT, fix_hlc(E8 + 1), salt_index=1)],
+    "o", "r", 3, SALT, (LEGACY_SALT,),
+))
+
+# 6: unknown salt (challenge carries a tag matching no configured salt) -> DENY
+server_cases.append(server_case(
+    "unknown_salt_denies",
+    [ROOT],
+    [make_step("o", "r", BOB, ROOT, Action.GRANT, fix_hlc(E8 + 1))],
+    "o", "r", 3, SALT2, (),
+))
+
+# Malformed challenge payloads: decode must raise (Python raises ValueError).
+def _mangle(payload: bytes, mutate) -> bytes:
+    fields = serialization.unpackb(payload)
+    mutate(fields)
+    return serialization.packb(fields)
+
+
+_good = serialization.unpackb(Challenge.generate(
+    "o", "r", HASHES[3], (NamespaceHasher(SALT),), nonce=_ch_nonce
+).to_payload())
+
+challenge_malformed_cases.extend([
+    ("nonce_wrong_length", hx(serialization.packb([bytes(31), _good[1]]))),
+    ("entry_not_5_elements", hx(serialization.packb([_ch_nonce, [_good[1][0][:4]]]))),
+    ("mismatched_grantee", hx(serialization.packb([_ch_nonce, [
+        _good[1][0],
+        [_good[1][0][0], bytes(16), _good[1][0][2], _good[1][0][3], _good[1][0][4]],
+    ]]))),
+    ("empty_entries", hx(serialization.packb([_ch_nonce, []]))),
+    ("not_an_array", hx(serialization.packb({"nonce": _ch_nonce}))),
+])
+
 # ==============================================================================
 # C++ emission
 # ==============================================================================
@@ -1089,6 +1269,48 @@ namespace DacarFixtures {{
 		const char* reserialized_hex; // parse -> serialize round-trip bytes
 	}};
 
+	struct ChallengeCase {{
+		const char* comment;
+		const char* object;
+		const char* relation;
+		const char* grantee_hex;
+		const char* nonce_hex;   // 32-byte client nonce
+		const char* salt_hex;
+		const char* legacy_hex;  // ';'-joined legacy salts
+		const char* expected_hex; // §8.3 payload bytes
+	}};
+
+	struct ReceiptCase {{
+		const char* comment;
+		int verdict;             // 0x01 ALLOW / 0x00 DENY
+		uint64_t server_hlc;
+		const char* nonce_hex;
+		int key_index;           // signing key index into KEYS
+		const char* preimage_hex;
+		const char* payload_hex; // §8.5 bytes
+	}};
+
+	struct ServerCase {{
+		const char* name;
+		const char* salt_hex;
+		const char* legacy_hex;
+		const char* anchors_hex;
+		const char* authoritative_hex; // 16-byte authoritative identity
+		const StateStep* steps;
+		size_t step_count;
+		const char* object;
+		const char* relation;
+		const char* grantee_hex;
+		const char* challenge_hex;  // §8.3 client payload
+		int verdict;                // expected verdict byte
+		const char* receipt_hex;    // expected signed §8.5 bytes
+	}};
+
+	struct ChallengeMalformedCase {{
+		const char* comment;
+		const char* payload_hex; // invalid §8.3 bytes (decode must throw)
+	}};
+
 ''')
         # Keys
         w.write(f"\tconstexpr size_t KEY_COUNT = {KEY_COUNT};\n")
@@ -1169,6 +1391,43 @@ namespace DacarFixtures {{
             w.write(f"\t\t&ENGINE_CASES_{idx},\n")
         w.write("\t};\n")
         w.write(f"\tconstexpr size_t ENGINE_CASE_COUNT = {len(engine_cases)};\n")
+
+        emit_case_array(w, "ChallengeMalformedCase", "CHALLENGE_MALFORMED_CASES", challenge_malformed_cases,
+                        lambda c: f'{{{cpp_str(c[0])}, {cpp_str(c[1])}}}')
+        w.write(f"\tconstexpr size_t CHALLENGE_MALFORMED_CASE_COUNT = {len(challenge_malformed_cases)};\n")
+
+        emit_case_array(w, "ChallengeCase", "CHALLENGE_CASES", challenge_cases,
+                        lambda c: (
+                            f'{{{cpp_str(c[0])}, {cpp_str(c[1])}, {cpp_str(c[2])}, '
+                            f'{cpp_str(hx(HASHES[c[3]]))}, {cpp_str(c[4])}, {cpp_str(c[5])}, '
+                            f'{cpp_str(c[6])}, {cpp_str(c[7])}}}'
+                        ))
+        w.write(f"\tconstexpr size_t CHALLENGE_CASE_COUNT = {len(challenge_cases)};\n")
+
+        emit_case_array(w, "ReceiptCase", "RECEIPT_CASES", receipt_cases,
+                        lambda c: (
+                            f'{{{cpp_str(c[0])}, {c[1]}, {c[2]}ULL, {cpp_str(c[3])}, '
+                            f'{c[4]}, {cpp_str(c[5])}, {cpp_str(c[6])}}}'
+                        ))
+        w.write(f"\tconstexpr size_t RECEIPT_CASE_COUNT = {len(receipt_cases)};\n")
+
+        w.write("\n\t// -- §8 authoritative server cases --\n")
+        for idx, case in enumerate(server_cases):
+            arr = f"SERVER_STEPS_{idx}"
+            emit_case_array(w, "StateStep", arr, case["steps"], emit_state_step)
+            w.write(
+                f"\tstatic const ServerCase SERVER_CASES_{idx} = "
+                f'{{{cpp_str(case["name"])}, {cpp_str(case["salt"])}, {cpp_str(case["legacy"])}, '
+                f'{cpp_str(case["anchors"])}, {cpp_str(case["authoritative"])}, {arr}, '
+                f'{len(case["steps"])}, {cpp_str(case["object"])}, {cpp_str(case["relation"])}, '
+                f'{cpp_str(hx(HASHES[case["grantee"]]))}, {cpp_str(case["challenge_hex"])}, '
+                f'{case["verdict"]}, {cpp_str(case["receipt_hex"])}}};\n'
+            )
+        w.write("\tstatic const ServerCase* const SERVER_CASES[] = {\n")
+        for idx in range(len(server_cases)):
+            w.write(f"\t\t&SERVER_CASES_{idx},\n")
+        w.write("\t};\n")
+        w.write(f"\tconstexpr size_t SERVER_CASE_COUNT = {len(server_cases)};\n")
 
         emit_case_array(w, "BatchCase", "BATCH_CASES", batch_cases,
                         lambda c: f'{{{cpp_str(c[0])}, {cpp_str(";".join(c[1]))}, {cpp_str(c[2])}}}')
@@ -1263,6 +1522,10 @@ namespace DacarFixtures {{
         f"  store: ini_enc={len(ini_encode_cases)} ini_dec={len(ini_decode_cases)} "
         f"clock={len(clock_file_cases)} ledger={len(ledger_file_cases)} "
         f"identities={len(identities_file_cases)} aliases={len(aliases_rt_cases) + len(aliases_parse_cases)}"
+    )
+    print(
+        f"  challenge: payloads={len(challenge_cases)} receipts={len(receipt_cases)} "
+        f"servers={len(server_cases)} malformed={len(challenge_malformed_cases)}"
     )
 
 

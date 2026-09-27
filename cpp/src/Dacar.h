@@ -29,6 +29,8 @@
 #include "Dacar/Engine.h"
 #include "Dacar/Delta.h"
 #include "Dacar/Store.h"
+#include "Dacar/Challenge.h"
+#include "Dacar/RnsChallenge.h"
 #include "Dacar/PosixStore.h"
 #include "Dacar/MicroStoreIo.h"
 #include "Dacar/Provisioning.h"

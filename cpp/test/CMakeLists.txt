@@ -38,3 +38,24 @@ foreach(test_dir IN LISTS DACAR_TEST_DIRS)
 
     add_test(NAME ${test_dir} COMMAND ${test_dir})
 endforeach()
+
+# -----------------------------------------------------------------------------
+# Two-process §8 challenge interop over UDP loopback (native only).
+#
+# The standalone challenge_authority executable is a second Reticulum stack;
+# a single stack can't deliver data packets to itself (Transport's packet-hash
+# dedup filters looped-back traffic), so the full §8 Link flow needs two.
+# The authority doubles as a manual testing tool against Python clients.
+# -----------------------------------------------------------------------------
+if(DACAR_BUILD_TESTS)
+    add_executable(challenge_authority tools/challenge_authority.cpp)
+    target_link_libraries(challenge_authority PRIVATE Dacar)
+
+    add_executable(test_challenge_udp tools/challenge_udp_test.cpp)
+    target_link_libraries(test_challenge_udp PRIVATE Dacar)
+    target_include_directories(test_challenge_udp PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tools")
+    target_compile_definitions(test_challenge_udp PRIVATE
+        AUTHORITY_EXECUTABLE="$<TARGET_FILE:challenge_authority>"
+    )
+    add_test(NAME test_challenge_udp COMMAND test_challenge_udp)
+endif()

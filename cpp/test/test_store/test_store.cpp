@@ -32,6 +32,8 @@
 #include <unistd.h>
 #endif
 
+#include <string>
+
 #if defined(RNS_USE_PROVISIONING)
 #include "Dacar/Provisioning.h"
 #endif
@@ -638,7 +640,12 @@ void testPosixIdentityRecord() {
 void testMicroStoreBackendRoundTrip() {
 	const std::string base = makeTempDir("dacar-ustore-");
 	TEST_ASSERT_TRUE(!base.empty());
-	microStore::Adapters::UniversalFileSystem fs(base.c_str());
+	// On native, microStore's PosixFileSystem is CWD-relative (basepath is
+	// an ESP32-only concept) — chdir so the segment files stay in the
+	// scratch dir; restored at the end of the test.
+	const std::string previousCwd = std::string(::getcwd(nullptr, 0));
+	TEST_ASSERT_EQUAL_INT(0, ::chdir(base.c_str()));
+	microStore::Adapters::UniversalFileSystem fs;
 	MicroStoreRecordIo::BlobStore blobStore(8192, 2);
 	TEST_ASSERT_TRUE(blobStore.init(fs, "dacar"));
 	MicroStoreRecordIo io(blobStore);
@@ -685,7 +692,7 @@ void testMicroStoreBackendRoundTrip() {
 
 	refIo.remove_records();
 	::rmdir(refDir.c_str());
-	// Best-effort cleanup of the segment files written under base/dacar.
+	::chdir(previousCwd.c_str());
 	::system(("rm -rf '" + base + "'").c_str());
 }
 

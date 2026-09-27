@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **C++**: §8 Strict Consistency Challenge (work doc #16, Phase 3). The
+  pure `Dacar/Challenge` module (fixture-tested against the canonical
+  Python implementation): hashed multi-salt §8.3 challenge payloads, the
+  §8.5 signed Freshness Receipts (pre-image, sign, verify, msgpack codec),
+  the `AuthoritativeServer` (salt-binding via `salt_id_tag` + evaluation
+  through `Engine::evaluate_hashes`), and the `ChallengeClient` (local
+  pre-check, partition -> DENY, nonce/signature verification). The
+  `Dacar/RnsChallenge` adapters wire it to microReticulum: an authority
+  endpoint on `dacar.auth.v1` plus a client-side Link transport and link
+  establishment — bin-wrapping payloads for Python-RNS wire parity.
+  Verified three ways: 17 Unity tests with byte-exact fixtures (challenge
+  payloads, receipts, full server transcripts with seeded clocks), the
+  `test_rns_challenge` stack tests, and a two-process UDP interop test
+  (`test_challenge_udp` + the standalone `challenge_authority` executable)
+  running the real announce -> Link -> challenge -> receipt flow between
+  two Reticulum stacks, covering ALLOW, divergent-state signed DENY, local
+  deny, and partition -> DENY.
 - **C++**: §13 persistence + configuration (work doc #16, Phase 2). A
   backend-neutral `Store` (`cpp/src/Dacar/Store.h`) holds the node's INI
   config, HLC, CRDT state, aliases, plaintext ledger, issuer public-key

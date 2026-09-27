@@ -88,6 +88,25 @@ cd cpp && pio test -e nrf52840-dk-adafruit
   node over BLE/USB/Web-Serial without a filesystem. Salts are `FF_SECRET`
   (never leave the node); trust-affecting fields apply live.
 
+### Strict Consistency Challenge (§8)
+
+`Dacar/Challenge.h` implements the pure §8 logic (hashed hypotheses, signed
+Freshness Receipts, authoritative evaluation, client pre-check + exchange);
+`Dacar/RnsChallenge.h` wires it to microReticulum Links:
+
+- **Authority**: `RnsChallengeServer` exposes `dacar.auth.v1`, accepts
+  Links, and answers challenges with signed receipts. Firmware enforces its
+  own gated actions the same way (e.g. the T1000-E buzzer): take the verified
+  `remote_identity` hash from the Link request, run
+  `Engine::evaluate`/`evaluate_hashes`, act on the verdict.
+- **Client**: `establish_challenge_link` + `RnsLinkTransport` feed the
+  `ChallengeClient`; any timeout/failure defaults to DENY (§8).
+
+The two-process UDP interop test (`test_challenge_udp` spawning
+`challenge_authority`) exercises the real announce → Link → challenge →
+receipt flow between two Reticulum stacks; the authority executable also
+serves for manual testing against Python or C++ clients.
+
 ### Storage sizing guide
 
 A CRDT row is ≈ 67 + 16·S bytes on the wire (S = object segments). A
