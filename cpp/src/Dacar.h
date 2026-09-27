@@ -31,6 +31,7 @@
 #include "Dacar/Store.h"
 #include "Dacar/Challenge.h"
 #include "Dacar/RnsChallenge.h"
+#include "Dacar/RfedCompact.h"
 #include "Dacar/PosixStore.h"
 #include "Dacar/MicroStoreIo.h"
 #include "Dacar/Provisioning.h"

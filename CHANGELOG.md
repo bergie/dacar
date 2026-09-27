@@ -8,6 +8,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Minimal RFed channel client in C++** (§11.1/§11.1.1, work doc #16 Phase
+  4b), structured for spin-out the same way the Python client became the
+  standalone `rfed` package: the generic client lives in `cpp/src/rfed/`
+  (namespace `RFed`, depends only on microReticulum — never on Dacar), and
+  the Dacar-specific compact format is a thin layer on top:
+  - `rfed/Constants.h` (wire constants: RTID magic, destination names,
+    request paths, the 431-byte publish MDU, the 16-round stamp contract),
+    `rfed/Channel` (deterministic channel derivation + `lxmf.delivery`
+    hashes), `rfed/Stamp` (the standard-LXMF memory-hard HKDF workblock,
+    16×256 B at rfed's rounds, with random-trial generation and value-based
+    validation), `rfed/Blob` (SEND/fanout payload framing + RTID prelude
+    verification), and `rfed/Client` (`subscribe`/`unsubscribe` with signed
+    channel payloads and stamp-cost caching, fire-and-forget `send_publish`,
+    paged `pull` with node error-code surfacing, and raw fanout listening on
+    the client's `rfed.delivery` destination).
+  - `Dacar/RfedCompact` — `wrap_dacar_delta`/`unwrap_dacar_delta` (§11.1.1):
+    `"RTID" ‖ sender_pub ‖ delta`, EC-encrypted to the channel identity and
+    framed with the channel hash + optional PoW stamp — wire-compatible with
+    the Python and JavaScript compact formats.
+  - The channel derivation clamps the X25519 scalar per RFC 7748 before
+    loading it into microReticulum: the raw ladder there leaves clamping to
+    the caller, so without the clamp C++ and Python derive *different*
+    channel keypairs (and ECDH secrets) from the same seed. Flagged for
+    upstream microReticulum (seeded identities are also how Provisioning and
+    any other deterministic-identity feature will trip over this).
+  - `test_rfed` (10 cases, byte-exact Python fixtures for channel derivation,
+    delivery hashes, the 4 KiB stamp workblock, stamp values/validation,
+    framing, prelude, subscribe payload/response shapes) and
+    `test_rfed_compact` (5 cases — unwraps a Python-wrapped fixture byte-
+    exactly and wraps/unwraps locally). The C++→Python direction is verified
+    with the new `rfed_wrap_tool` (wrap a Delta in C++, unwrap it with
+    `dacar.transport.rfed_compact`). The generic LXMF-tail channel codec is
+    deliberately not ported yet — the spin-out can add it with an LXMF port.
 - **Direct-link Delta push** (§11, work doc #16 Phase 4a) — the constrained-
   node transport, so a peer can deliver Deltas to an MCU-class node that runs
   neither rfed nor LXMF:

@@ -58,4 +58,9 @@ if(DACAR_BUILD_TESTS)
         AUTHORITY_EXECUTABLE="$<TARGET_FILE:challenge_authority>"
     )
     add_test(NAME test_challenge_udp COMMAND test_challenge_udp)
+
+    # Manual rfed compact-format cross-implementation tool (see its header):
+    # C++ wraps, the Python dacar.transport.rfed_compact unwraps. Not a test.
+    add_executable(rfed_wrap_tool EXCLUDE_FROM_ALL tools/rfed_wrap_tool.cpp)
+    target_link_libraries(rfed_wrap_tool PRIVATE Dacar)
 endif()

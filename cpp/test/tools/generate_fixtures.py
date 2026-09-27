@@ -43,6 +43,26 @@ from dacar.tuple import Tuple  # noqa: E402
 from dacar.verifier import Keyring  # noqa: E402
 from dacar import serialization  # noqa: E402
 
+# The rfed client library (spin-out candidate — the same package the Python
+# RFed client ships as). Installed in the environment (``pip install rfed``)
+# or a sibling rfed-python checkout.
+try:
+    import rfed  # noqa: E402,F401
+except ImportError:
+    sys.path.insert(
+        0,
+        os.environ.get("RFED_PYTHON_PATH")
+        or os.path.normpath(os.path.join(HERE, "..", "..", "..", "rfed-python")),
+    )
+    import rfed  # noqa: E402,F401
+from rfed.channel import derive_channel, delivery_hash_for  # noqa: E402
+from rfed.stamp import (  # noqa: E402
+    channel_stamp_workblock,
+    stamp_valid,
+    stamp_value,
+)
+from dacar.transport.rfed_compact import wrap_dacar_delta  # noqa: E402
+
 # --- fixture identities and salts -------------------------------------------
 
 SALT = bytes(range(32))
@@ -1042,6 +1062,87 @@ challenge_malformed_cases.extend([
 ])
 
 # ==============================================================================
+# §11.1.1 rfed compact-format cases (work doc #16 Phase 4b)
+# ==============================================================================
+
+RFED_CHANNEL_NAMES = ("dacar.policy.v1", "rfed.cpp.test.channel")
+
+
+def _rfed_x25519_scalar(seed: bytes) -> bytes:
+    """The RFC 7748-clamped X25519 scalar (what the C++ ladder must load)."""
+    scalar = bytearray(seed)
+    scalar[0] &= 0xF8
+    scalar[31] = (scalar[31] & 0x7F) | 0x40
+    return bytes(scalar)
+
+
+rfed_channel_cases = []  # (name, seed, x25519_scalar, pub, channel_hash, delivery_hash)
+for _name in RFED_CHANNEL_NAMES:
+    _seed = hashlib.sha256(_name.encode("utf-8")).digest()
+    _identity, _channel_hash = derive_channel(_name)
+    rfed_channel_cases.append((
+        _name,
+        hx(_seed),
+        hx(_rfed_x25519_scalar(_seed)),
+        hx(_identity.get_public_key()),
+        hx(_channel_hash),
+        hx(delivery_hash_for(_identity)),
+    ))
+
+# Stamp vectors: the workblock is the byte-exact HKDF expansion; the all-zero
+# stamp pins the value function; the searched stamp pins validation at a
+# realistic rfed cost (12 — expected ~4096 trials).
+rfed_stamp_cases = []  # (channel_hash, inner_blob, transient, workblock, zero_value, stamp, value, cost)
+for _name in RFED_CHANNEL_NAMES:
+    _identity, _channel_hash = derive_channel(_name)
+    _inner_blob = bytes(range(48))
+    _transient, _workblock = channel_stamp_workblock(_channel_hash, _inner_blob)
+    _stamp = None
+    for _ in range(1 << 20):
+        _candidate = os.urandom(32)
+        if stamp_valid(_candidate, 12, _workblock):
+            _stamp = _candidate
+            break
+    assert _stamp is not None, f"stamp search failed for {_name}"
+    rfed_stamp_cases.append((
+        hx(_channel_hash),
+        hx(_inner_blob),
+        hx(_transient),
+        hx(_workblock),
+        stamp_value(_workblock, bytes(32)),
+        hx(_stamp),
+        stamp_value(_workblock, _stamp),
+        12,
+    ))
+
+# Compact Delta vectors: Python wraps (EC encryption is randomized — the
+# stored ciphertext is deterministic to decrypt, so the C++ suite verifies the
+# Python→C++ direction byte-exactly, and wraps/unwraps its own locally).
+_rf_channel_identity, _ = derive_channel(RFED_CHANNEL_NAMES[1])
+_rf_sender_identity, _ = derive_channel("rfed.cpp.sender.v1")
+_rf_delta = Operation(
+    tuple=Tuple.from_plaintext(
+        object_id="buzzer", relation="sound", grantee=HASHES[3], issuer=HASHES[0],
+        hasher=NamespaceHasher(SALT),
+    ),
+    action=Action.GRANT,
+    hlc=fix_hlc(1700000000000),
+).sign(KEYS[0][1])
+_rf_wrapped = wrap_dacar_delta(
+    channel_identity=_rf_channel_identity,
+    sender_identity=_rf_sender_identity,
+    delta=_rf_delta.to_payload(),
+)
+rfed_compact_cases = [(
+    RFED_CHANNEL_NAMES[1],
+    "rfed.cpp.sender.v1",
+    hx(_rf_sender_identity.get_public_key()),
+    hx(_rf_delta.to_payload()),
+    hx(_rf_wrapped.inner_blob),
+    hx(_rf_wrapped.rfed_payload),
+)]
+
+# ==============================================================================
 # C++ emission
 # ==============================================================================
 
@@ -1311,6 +1412,35 @@ namespace DacarFixtures {{
 		const char* payload_hex; // invalid §8.3 bytes (decode must throw)
 	}};
 
+	struct RfedChannelCase {{
+		const char* name;
+		const char* seed_hex;         // SHA-256(name): the raw derivation seed
+		const char* x25519_scalar_hex; // RFC 7748-clamped X25519 scalar
+		const char* pub_hex;          // 64-byte public bundle
+		const char* channel_hash_hex;
+		const char* delivery_hash_hex;
+	}};
+
+	struct RfedStampCase {{
+		const char* channel_hash_hex;
+		const char* inner_blob_hex;
+		const char* transient_hex;
+		const char* workblock_hex;   // 16 * 256 bytes of HKDF expansion
+		size_t zero_stamp_value;     // value of an all-zero stamp
+		const char* stamp_hex;       // a searched stamp meeting the cost
+		size_t stamp_value;
+		size_t stamp_cost;
+	}};
+
+	struct RfedCompactCase {{
+		const char* channel_name;
+		const char* sender_name;
+		const char* sender_pub_hex;   // 64-byte prelude bundle
+		const char* delta_hex;        // raw §5.3 payload carried in the envelope
+		const char* inner_blob_hex;   // Python-EC-encrypted (C++ decrypts)
+		const char* rfed_payload_hex; // channel_hash ‖ inner_blob (no stamp)
+	}};
+
 ''')
         # Keys
         w.write(f"\tconstexpr size_t KEY_COUNT = {KEY_COUNT};\n")
@@ -1433,6 +1563,27 @@ namespace DacarFixtures {{
                         lambda c: f'{{{cpp_str(c[0])}, {cpp_str(";".join(c[1]))}, {cpp_str(c[2])}}}')
         w.write(f"\tconstexpr size_t BATCH_CASE_COUNT = {len(batch_cases)};\n")
 
+        emit_case_array(
+            w, "RfedChannelCase", "RFED_CHANNEL_CASES", rfed_channel_cases,
+            lambda c: (f'{{{cpp_str(c[0])}, {cpp_str(c[1])}, {cpp_str(c[2])}, {cpp_str(c[3])}, '
+                       f'{cpp_str(c[4])}, {cpp_str(c[5])}}}'),
+        )
+        w.write(f"\tconstexpr size_t RFED_CHANNEL_CASE_COUNT = {len(rfed_channel_cases)};\n")
+
+        emit_case_array(
+            w, "RfedStampCase", "RFED_STAMP_CASES", rfed_stamp_cases,
+            lambda c: (f'{{{cpp_str(c[0])}, {cpp_str(c[1])}, {cpp_str(c[2])}, {cpp_str(c[3])}, '
+                       f'{c[4]}, {cpp_str(c[5])}, {c[6]}, {c[7]}}}'),
+        )
+        w.write(f"\tconstexpr size_t RFED_STAMP_CASE_COUNT = {len(rfed_stamp_cases)};\n")
+
+        emit_case_array(
+            w, "RfedCompactCase", "RFED_COMPACT_CASES", rfed_compact_cases,
+            lambda c: (f'{{{cpp_str(c[0])}, {cpp_str(c[1])}, {cpp_str(c[2])}, '
+                       f'{cpp_str(c[3])}, {cpp_str(c[4])}, {cpp_str(c[5])}}}'),
+        )
+        w.write(f"\tconstexpr size_t RFED_COMPACT_CASE_COUNT = {len(rfed_compact_cases)};\n")
+
         emit_case_array(w, "IniEncodeCase", "INI_ENCODE_CASES", ini_encode_cases,
                         lambda c: (
                             f'{{{cpp_str(c[0])}, {cpp_str(hx(c[1]["primary_salt"]))}, '
@@ -1526,6 +1677,10 @@ namespace DacarFixtures {{
     print(
         f"  challenge: payloads={len(challenge_cases)} receipts={len(receipt_cases)} "
         f"servers={len(server_cases)} malformed={len(challenge_malformed_cases)}"
+    )
+    print(
+        f"  rfed: channels={len(rfed_channel_cases)} stamps={len(rfed_stamp_cases)} "
+        f"compact={len(rfed_compact_cases)}"
     )
 
 
