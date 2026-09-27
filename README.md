@@ -81,7 +81,7 @@ Dacar acts as a decentralized authorization firewall for your off-grid systems. 
    dacar grants --effective                    # list grants with ✔/⚠ authority tracing
    ```
 
-See the [Python](python/README.md) and [JavaScript](javascript/README.md) implementation READMEs for the full `dacar` command reference. In addition to CLI, all these operations can be done inside your application using the Dacar library.
+See the [Python](python/README.md), [JavaScript](javascript/README.md), and [C++](cpp/README.md) implementation READMEs for the full command reference and build instructions. In addition to CLI, all these operations can be done inside your application using the Dacar library.
 
 ## Status
 
@@ -98,6 +98,10 @@ Python implementation of Dacar, a Decentralized Access Control system for Reticu
 ### JavaScript
 
 JavaScript implementation of Dacar, a Decentralized Access Control system for Reticulum. Runs in browsers and on servers (Node, Deno, Bun), built on the reticulum-js packages (`@reticulum/core`, `@reticulum/lxmf`, `@reticulum/rfed`).
+
+### C++
+
+C++ implementation of Dacar, a Decentralized Access Control system for Reticulum, for microReticulum-class MCU nodes (ESP32, nRF52 — the constrained tier) as well as native platforms. Structured as a PlatformIO library plus a CMake native build, it covers the full policy core (namespace hashing, HLCs, signed operations, threshold groups, the CRDT, the evaluation engine), §13 persistence byte-compatible with the Python and JavaScript stores, and the §8 Strict Consistency Challenge over RNS Links. See [cpp/README.md](cpp/README.md) for dependencies, build, and storage sizing.
 
 ## Development
 
