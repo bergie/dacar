@@ -216,6 +216,36 @@ def build_parser() -> argparse.ArgumentParser:
     _add_global_flags(p)
     p.set_defaults(func=_cmd_publish)
 
+    # -- push (§11 direct-link delivery, work doc #16 Phase 4a) --------------
+    p = sub.add_parser(
+        "push",
+        help="push signed delta(s) to a node over a direct Link "
+             "(online, §11 — the constrained-node/MCU path)",
+    )
+    p.add_argument("node",
+                   help="target node's identity hash or alias — its dacar.sync.v1 "
+                        "destination is derived from it and the deltas are pushed "
+                        "over a Link (verify-on-ingest on the node)")
+    p.add_argument("payloads", nargs="*",
+                   help="payload file path(s) (or - for stdin); hex or binary")
+    p.add_argument("--outbox", action="store_true",
+                   help="push + move the outbox (unsent deltas) to the sent box")
+    p.add_argument("--sent", action="store_true",
+                   help="re-send every Delta in the sent box (durable replay log; idempotent)")
+    p.add_argument("--all", action="store_true",
+                   help="push outbox + sent box (everything this node has issued)")
+    p.add_argument("--binary", action="store_true",
+                   help="treat file input as raw binary (skip hex auto-detect)")
+    p.add_argument("--timeout", type=float, default=None,
+                   help="per-Delta Link request timeout in seconds (default: 15)")
+    p.add_argument("--interface", default="shared",
+                   choices=["shared", "auto", "tcp"],
+                   help="RNS interface mode (shared=attach to rnsd, auto=create default, tcp=direct TCP)")
+    p.add_argument("--rns-config", default=None,
+                   help="RNS config directory (default: ~/.reticulum or $DACAR_RNS_CONFIG)")
+    _add_global_flags(p)
+    p.set_defaults(func=_cmd_push)
+
     # -- paper messages (§11.3, work doc #14) --------------------------------
     paper = sub.add_parser(
         "paper",
@@ -493,6 +523,12 @@ def _cmd_publish(args):
     from dacar.cli.commands import cmd_publish
     args.store = _store_path(args)
     return cmd_publish(args)
+
+
+def _cmd_push(args):
+    from dacar.cli.commands import cmd_push
+    args.store = _store_path(args)
+    return cmd_push(args)
 
 
 def _cmd_paper_export(args):

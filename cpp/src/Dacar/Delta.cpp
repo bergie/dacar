@@ -8,6 +8,8 @@
 
 #include <MsgPack.h>
 
+#include <string>
+
 using namespace Dacar;
 
 bool DeltaReceiver::apply_payload(const RNS::Bytes& payload, int64_t now_ms, int64_t max_future_ms) {
@@ -51,5 +53,29 @@ size_t DeltaReceiver::apply_payloads(const RNS::Bytes& payload, int64_t now_ms, 
 	for (const auto& payload : operation_payloads) {
 		p.packBinary(payload.data(), payload.size());
 	}
+	return RNS::Bytes(p.data(), p.size());
+}
+
+RNS::Bytes DeltaReceiver::handle_push(const RNS::Bytes& request, int64_t now_ms, int64_t max_future_ms) {
+	size_t applied = 0;
+	if (request && apply_payload(request, now_ms, max_future_ms)) {
+		applied = 1;
+	}
+	else if (request) {
+		try {
+			applied = apply_payloads(request, now_ms, max_future_ms);
+		}
+		catch (...) {
+			applied = 0; // garbage must never crash a request handler
+		}
+	}
+	return pack_ack(applied);
+}
+
+/*static*/ RNS::Bytes DeltaReceiver::pack_ack(size_t applied) {
+	MsgPack::Packer p;
+	p.packMapSize(1);
+	p.pack(std::string("applied"));
+	p.pack<uint32_t>((uint32_t)applied);
 	return RNS::Bytes(p.data(), p.size());
 }

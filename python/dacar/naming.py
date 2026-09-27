@@ -7,8 +7,9 @@ These are pure, dependency-free constants. Two scopes:
   deployment-specific topic to isolate their policy feeds (verify-on-ingest
   limits cross-feed damage, but does not stop the bandwidth cost or the risk of
   shared root anchors).
-* **CHALLENGE_DESTINATION** and **LXMF_DELIVERY_TITLE** are *fixed
-  discriminators*. The §8 Challenge and §11.2 LXMF delivery are addressed
+* **CHALLENGE_DESTINATION**, **SYNC_DESTINATION**, and
+  **LXMF_DELIVERY_TITLE** are *fixed discriminators*. The §8 Challenge, the
+  §11 direct-link Delta push, and §11.2 LXMF delivery are addressed
   point-to-point to a specific Identity, so RNS derives isolation from the
   destination *hash* (which embeds the target Identity), not from this name.
 
@@ -28,6 +29,17 @@ CHALLENGE_ASPECTS = ("auth", "v1")
 
 #: The full dotted name of the §8 Authoritative Challenge destination.
 CHALLENGE_DESTINATION = ".".join((APP_NAME, *CHALLENGE_ASPECTS))  # "dacar.auth.v1"
+
+#: Aspects of the direct-link Delta ingestion destination (§11, work doc #16
+#: Phase 4a). A constrained node (e.g. an MCU running microReticulum) exposes
+#: this destination so a peer can push raw §5.3 Delta payloads to it over a
+#: Link request; the node ingests them through verify-on-ingest (§11.2.4),
+#: which makes any transport valid — the same precedent as optical Paper
+#: Messages (§11.3).
+SYNC_ASPECTS = ("sync", "v1")
+
+#: The full dotted name of the direct-link Delta ingestion destination.
+SYNC_DESTINATION = ".".join((APP_NAME, *SYNC_ASPECTS))  # "dacar.sync.v1"
 
 #: RFed topic for many-to-many CRDT convergence (§11.1). Deployment-overridable
 #: default -- RFed is broadcast, so shared-network deployments SHOULD set a

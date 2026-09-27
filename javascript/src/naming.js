@@ -8,10 +8,11 @@
  *     deployment-specific topic to isolate their policy feeds (verify-on-ingest
  *     limits cross-feed damage, but not the bandwidth cost or the risk of
  *     shared root anchors).
- *   - `CHALLENGE_DESTINATION` and `LXMF_DELIVERY_TITLE` are *fixed
- *     discriminators*. The §8 Challenge and §11.2 LXMF delivery are addressed
- *     point-to-point to a specific Identity, so RNS derives isolation from the
- *     destination *hash* (which embeds the target Identity), not from this name.
+ *   - `CHALLENGE_DESTINATION`, `SYNC_DESTINATION`, and `LXMF_DELIVERY_TITLE`
+ *     are *fixed discriminators*. The §8 Challenge, the §11 direct-link Delta
+ *     push, and §11.2 LXMF delivery are addressed point-to-point to a specific
+ *     Identity, so RNS derives isolation from the destination *hash* (which
+ *     embeds the target Identity), not from this name.
  *
  * Both the pure core and the (optional) transport adapters reference these, so
  * the on-wire naming is defined in one place and stays consistent across
@@ -27,6 +28,19 @@ export const CHALLENGE_ASPECTS = Object.freeze(["auth", "v1"]);
 
 /** The full dotted name of the §8 Authoritative Challenge destination. */
 export const CHALLENGE_DESTINATION = "dacar.auth.v1";
+
+/**
+ * Aspects of the direct-link Delta ingestion destination (§11, work doc #16
+ * Phase 4a). A constrained node (e.g. an MCU running microReticulum) exposes
+ * this destination so a peer can push raw §5.3 Delta payloads to it over a
+ * Link request; the node ingests them through verify-on-ingest (§11.2.4),
+ * which makes any transport valid — the same precedent as optical Paper
+ * Messages (§11.3).
+ */
+export const SYNC_ASPECTS = Object.freeze(["sync", "v1"]);
+
+/** The full dotted name of the direct-link Delta ingestion destination. */
+export const SYNC_DESTINATION = "dacar.sync.v1";
 
 /**
  * RFed topic for many-to-many CRDT convergence (§11.1). Deployment-overridable

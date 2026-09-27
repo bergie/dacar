@@ -153,6 +153,73 @@ void testFutureSkewedElementRejected() {
 	TEST_ASSERT_EQUAL_size_t(0, state.size());
 }
 
+// -- direct-link push inbound seam (§11, work doc #16 Phase 4a) -------------
+
+void testPackAckMatchesCanonicalBytes() {
+	// fixmap(1) | fixstr "applied" | 1 — byte-identical with the Python/JS
+	// acks (msgpack.use_bin_type parity pinned by their suites).
+	TEST_ASSERT_EQUAL_STRING("81a76170706c69656401", DeltaReceiver::pack_ack(1).toHex().c_str());
+	TEST_ASSERT_EQUAL_STRING("81a76170706c69656400", DeltaReceiver::pack_ack(0).toHex().c_str());
+}
+
+void testHandlePushAppliesSingleDelta() {
+	Keyring ring = fixtureKeyring();
+	StateVector state;
+	DeltaReceiver receiver(state, ring);
+	Operation first = Operation::from_payload(opPayload(0));
+	int64_t now = (int64_t)(first.hlc() >> 16);
+	RNS::Bytes ack = receiver.handle_push(opPayload(0), now);
+	TEST_ASSERT_EQUAL_STRING("81a76170706c69656401", ack.toHex().c_str());
+	TEST_ASSERT_EQUAL_size_t(1, state.size());
+}
+
+void testHandlePushAppliesBatch() {
+	Keyring ring = fixtureKeyring();
+	StateVector state;
+	DeltaReceiver receiver(state, ring);
+	RNS::Bytes batch = DeltaReceiver::pack_payloads(
+		bytesVecFromHex(DacarFixtures::BATCH_CASES[0].payloads_hex));
+	Operation first = Operation::from_payload(opPayload(0));
+	int64_t now = (int64_t)(first.hlc() >> 16);
+	RNS::Bytes ack = receiver.handle_push(batch, now);
+	TEST_ASSERT_EQUAL_STRING("81a76170706c69656402", ack.toHex().c_str());
+	TEST_ASSERT_EQUAL_size_t(2, state.size());
+}
+
+void testHandlePushDuplicateIsIdempotentSuccess() {
+	Keyring ring = fixtureKeyring();
+	StateVector state;
+	DeltaReceiver receiver(state, ring);
+	Operation first = Operation::from_payload(opPayload(0));
+	int64_t now = (int64_t)(first.hlc() >> 16);
+	TEST_ASSERT_EQUAL_STRING(
+		"81a76170706c69656401", receiver.handle_push(opPayload(0), now).toHex().c_str());
+	// The re-push acks applied:1 even though state is unchanged, so the
+	// pusher's outbox drains (CRDT merge is idempotent).
+	TEST_ASSERT_EQUAL_STRING(
+		"81a76170706c69656401", receiver.handle_push(opPayload(0), now).toHex().c_str());
+	TEST_ASSERT_EQUAL_size_t(1, state.size());
+}
+
+void testHandlePushGarbageAcksZero() {
+	Keyring ring = fixtureKeyring();
+	StateVector state;
+	DeltaReceiver receiver(state, ring);
+	TEST_ASSERT_EQUAL_STRING(
+		"81a76170706c69656400", receiver.handle_push(RNS::Bytes()).toHex().c_str());
+	TEST_ASSERT_EQUAL_STRING(
+		"81a76170706c69656400", receiver.handle_push(RNS::Bytes("not-msgpack")).toHex().c_str());
+	TEST_ASSERT_EQUAL_size_t(0, state.size());
+}
+
+void testHandlePushUnknownIssuerAcksZero() {
+	StateVector state;
+	DeltaReceiver receiver(state, Keyring());
+	RNS::Bytes ack = receiver.handle_push(opPayload(0));
+	TEST_ASSERT_EQUAL_STRING("81a76170706c69656400", ack.toHex().c_str());
+	TEST_ASSERT_EQUAL_size_t(0, state.size());
+}
+
 int runUnityTests(void) {
 	UNITY_BEGIN();
 	RUN_TEST(testBatchEncodingMatchesCanonical);
@@ -165,6 +232,12 @@ int runUnityTests(void) {
 	RUN_TEST(testUnknownIssuerElementDropped);
 	RUN_TEST(testMalformedOuterPayloadIsSwallowed);
 	RUN_TEST(testFutureSkewedElementRejected);
+	RUN_TEST(testPackAckMatchesCanonicalBytes);
+	RUN_TEST(testHandlePushAppliesSingleDelta);
+	RUN_TEST(testHandlePushAppliesBatch);
+	RUN_TEST(testHandlePushDuplicateIsIdempotentSuccess);
+	RUN_TEST(testHandlePushGarbageAcksZero);
+	RUN_TEST(testHandlePushUnknownIssuerAcksZero);
 	return UNITY_END();
 }
 

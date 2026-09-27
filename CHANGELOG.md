@@ -8,6 +8,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Direct-link Delta push** (§11, work doc #16 Phase 4a) — the constrained-
+  node transport, so a peer can deliver Deltas to an MCU-class node that runs
+  neither rfed nor LXMF:
+  - The receiving node exposes the `dacar.sync.v1` destination (naming
+    constants added in all three implementations) and ingests Link-request
+    payloads through verify-on-ingest (§11.2.4) — the transport adds no
+    trust, the same precedent as optical Paper Messages (§11.3). Request
+    path `delta`; a raw §5.3 payload or a §11.1 batch per request; the
+    response is a byte-pinned ack (`{"applied": n}`) distinguishing "node
+    refused (kept in outbox)" from "request lost (retry)".
+  - **Python**: `dacar/transport/rns_sync.py` (`RnsSyncServer`,
+    `handle_push`, `push_deltas`, ack codec) and the `dacar push <node>` CLI
+    command — the target node's identity hash/alias is a positional, sources
+    mirror `publish` (`<file>...` or `--outbox`/`--sent`/`--all` with the
+    same durable outbox → sent lifecycle, doc #11), and the pusher announces
+    its identity first so the node can recall the issuer.
+  - **JavaScript**: `src/transport/rnsSync.js` (`RnsSyncServer`, `handlePush`,
+    `pushDeltas`, `pushOne`, ack codec) and the `dacar push <node>` CLI
+    command with the same source families and lifecycle; exported from
+    `@reticulum/dacar/transport`.
+  - **C++**: `DeltaReceiver::handle_push` + `DeltaReceiver::pack_ack` — the
+    pure inbound seam an MCU firmware request handler needs on the
+    `dacar.sync.v1` destination (register it on the RNS side and feed it the
+    request bytes); ack bytes are pinned identical across implementations.
+  - Tests: Python `test_transport_rns_sync` + `test_cli_push`, JS
+    `transport-rns-sync.test.js` + `cli-push.test.js`, and six new C++
+    `test_delta` cases (ack bytes, single/batch/duplicate/garbage/unknown
+    issuer through the seam).
 - **C++**: §8 Strict Consistency Challenge (work doc #16, Phase 3). The
   pure `Dacar/Challenge` module (fixture-tested against the canonical
   Python implementation): hashed multi-salt §8.3 challenge payloads, the

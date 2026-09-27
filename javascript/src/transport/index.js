@@ -9,6 +9,7 @@
  *
  *   - {@link RnsIdentityResolver}      §3.1, §11.2.4  recall → verify key
  *   - {@link RnsChallengeServer} &c.   §8             Challenge over an RNS Link
+ *   - {@link RnsSyncServer} &c.        §11            direct-link Delta push
  *   - {@link LxmfDeltaDelivery}        §11.2/§11.3    targeted LXMF + Paper Messages
  *   - {@link RfedDeltaSync}            §11.1          RFed many-to-many convergence
  *
@@ -28,6 +29,19 @@ export {
   RnsLinkTransport,
   establishLink,
 } from "./rnsChallenge.js";
+
+export {
+  SYNC_REQUEST_PATH,
+  DEFAULT_PUSH_TIMEOUT_MS,
+  DEFAULT_PATH_TIMEOUT_MS,
+  packAck,
+  unpackAck,
+  handlePush,
+  syncRequestHandler,
+  RnsSyncServer,
+  ensureSyncPath,
+  pushDeltas,
+} from "./rnsSync.js";
 
 export {
   LxmfDeltaDelivery,

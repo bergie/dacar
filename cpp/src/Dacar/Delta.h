@@ -90,6 +90,34 @@ namespace Dacar {
 		*/
 		static RNS::Bytes pack_payloads(const Vector<RNS::Bytes>& operation_payloads);
 
+		/*
+		Direct-link Delta push inbound seam (§11, work doc #16 Phase 4a).
+
+		Apply one Link-request payload — a raw §5.3 Delta, or a §11.1 batch
+		of them (tried in that order; the two shapes are unambiguous) — and
+		return the ack: a MessagePack map {"applied": n}. Every outcome yields
+		an ack (even 0), so a pusher can distinguish "node refused (kept in
+		its outbox)" from "request lost (retry)". Garbage and internal errors
+		ack 0; this method never throws — a request handler must not crash on
+		arbitrary bytes.
+
+		This is the entire body an MCU firmware's request handler needs:
+		register it on the dacar.sync.v1 destination (Naming.h) and feed it
+		the request bytes; verify-on-ingest authenticates each Delta by the
+		issuer's signature, so the transport adds no trust.
+		*/
+		RNS::Bytes handle_push(
+			const RNS::Bytes& request,
+			int64_t now_ms = -1,
+			int64_t max_future_ms = DEFAULT_MAX_FUTURE_MS
+		);
+
+		/*
+		Encode the push ack: a MessagePack map {"applied": n}. Byte-identical
+		to the Python/JS acks (fixmap | fixstr "applied" | integer).
+		*/
+		static RNS::Bytes pack_ack(size_t applied);
+
 	private:
 		StateVector& _state;
 		KeyResolver _resolver;

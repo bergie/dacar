@@ -1881,6 +1881,143 @@ def cmd_publish(args) -> int:
     return EXIT_OK
 
 
+def cmd_push(args) -> int:
+    """``dacar push`` — push signed delta(s) to a node over a direct Link
+    (§11, work doc #16 Phase 4a).
+
+    The constrained-node path: rfed and LXMF are too heavy for an MCU running
+    microReticulum, so the node exposes the ``dacar.sync.v1`` destination and
+    this command sends raw §5.3 payloads to it over Link requests. The node
+    ingests each Delta through verify-on-ingest (§11.2.4) — the transport
+    adds no trust, exactly like optical Paper Messages (§11.3), so this works
+    for any reachable dacar node.
+
+    Sources are the same families as ``publish``: previously-signed payload
+    file(s) (exact bytes, no re-sign, not this node's issuance → not recorded
+    to the sent box), or this node's own issuance via ``--outbox``/``--sent``
+    /``--all`` (implied ``--outbox``; accepted deltas drain from the outbox
+    into the sent box, work doc #11).
+
+    ``node`` (positional) is the target node's *identity hash* (or alias):
+    the ``dacar.sync.v1`` destination is derived from it, its path is
+    requested, and one Link carries all Deltas. The announce invariant
+    (§11.2.4) is load-bearing here too: this node announces its identity
+    before pushing, or the target drops the Deltas as "unknown issuer".
+    """
+    store = Store(args.store, identity_override=args.identity)
+    store.ensure()
+    identity = store.load_identity()
+    if identity is None:
+        raise CliError("no signing identity (run `dacar init` or `dacar identity new`)")
+
+    aliases = store.load_aliases()
+    target = resolve_identity(args.node, aliases)
+
+    use_outbox = getattr(args, "outbox", False) or getattr(args, "all", False)
+    use_sent = getattr(args, "sent", False) or getattr(args, "all", False)
+    files = list(args.payloads or [])
+    from_stores = use_outbox or use_sent
+
+    if files and from_stores:
+        raise CliError(
+            "push: use either <file>... or a source flag (--outbox/--sent/--all), not both"
+        )
+    if not files and not from_stores:
+        use_outbox = True
+
+    to_push: List[bytes] = []
+    if use_outbox:
+        to_push.extend(store.load_outbox())
+    if use_sent:
+        to_push.extend(store.load_sent())
+    for path in files:
+        data = _read_payload_input(path, args.binary)
+        if not data:
+            raise CliError(f"empty payload: {path}")
+        to_push.append(data)
+
+    if not to_push:
+        which = " + ".join(
+            name for name, on in (("outbox", use_outbox), ("sent", use_sent)) if on
+        ) or "outbox"
+        _err(f"nothing to push ({which} empty)")
+        return EXIT_OK
+
+    # Dedup the send list by exact bytes, preserving first-seen order (a delta
+    # could appear in both the outbox and the sent box after a partial-failure
+    # recovery; sending it once is sufficient — CRDT merge is idempotent).
+    seen: set = set()
+    deduped: List[bytes] = []
+    for payload in to_push:
+        b = bytes(payload)
+        if b not in seen:
+            seen.add(b)
+            deduped.append(b)
+
+    # External file payloads are not this node's issuance -> not logged to the
+    # sent box. Anything sourced from a store (outbox/sent/--all) is recorded.
+    record_to_sent = not bool(files)
+
+    label_parts: List[str] = []
+    if use_outbox:
+        label_parts.append("outbox")
+    if use_sent:
+        label_parts.append("sent")
+    if files:
+        label_parts.append(f"{len(files)} file(s)")
+    _err(f"  pushing {len(deduped)} delta(s) ({' + '.join(label_parts)}) to "
+         f"{render_identity(target, aliases, full=args.full_hashes)} via direct link")
+
+    accepted = _push_deltas(args, store, identity, deduped, target)
+    n_sent = _record_publish(store, deduped, accepted, record_to_sent=record_to_sent)
+
+    applied = sum(1 for ok in accepted if ok)
+    if applied < len(deduped):
+        _err(f"  ⚠ {len(deduped) - applied} delta(s) not accepted by the node "
+             "(refused or link lost; retained for retry)")
+    if use_outbox and not files:
+        _err(
+            f"  ({n_sent} moved outbox → sent box; "
+            "`dacar push --sent <node>` to re-send)"
+        )
+    elif use_sent and not use_outbox and not files:
+        _err("  (sent box re-sent; not modified — idempotent)")
+    return EXIT_OK
+
+
+def _push_deltas(
+    args, store: Store, identity, payloads: List[bytes], target: bytes
+) -> List[bool]:
+    """Online direct-link push hook for ``push`` (work doc #16 Phase 4a).
+
+    Boots RNS **once**, announces the node identity (the announce invariant —
+    without it the target drops every Delta as "unknown issuer"), seeds the
+    durable issuer cache, then hands the whole batch to the transport's
+    :func:`~dacar.transport.rns_sync.push_deltas` (one Link, one request per
+    Delta). Returns per-Delta acceptance flags for :func:`_record_publish`.
+    This is the RNS boot seam that tests patch with a fake.
+    """
+    from dacar.cli.rns import announce_identity, boot, register_announce_handler
+    from dacar.transport.rns_sync import DEFAULT_PUSH_TIMEOUT, push_deltas as transport_push
+
+    rns = boot(_resolve_rns_config_dir(args))
+    announce_identity(identity)  # announce invariant (§11.2.4)
+
+    # Durable issuer cache (work doc #5): same seeding as the other online legs.
+    keyring = store.load_keyring()
+    keyring.register_single(identity.hash, identity.sig_pub_bytes)
+    register_announce_handler(keyring, on_save=store.save_keyring)
+    store.save_keyring(keyring)
+
+    timeout = getattr(args, "timeout", None) or DEFAULT_PUSH_TIMEOUT
+    return transport_push(
+        list(payloads),
+        bytes(target),
+        timeout=timeout,
+        on_request=lambda: _err("  requesting node path…"),
+    )
+
+
 def _prune_payload_list(
     payloads: List[bytes], horizon_ms: int, *, now_ms: Optional[int] = None
 ) -> tuple:

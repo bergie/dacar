@@ -19,6 +19,7 @@
  *   dacar grants
  *   dacar revoke <grantee> <relation> <object> [--publish]
  *   dacar publish <file> [<file>...] | --outbox | --sent | --all   (docs #8/#11)
+ *   dacar push <node> [<file>...] | --outbox | --sent | --all     (§11, doc #16 4a)
  *   dacar identity remember|forget|list ...
  *
  * Online flags: --node <hash>, --topic <topic>, --interface shared|auto|tcp,
@@ -51,6 +52,7 @@ import {
   registerAnnounceHandler, bootLxmfRouter, lxmfOutDestination, runLxmfPublish, runLxmfSync,
 } from "./session.js";
 import { LxmfDeltaDelivery, packPaperUris } from "../transport/lxmfSync.js";
+import { DEFAULT_PUSH_TIMEOUT_MS, pushDeltas as pushDeltasOverLink } from "../transport/rnsSync.js";
 
 const SHORT_HASH = 7;
 
@@ -990,6 +992,129 @@ async function cmdPublish(args) {
   return 0;
 }
 
+async function cmdPush(args) {
+  const store = await openStore(args);
+  const identity = await store.loadIdentity();
+  if (!identity) throw new CliError("no signing identity (run `dacar init`)");
+
+  // The target node is positional[0]; payload files are positionals 1..N
+  // (`positional` naming is unused for push — see the SUBCOMMANDS entry).
+  const positionals = args._positionals ?? [];
+  const nodeArg = positionals[0];
+  if (!nodeArg) throw new CliError("push: no target node given (usage: dacar push <node> [...])");
+  const aliases = await store.loadAliases();
+  const target = resolveIdentityHash(nodeArg, aliases);
+  const files = positionals.slice(1);
+
+  const useAll = !!args.all;
+  let useOutbox = !!args.outbox || useAll;
+  let useSent = !!args.sent || useAll;
+  let fromStores = useOutbox || useSent;
+
+  if (files.length && fromStores) {
+    throw new CliError(
+      "push: use either <file>... or a source flag (--outbox/--sent/--all), not both",
+    );
+  }
+  // With no files and no source flag, `--outbox` is implied (doc #11): the
+  // common case is "flush what I've issued".
+  if (!files.length && !fromStores) {
+    useOutbox = true;
+    fromStores = true;
+  }
+
+  /** @type {Uint8Array[]} */
+  const toPush = [];
+  if (useOutbox) toPush.push(...(await store.loadOutbox()));
+  if (useSent) toPush.push(...(await store.loadSent()));
+  for (const path of files) {
+    const data = await readPayloadInput(path, !!args.binary);
+    if (!data.length) throw new CliError(`empty payload: ${path}`);
+    toPush.push(data);
+  }
+
+  if (!toPush.length) {
+    const which = [
+      ["outbox", useOutbox],
+      ["sent", useSent],
+    ].filter(([, on]) => on).map(([n]) => n).join(" + ") || "outbox";
+    err(`nothing to push (${which} empty)`);
+    return 0;
+  }
+
+  // Dedup the send list by exact bytes, preserving first-seen order (a delta
+  // could appear in both the outbox and the sent box after a partial-failure
+  // recovery; sending it once is sufficient — CRDT merge is idempotent).
+  const seen = new Set();
+  const deduped = [];
+  for (const payload of toPush) {
+    const h = toHex(payload);
+    if (!seen.has(h)) {
+      seen.add(h);
+      deduped.push(new Uint8Array(payload));
+    }
+  }
+
+  // External file payloads are not this node's issuance -> not logged to the
+  // sent box. Anything sourced from a store (outbox/sent/--all) is recorded.
+  const recordToSent = files.length === 0;
+
+  const labelParts = [];
+  if (useOutbox) labelParts.push("outbox");
+  if (useSent) labelParts.push("sent");
+  if (files.length) labelParts.push(`${files.length} file(s)`);
+  err(`  pushing ${deduped.length} delta(s) (${labelParts.join(" + ")}) to ` +
+    `${shortHash(target, args.fullHashes)} via direct link`);
+
+  const accepted = await pushDelta(args, store, identity, deduped, target);
+  const nSent = await recordPublish(store, deduped, accepted, { recordToSent });
+
+  const applied = accepted.filter((ok) => ok).length;
+  if (applied < deduped.length) {
+    err(`  ⚠ ${deduped.length - applied} delta(s) not accepted by the node ` +
+      "(refused or link lost; retained for retry)");
+  }
+  if (useOutbox && !files.length) {
+    err(`  (${nSent} moved outbox → sent box; ` +
+      "`dacar push --sent <node>` to re-send)");
+  } else if (useSent && !useOutbox && !files.length) {
+    err("  (sent box re-sent; not modified — idempotent)");
+  }
+  return 0;
+}
+
+/**
+ * Online direct-link push hook for `push` (§11, work doc #16 Phase 4a) — the
+ * sibling of `publishDelta` and the seam tests patch with a fake.
+ *
+ * Boots RNS once, announces the node identity (the announce invariant —
+ * without it the target drops every Delta as "unknown issuer"), seeds the
+ * durable keyring, then hands the whole batch to the transport's
+ * `pushDeltas` (one Link, one request per Delta). Returns per-Delta
+ * acceptance flags for `recordPublish` (work doc #11 — same outbox → sent
+ * lifecycle regardless of transport).
+ */
+async function pushDelta(args, store, identity, payloads, target) {
+  const configDir = await resolveRnsConfigDir(args);
+  const rns = await bootRns(configDir, args.interface || "shared", {
+    verbose: !!args.verbose,
+  });
+  await announceIdentity(identity, rns);
+
+  // Durable issuer cache (doc #5): same seeding as the other online legs.
+  const keyring = await store.loadKeyring();
+  keyring.registerSingle(identity.identityHash, await identity.getPublicKey());
+  await registerAnnounceHandler({ rns, keyring, onSave: (kr) => store.saveKeyring(kr) });
+  await store.saveKeyring(keyring);
+
+  return pushDeltasOverLink(payloads, target, {
+    rns,
+    // --timeout is in seconds (Python parity); the transport speaks ms.
+    timeoutMs: args.timeout ? Number(args.timeout) * 1000 : DEFAULT_PUSH_TIMEOUT_MS,
+    onRequest: () => err("  requesting node path…"),
+  });
+}
+
 async function readStdin() {
   const chunks = [];
   for await (const chunk of process.stdin) chunks.push(chunk);
@@ -1146,6 +1271,14 @@ const SUBCOMMANDS = {
     run: cmdPublish,
     opts: { all: "boolean", outbox: "boolean", sent: "boolean", binary: "boolean", lxmf: "string", direct: "boolean", node: "string", discover: "boolean", topic: "string", proprietor: "string", "rns-dir": "string", interface: "string" },
     // variable file list (0..N) accessed via args._positionals
+    online: true,
+  },
+  push: {
+    run: cmdPush,
+    // The target node is positional[0]; the payload file list (0..N) is
+    // positionals 1..N, read from args._positionals in cmdPush (a leading
+    // fixed positional plus a variadic rest can't use the `positional` map).
+    opts: { all: "boolean", outbox: "boolean", sent: "boolean", binary: "boolean", timeout: "string", "rns-dir": "string", interface: "string" },
     online: true,
   },
   paper: {
