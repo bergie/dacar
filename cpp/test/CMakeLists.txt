@@ -63,4 +63,21 @@ if(DACAR_BUILD_TESTS)
     # C++ wraps, the Python dacar.transport.rfed_compact unwraps. Not a test.
     add_executable(rfed_wrap_tool EXCLUDE_FROM_ALL tools/rfed_wrap_tool.cpp)
     target_link_libraries(rfed_wrap_tool PRIVATE Dacar)
+
+    # -----------------------------------------------------------------------------
+    # Two-process rfed publish interop over UDP loopback: the resource_sink is
+    # a minimal rfed publish node (DATA packets + ACCEPT_ALL Resource
+    # ingestion); the test drives RFedClient::send_publish through both wire
+    # paths and verifies the sink received the bytes intact.
+    # -----------------------------------------------------------------------------
+    add_executable(resource_sink tools/resource_sink.cpp)
+    target_link_libraries(resource_sink PRIVATE Dacar)
+
+    add_executable(test_resource_publish tools/resource_publish_test.cpp)
+    target_link_libraries(test_resource_publish PRIVATE Dacar)
+    target_compile_definitions(test_resource_publish PRIVATE
+        SINK_EXECUTABLE="$<TARGET_FILE:resource_sink>"
+    )
+    add_test(NAME test_resource_publish COMMAND test_resource_publish)
+
 endif()

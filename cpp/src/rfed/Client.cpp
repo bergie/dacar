@@ -9,6 +9,7 @@
 #include "microReticulum/Cryptography/Random.h"
 #include "microReticulum/Log.h"
 #include "microReticulum/Packet.h"
+#include "microReticulum/Resource.h"
 #include "microReticulum/Transport.h"
 #include "microReticulum/Utilities/OS.h"
 
@@ -130,6 +131,18 @@ namespace RFed {
 		void on_link_established(RNS::Link& link) {
 			(void)link;
 			_link_established = true;
+		}
+
+		/*
+		Resource transfer bookkeeping (single-flight, like the requests):
+		the concluded callback fires on both successful assembly and
+		assembly failure — the status distinguishes them.
+		*/
+		volatile bool _resource_done = false;
+
+		void on_resource_concluded(const RNS::Resource& resource) {
+			(void)resource;
+			_resource_done = true;
 		}
 
 		/*
@@ -318,14 +331,6 @@ namespace RFed {
 	}
 
 	bool RFedClient::send_publish(const RNS::Bytes& node_hash, const RNS::Bytes& rfed_payload) {
-		if (rfed_payload.size() > PUBLISH_DATA_MAX) {
-			ERRORF(
-				"rfed publish payload %u bytes exceeds the %u-byte single-packet MDU "
-				"(the Resource-over-link path is not part of this port)",
-				rfed_payload.size(), PUBLISH_DATA_MAX
-			);
-			return false;
-		}
 		const RNS::Identity node_identity = RNS::Identity::recall(node_hash);
 		if (!node_identity) {
 			throw std::runtime_error(
@@ -336,6 +341,12 @@ namespace RFed {
 			node_identity, RNS::Type::Destination::OUT, RNS::Type::Destination::SINGLE,
 			"rfed", "channel.publish"
 		);
+		if (rfed_payload.size() > PUBLISH_DATA_PACKET_MAX) {
+			// Oversized for a single plain destination packet: advertise as a
+			// Resource over a link to the publish destination — the node
+			// ingests both paths identically.
+			return _send_publish_resource(destination, rfed_payload, DEFAULT_REQUEST_TIMEOUT);
+		}
 		if (!RNS::Transport::has_path(destination.hash())) {
 			RNS::Transport::request_path(destination.hash());
 			const double deadline = RNS::Utilities::OS::time() + DEFAULT_PATH_TIMEOUT;
@@ -350,6 +361,46 @@ namespace RFed {
 		RNS::Packet packet(destination, rfed_payload);
 		const RNS::PacketReceipt receipt = packet.receipt_send();
 		return (bool)receipt;
+	}
+
+	bool RFedClient::_send_publish_resource(
+		const RNS::Destination& destination,
+		const RNS::Bytes& payload,
+		double timeout
+	) {
+		RNS::Link link = _establish_link(destination, DEFAULT_ESTABLISH_TIMEOUT);
+		_resource_done = false;
+		// Advertise over the link (auto_compress mirrors Python RNS's
+		// Resource default; the receiver honours the advertisement flag).
+		RNS::Resource resource(payload, link, true, true, on_resource_concluded, nullptr, timeout);
+		if (!resource) {
+			try {
+				link.teardown();
+			}
+			catch (const std::exception&) {}
+			return false; // could not advertise
+		}
+		const double deadline = RNS::Utilities::OS::time() + timeout + DEFAULT_TIMEOUT_GRACE;
+		while (!_resource_done) {
+			_reticulum.loop();
+			if (RNS::Utilities::OS::time() > deadline) {
+				try {
+					link.teardown();
+				}
+				catch (const std::exception&) {}
+				return false; // transfer did not conclude
+			}
+			RNS::Utilities::OS::sleep(0.02);
+		}
+		const bool complete = resource.status() == RNS::Type::Resource::COMPLETE;
+		try {
+			link.teardown();
+		}
+		catch (const std::exception&) {}
+		if (!complete) {
+			ERRORF("rfed resource publish concluded with status %d", (int)resource.status());
+		}
+		return complete;
 	}
 
 	PullPage RFedClient::pull(

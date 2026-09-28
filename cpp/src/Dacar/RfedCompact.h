@@ -49,7 +49,8 @@ namespace Dacar {
 	EC-encrypts it to the channel identity, and frames it with the channel
 	hash + optional PoW stamp. The Delta's own Ed25519 signature (field [7])
 	is the authenticity check; no envelope signature is added, so this stays
-	well under the 431-byte single-packet MDU for a typical Delta.
+	well under the single-packet publish budget (399-byte payload ceiling
+	at the default 500 B MTU) for a typical Delta.
 
 	`stamp_cost` is the cached PoW stamp cost advertised by the node (from
 	the last RFedClient::subscribe). 0 means no stamp is appended.

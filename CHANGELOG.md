@@ -20,9 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     16×256 B at rfed's rounds, with random-trial generation and value-based
     validation), `rfed/Blob` (SEND/fanout payload framing + RTID prelude
     verification), and `rfed/Client` (`subscribe`/`unsubscribe` with signed
-    channel payloads and stamp-cost caching, fire-and-forget `send_publish`,
-    paged `pull` with node error-code surfacing, and raw fanout listening on
-    the client's `rfed.delivery` destination).
+    channel payloads and stamp-cost caching, `send_publish` on both wire
+    paths a rfed node ingests — single-packet DATA and Resource-over-link for
+    oversized payloads — paged `pull` with node error-code surfacing, and raw
+    fanout listening on the client's `rfed.delivery` destination).
   - `Dacar/RfedCompact` — `wrap_dacar_delta`/`unwrap_dacar_delta` (§11.1.1):
     `"RTID" ‖ sender_pub ‖ delta`, EC-encrypted to the channel identity and
     framed with the channel hash + optional PoW stamp — wire-compatible with
@@ -41,6 +42,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     with the new `rfed_wrap_tool` (wrap a Delta in C++, unwrap it with
     `dacar.transport.rfed_compact`). The generic LXMF-tail channel codec is
     deliberately not ported yet — the spin-out can add it with an LXMF port.
+  - A two-process publish interop test (`test_resource_publish` + the
+    `resource_sink` minimal publish node, over UDP loopback): the DATA path
+    (384-byte single-packet publish) and the Resource path (1724-byte
+    transfer, ACCEPT_ALL ingestion) both arrive byte-exactly.
+  - Publish-path finding: rfed-python's `PUBLISH_DATA_MAX = 431` does **not**
+    fit a plain tokenized destination packet — the Token envelope adds ~99
+    bytes over the PKCS7-padded payload, so a 431-byte publish packs to 531
+    bytes and throws at pack time on Python RNS and microReticulum alike
+    (verified identical packing). The largest payload that fits the default
+    500 B MTU is 399 bytes; the C++ client routes everything above 384
+    (`PUBLISH_DATA_PACKET_MAX`) through the Resource path. Upstream-worthy:
+    rfed-python's plain publishes in the 385–431 range fail the same way.
 - **Direct-link Delta push** (§11, work doc #16 Phase 4a) — the constrained-
   node transport, so a peer can deliver Deltas to an MCU-class node that runs
   neither rfed nor LXMF:
@@ -168,6 +181,17 @@ generate_fixtures.py`): identical namespace hashes, deterministic Ed25519
     cross-implementation test vectors.
 
 ### Changed
+- **JavaScript**: `@reticulum/rfed` floor raised to `^0.9.2` — 0.9.2 fixes
+  the rfed client's `PUBLISH_DATA_MAX` publish threshold (the historical
+  431 B value did not fit a plain tokenized destination packet — the real
+  single-packet ceiling is 399 B, and larger payloads take the
+  Resource-over-link path). Same fix as the Python `rfed>=0.1.2` floor.
+- **Python**: rfed floor raised to `rfed>=0.1.2` — 0.1.2 fixes the rfed
+  client's `PUBLISH_DATA_MAX` publish threshold (the historical 431 B value
+  did not fit a plain tokenized destination packet; publishes of 385–431
+  bytes threw "packet size of 531 exceeds MTU of 500 bytes" at pack time —
+  the real single-packet ceiling is 399 B, and larger payloads take the
+  Resource-over-link path).
 - **Python**: the RFed channel client now ships as its own pip package. The
   `dacar.rfed` subpackage (wire constants, channel derivation, LXMF tail
   codec, RTID envelope, PoW stamp contract, `RFedClient`) moved verbatim to
@@ -181,10 +205,11 @@ generate_fixtures.py`): identical namespace hashes, deterministic Ed25519
   repository.
 - **`SPEC.md` §11.1.1**: the `rfed.channel.publish` destination description no
   longer claims the destination is link-less/fire-and-forget-only — oversized
-  publishes travel as `RNS.Resource` transfers over a link (single-packet MDU
-  431 B at the default 500 B MTU), matching the `rfed` client /
-  `@reticulum/rfed` behavior shipped since 1.4.0. The one-Delta-per-envelope
-  rule is unchanged (the receive path still has no multi-Delta batch decode).
+  publishes travel as `RNS.Resource` transfers over a link (single-packet
+  budget: 399 bytes of payload at the default 500 B MTU), matching the `rfed`
+  client / `@reticulum/rfed` behavior shipped since 1.4.0. The
+  one-Delta-per-envelope rule is unchanged (the receive path still has no
+  multi-Delta batch decode).
 - **`SPEC.md` §13.10**: documents that the identity-record divergence is also a
   filename divergence (Python `identity` 64 B vs JavaScript `identity.key`
   128 B, which may coexist in one store), and fixes the section's internal

@@ -141,13 +141,18 @@ namespace RFed {
 		/*
 		Fire-and-forget SEND of a pre-wrapped rfed_payload (the general
 		publish primitive, independent of the inner format):
-		`channel_hash ‖ inner_blob ‖ stamp`. Sends as a single DATA packet to
-		the node's rfed.channel.publish destination. Returns false when the
-		payload exceeds PUBLISH_DATA_MAX (oversized publishes need the
-		Resource-over-link path, not part of this port) or the transport
-		rejected the packet. Transport acceptance is NOT confirmation the
-		node stored the blob — an under-stamped blob is silently dropped by
-		the node.
+		`channel_hash ‖ inner_blob ‖ stamp`. Payloads up to
+		PUBLISH_DATA_PACKET_MAX (the largest payload that fits one plain
+		tokenized packet at the default 500 B MTU) go out as a single DATA
+		packet. Anything larger is advertised as a Resource over a link
+		to the publish destination — the node ingests both paths identically.
+
+		SEND is fire-and-forget for the DATA path (returns transport
+		acceptance); the Resource path waits for the transfer to conclude and
+		returns the transfer status. Neither is confirmation that the node
+		stored the blob — an under-stamped blob is silently dropped by the
+		node. Call subscribe() again to refresh the stamp cost if publishes
+		seem dropped.
 		*/
 		bool send_publish(const RNS::Bytes& node_hash, const RNS::Bytes& rfed_payload);
 
@@ -185,6 +190,11 @@ namespace RFed {
 		FanoutCallback _fanout_callback;
 
 		RNS::Link _establish_link(const RNS::Destination& destination, double timeout);
+		bool _send_publish_resource(
+			const RNS::Destination& destination,
+			const RNS::Bytes& payload,
+			double timeout
+		);
 		RNS::Bytes _request(
 			RNS::Link& link,
 			const char* path,

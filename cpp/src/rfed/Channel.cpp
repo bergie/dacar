@@ -24,13 +24,15 @@ namespace RFed {
 		// scalar for both X25519 and Ed25519), matching the Rust reference and
 		// the canonical Python vectors.
 		//
-		// The X25519 half must be RFC 7748-clamped first: microReticulum's
-		// Curve25519::eval is the raw Montgomery ladder and leaves clamping to
-		// the caller (as Curve25519::dh1 does), while Python RNS relies on the
-		// `cryptography` package clamping internally. Without the clamp the two
+		// The X25519 half must be RFC 7748-clamped first: without it the two
 		// implementations derive *different* channel public keys (and ECDH
 		// secrets) from the same seed — bits 0..2 of the scalar would be used
-		// by one side and ignored by the other.
+		// by one side and ignored by the other. Python RNS clamps inside
+		// X25519 (the cryptography package), while microReticulum's raw
+		// Curve25519::eval ladder leaves clamping to the caller. Upstream
+		// microReticulum now clamps in X25519PrivateKey::from_private_bytes;
+		// this clamp stays as a guard while dacar pins the pre-fix revision
+		// (clamping is idempotent, so the two compose).
 		// Exclusive copy: RNS::Bytes copy construction SHARES the buffer, so
 		// clamping in place through a plain copy would also corrupt the raw
 		// seed used for the Ed25519 half.

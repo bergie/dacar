@@ -63,9 +63,23 @@ namespace RFed {
 	constexpr const char* PULL_PATH = "/rfed/pull";
 
 	// Maximum publish payload size sent as a single fire-and-forget DATA
-	// packet: the link MDU at the default 500 B RNS MTU (500 − 69 B link
-	// overhead). Anything larger must go as a Resource over a link to the
-	// publish destination — the node ingests both paths identically.
+	// packet (the threshold between the DATA and Resource publish paths —
+	// the node ingests both identically).
+	//
+	// rfed-python's constant for this is 431 ("the link MDU at the default
+	// 500 B RNS MTU"), but that does not fit a plain tokenized destination
+	// packet on either stack: the Token envelope adds ~99 bytes over the
+	// PKCS7-padded payload (ephemeral pubkey 32 ‖ iv 16 ‖ hmac 32 + 18-byte
+	// packet header + destination hash), so a 431-byte payload packs to 531
+	// bytes and throws at pack time — in Python RNS just as in
+	// microReticulum (verified byte-for-byte identical packing on both).
+	// The largest payload that packs to raw ≤ 500 is 399 bytes; this
+	// constant uses a clean 16-byte-block-multiple below that.
+	constexpr size_t PUBLISH_DATA_PACKET_MAX = 384;
+
+	// The rfed-protocol constant, kept for wire-behaviour parity with the
+	// Python/JS clients (see PUBLISH_DATA_PACKET_MAX above for why the C++
+	// client routes everything above 384 bytes through the Resource path).
 	constexpr size_t PUBLISH_DATA_MAX = 431;
 
 	// Smallest rfed node error code (0xF0 ERROR_NO_IDENTITY — the link could
