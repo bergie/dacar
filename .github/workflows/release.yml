@@ -6,8 +6,9 @@
 #
 #   * PyPI  build sdist+wheel (make release-python-dry) + upload via OIDC
 #           trusted publishing (pypa/gh-action-pypi-publish). No API token.
-#   * npm   npm publish --provenance with OIDC trusted publishing. Prereleases are
-#           dist-tagged (NPM_DIST_TAG) — a stable release sets NPM_DIST_TAG=latest.
+#   * npm   npm publish --provenance with OIDC trusted publishing. The dist-tag is
+#           derived from the version: prereleases (e.g. 1.2.0-rc.1) go to "rc",
+#           stable releases to "latest".
 #   * JSR   deno publish; JSR authenticates to this repo via GitHub OIDC.
 #
 # Before tagging, bump the version in all THREE configs in lockstep:
@@ -87,9 +88,20 @@ jobs:
       - name: Install deps
         run: make install-js
 
-      - name: Publish to npm (provenance, dist-tag rc)
+      # npm publish defaults every publish to the "latest" dist-tag, so
+      # prerelease versions (e.g. 1.2.0-rc.1) must be explicitly tagged "rc"
+      # to avoid becoming the default install for everyone.
+      - name: Determine npm dist-tag
+        id: npm-tag
+        run: |
+          version=$(node -p "require('./javascript/package.json').version")
+          if [[ $version == *-* ]]; then tag=rc; else tag=latest; fi
+          echo "Publishing $version with dist-tag $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Publish to npm (provenance)
         if: ${{ github.event.inputs.dry_run != 'true' }}
-        run: make release-js NPM_PUBLISH_FLAGS="--access public --provenance"
+        run: make release-js NPM_DIST_TAG=${{ steps.npm-tag.outputs.tag }} NPM_PUBLISH_FLAGS="--access public --provenance"
 
       - name: Validate packaging (dry-run)
         if: ${{ github.event.inputs.dry_run == 'true' }}
