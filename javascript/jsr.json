@@ -1,6 +1,6 @@
 {
   "name": "@reticulum/dacar",
-  "version": "1.4.1",
+  "version": "1.5.0",
   "license": "EUPL-1.2",
   "exports": {
     ".": "./src/index.js",
@@ -35,6 +35,7 @@
       "src/verifier.js",
       "src/transport/rnsIdentity.js",
       "src/transport/rnsChallenge.js",
+      "src/transport/rnsSync.js",
       "src/transport/lxmfSync.js",
       "src/transport/rfedSync.js",
       "README.md"

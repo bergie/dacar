@@ -1,6 +1,6 @@
 {
   "name": "@reticulum/dacar",
-  "version": "1.4.1",
+  "version": "1.5.0",
   "description": "JavaScript implementation of Dacar, a Decentralized Access Control system for Reticulum",
   "type": "module",
   "main": "src/index.js",

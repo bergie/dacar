@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-10-03
+
 ### Added
 - **Minimal RFed channel client in C++** (§11.1/§11.1.1, work doc #16 Phase
   4b), structured for spin-out the same way the Python client became the
@@ -150,7 +152,6 @@ generate_fixtures.py`): identical namespace hashes, deterministic Ed25519
   native suites; `pio test -e <env>` builds the on-device runner (nRF52840
   validated; T1000-E board wiring lives with the firmware project).
 
-### Added
 - **LXMF delivery, receiving, and Paper Messages in the CLIs** (work doc
   #14, §11.2/§11.3) — both implementations:
   - `grant`/`revoke`/`publish` gain `--lxmf <hash|alias>`: one-shot,
