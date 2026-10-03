@@ -224,7 +224,8 @@ export class LxmfDeltaDelivery {
    * Builds and queues a Delta for LXMF delivery via the bound router (§11.2).
    *
    * Uses the router's identity as the LXMF sender (and source hash). Delivery
-   * method is chosen by the router (DIRECT link, falling back to opportunistic).
+   * method is chosen by the router (DIRECT link, falling back to opportunistic,
+   * with identity solicitation when the recipient is not yet recallable).
    * @param {Uint8Array} deltaPayload
    * @param {Uint8Array} destinationHash The recipient `lxmf.delivery` hash.
    * @param {Object} [opts]
@@ -237,7 +238,7 @@ export class LxmfDeltaDelivery {
     }
     const sourceHash = this._router.identity.identityHash;
     const message = this.makeMessage(deltaPayload, destinationHash, sourceHash);
-    await this._router.send(message, this._router.identity, linkId);
+    await this._router.send(message, this._router.identity, { linkId });
     return message;
   }
 

@@ -181,6 +181,19 @@ generate_fixtures.py`): identical namespace hashes, deterministic Ed25519
     cross-implementation test vectors.
 
 ### Changed
+- **JavaScript**: reticulum-js floor raised to `^0.9.3` across the
+  `@reticulum/*` packages. `ensureNodeIdentity` is now implemented over the
+  new `transport.recallOrSolicitIdentity` (recall → `path?` request → wait
+  for the path-response announce, with concurrent solicitations for the same
+  hash deduplicated) instead of a hand-rolled request-and-poll loop; the
+  `pollInterval` option was dropped (announce-event driven now, no polling).
+  External behavior is unchanged: the same `rfed node identity unknown for …
+  wait for its announce` error is thrown on timeout. `LxmfDeltaDelivery.deliver`
+  passes the new `LXMRouter.send` options bag (`{ linkId }`) instead of the
+  legacy bare-link third argument, and direct publishes now benefit from the
+  router's built-in identity solicitation. 0.9.3's rfed prelude key-binding
+  enforcement (the prelude sender key's `lxmf.delivery` hash must match the
+  LXMF `source_hash`) applies automatically via the dependency bump.
 - **JavaScript**: `@reticulum/rfed` floor raised to `^0.9.2` — 0.9.2 fixes
   the rfed client's `PUBLISH_DATA_MAX` publish threshold (the historical
   431 B value did not fit a plain tokenized destination packet — the real

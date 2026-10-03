@@ -12,7 +12,13 @@
  * core. It mirrors Python's `dacar/cli/rns.py` + `run_publish`/`run_sync`.
  */
 
-import { Destination, DestType, Identity, toHex } from "@reticulum/core";
+import {
+  Destination,
+  DestType,
+  Identity,
+  toHex,
+  UnknownIdentityError,
+} from "@reticulum/core";
 import { APP_NAME } from "../naming.js";
 import { RfedDeltaSync } from "../transport/rfedSync.js";
 
@@ -68,49 +74,47 @@ export const DEFAULT_NODE_DISCOVERY_TIMEOUT = 15_000;
  * announce isn't in the recall store yet, `RFedClient.subscribe` can't open a
  * link and fails with `rfed node identity unknown for <hash>; wait for its
  * announce`. Rather than fail immediately, this sends a `path?` request for
- * the destination and polls the transport's identity recall store
- * (`rns.transport.recallIdentity`) until the node's
- * path-response announce populates it (or `timeout` elapses), then returns
- * the identity.
+ * the destination and waits for the node's path-response announce to populate
+ * the recall store (or `timeout` elapses), then returns the identity.
  *
  * The rfed node announces every `rfed.*` destination under one shared
  * identity, so a path request for any of them is answered with an announce
  * that makes that identity recallable by destination hash.
  *
- * `onRequest` (if given) is invoked once when the path request is sent, so the
- * CLI can surface "requesting node identity…" progress to the user. Throws
- * the same `rfed node identity unknown for …` error the client raises if
- * still unknown after `timeout` — so callers that skip this helper see no
- * behavior change.
+ * Implemented over `transport.recallOrSolicitIdentity` (reticulum-js 0.9.3),
+ * which recalls, sends the `path?` request, and awaits the announce event —
+ * with concurrent solicitations for the same hash deduplicated.
+ *
+ * `onRequest` (if given) is invoked once when the identity was unknown and a
+ * path request is about to be sent, so the CLI can surface "requesting node
+ * identity…" progress to the user. Throws the same
+ * `rfed node identity unknown for …` error the client raises if still unknown
+ * after `timeout` — so callers that skip this helper see no behavior change.
  * @param {import("@reticulum/core").Reticulum} rns A booted Reticulum.
  * @param {Uint8Array} nodeHash An `rfed.*` destination hash of the node.
  * @param {Object} [opts]
  * @param {number} [opts.timeout=15000] Max wait in milliseconds.
- * @param {number} [opts.pollInterval=250] Poll interval in milliseconds.
- * @param {() => void} [opts.onRequest] Invoked once when the path request fires.
+ * @param {() => void} [opts.onRequest] Invoked once when a path request fires.
  * @returns {Promise<import("@reticulum/core").Identity>}
  */
 export async function ensureNodeIdentity(
   rns,
   nodeHash,
-  { timeout = DEFAULT_NODE_DISCOVERY_TIMEOUT, pollInterval = 250, onRequest } = {},
+  { timeout = DEFAULT_NODE_DISCOVERY_TIMEOUT, onRequest } = {},
 ) {
-  let identity = await rns.transport.recallIdentity(nodeHash);
-  if (identity) return identity;
-  // Not yet known — proactively request the destination's path (§7.1). The
-  // rfed node answers with a path-response announce (§7.2.4) that populates
-  // the recall store; poll until it arrives or the timeout elapses.
+  const known = await rns.transport.recallIdentity(nodeHash);
+  if (known) return known;
   if (onRequest) onRequest();
-  await rns.transport.requestPath(nodeHash);
-  const deadline = Date.now() + timeout;
-  while (Date.now() < deadline) {
-    identity = await rns.transport.recallIdentity(nodeHash);
-    if (identity) return identity;
-    await new Promise((resolve) => setTimeout(resolve, pollInterval));
+  try {
+    return await rns.transport.recallOrSolicitIdentity(nodeHash, timeout);
+  } catch (err) {
+    if (err instanceof UnknownIdentityError) {
+      throw new Error(
+        `rfed node identity unknown for ${toHex(nodeHash)}; wait for its announce`,
+      );
+    }
+    throw err;
   }
-  throw new Error(
-    `rfed node identity unknown for ${toHex(nodeHash)}; wait for its announce`,
-  );
 }
 
 /**
