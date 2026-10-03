@@ -52,7 +52,7 @@ export const DEFAULT_PUSH_TIMEOUT_MS = 15_000;
 export const DEFAULT_PATH_TIMEOUT_MS = 15_000;
 
 /**
- * @typedef {import("../delta.js").DeltaReceiver} DeltaReceiver
+ * @typedef {import("../delta.js").DeltaReceiver} DeltaReceiverType
  * @typedef {import("@reticulum/core").Destination} DestinationType
  * @typedef {import("@reticulum/core").Link} LinkType
  * @typedef {import("@reticulum/core").Identity} IdentityType
@@ -103,7 +103,7 @@ export function unpackAck(data) {
  * binary elements. Resolves with the number of Deltas applied (0 = decoded
  * but nothing accepted, or undecodable garbage — never rejects: a request
  * handler must not crash on arbitrary bytes).
- * @param {DeltaReceiver} receiver
+ * @param {DeltaReceiverType} receiver
  * @param {Uint8Array} data
  * @returns {Promise<number>}
  */
@@ -136,7 +136,7 @@ export async function handlePush(receiver, data) {
  * bytes. Every outcome yields a response — even `{applied: 0}` — so the
  * pusher can distinguish "node refused (kept in outbox)" from "request lost
  * (retry)".
- * @param {DeltaReceiver} receiver
+ * @param {DeltaReceiverType} receiver
  * @returns {ResponseGenerator}
  */
 export function syncRequestHandler(receiver) {
@@ -168,7 +168,7 @@ export class RnsSyncServer {
    * @param {Object} opts
    * @param {IdentityType} opts.identity The node identity (deltas are ingested
    *   by issuer signatures, not the server's — this signs nothing).
-   * @param {DeltaReceiver} opts.receiver The shared receive boundary.
+   * @param {DeltaReceiverType} opts.receiver The shared receive boundary.
    * @param {ReticulumType} opts.rns A running Reticulum instance.
    * @param {string} [opts.appName] Override the `dacar` app name.
    * @param {readonly string[]} [opts.aspects] Override the `sync.v1` aspects.
@@ -210,15 +210,15 @@ export class RnsSyncServer {
     return self;
   }
 
-  /** @param {DeltaReceiver} receiver */
+  /** @param {DeltaReceiverType} receiver */
   constructor(receiver) {
-    /** @type {DeltaReceiver} */
+    /** @type {DeltaReceiverType} */
     this._receiver = receiver;
     /** @type {DestinationType | null} */
     this._destination = null;
   }
 
-  /** @returns {DeltaReceiver} */
+  /** @returns {DeltaReceiverType} */
   get receiver() {
     return this._receiver;
   }
