@@ -15,6 +15,7 @@
  * SHA-256 uses Web Crypto, so `groupId()` is asynchronous. Compute it once and
  * cache the result (`group.id` after the first `await group.groupId()`).
  */
+/* @ts-self-types="../types/src/threshold.d.ts" */
 
 import { HASH_SIZE } from "./namespace.js";
 

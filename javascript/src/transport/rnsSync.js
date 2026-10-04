@@ -37,6 +37,7 @@
  * never pulls it in. It depends only on `@reticulum/core` (Destination, Link,
  * MsgPack), which the core already depends on.
  */
+/* @ts-self-types="../../types/src/transport/rnsSync.d.ts" */
 
 import { Destination, DestType, Link, MsgPack } from "@reticulum/core";
 import { APP_NAME, SYNC_ASPECTS } from "../naming.js";

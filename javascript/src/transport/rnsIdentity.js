@@ -25,6 +25,7 @@
  * `@reticulum/core`'s instance-scoped identity recall store
  * (`rns.transport.recallIdentity`).
  */
+/* @ts-self-types="../../types/src/transport/rnsIdentity.d.ts" */
 
 import { IssuerKeyset } from "../verifier.js";
 
@@ -53,6 +54,8 @@ async function resolveWith(resolver, hash) {
  * `.resolve` method) where a `KeyResolver` function is expected.
  */
 export class RnsIdentityResolver {
+  /** @type {import("@reticulum/core").Reticulum} */
+  _rns;
   /**
    * @param {import("@reticulum/core").Reticulum} rns A booted Reticulum whose
    *   transport owns the instance-scoped identity recall store

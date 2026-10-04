@@ -25,6 +25,7 @@
  * never pulls it in. It depends only on `@reticulum/core` (Destination, Link),
  * which the core already depends on.
  */
+/* @ts-self-types="../../types/src/transport/rnsChallenge.d.ts" */
 
 import { Destination, DestType, Link } from "@reticulum/core";
 import { APP_NAME, CHALLENGE_ASPECTS } from "../naming.js";

@@ -27,6 +27,7 @@
  * verdict logic is testable without a live network. A transport that returns
  * null or throws is a partition -> immediately DENIED (§8).
  */
+/* @ts-self-types="../types/src/challenge.d.ts" */
 
 import { Identity, MsgPack, toHex } from "@reticulum/core";
 import { Config } from "./config.js";

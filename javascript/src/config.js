@@ -6,6 +6,7 @@
  * two Legacy Salts for rotation, §10), and optionally an Authoritative Identity
  * for Strict Consistency (§8).
  */
+/* @ts-self-types="../types/src/config.d.ts" */
 
 import { toHex } from "@reticulum/core";
 import {

@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **JavaScript: ship type declarations to fix the JSR package score.** The
+  package scored 70% on JSR with two failing checks:
+  - *No slow types*: `deno publish` now runs without `--allow-slow-types`
+    (Makefile `JSR_PUBLISH_FLAGS`). The entrypoints satisfy JSR's fast check
+    via generated declaration files in `types/src/` wired to the sources with
+    `@ts-self-types` pragmas; npm consumers get the same declarations through
+    new `types` conditions on the `.` and `./transport` exports. Regenerate
+    with `npm run types` (tsc + `scripts/fix-dts.mjs`, which rewrites the
+    relative specifiers to `.d.ts` for Deno and copies module docs onto
+    re-export-only barrels). Requires `tsc` on PATH; commit `types/` along
+    with `src/`.
+  - *Module docs in all entrypoints*: JSR only accepts a module doc whose
+    leading JSDoc block carries an `@module` tag. Both `src/index.js`
+    (`@module @reticulum/dacar`) and `src/transport/index.js`
+    (`@module @reticulum/dacar/transport`) now have one.
+
 ## [1.5.0] - 2026-10-03
 
 ### Added

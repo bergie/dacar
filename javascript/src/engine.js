@@ -22,6 +22,7 @@
  * server (§8) builds the same hypothesis objects straight from the wire and
  * calls the synchronous `evaluateHashes()`.
  */
+/* @ts-self-types="../types/src/engine.d.ts" */
 
 import { toHex } from "@reticulum/core";
 import { covers } from "./namespace.js";

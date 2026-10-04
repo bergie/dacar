@@ -19,37 +19,8 @@
  * subpath: it is opt-in via `@reticulum/dacar/transport`. The adapters build
  * on the `@reticulum/*` reticulum-js packages (core, lxmf, rfed).
  */
-/* @ts-self-types="../../types/src/transport/index.d.ts" */
-
-export { RnsIdentityResolver } from "./rnsIdentity.js";
-
-export {
-  CHALLENGE_REQUEST_PATH,
-  DEFAULT_CHALLENGE_TIMEOUT_MS,
-  DEFAULT_ESTABLISH_TIMEOUT_MS,
-  challengeRequestHandler,
-  RnsChallengeServer,
-  RnsLinkTransport,
-  establishLink,
-} from "./rnsChallenge.js";
-
-export {
-  SYNC_REQUEST_PATH,
-  DEFAULT_PUSH_TIMEOUT_MS,
-  DEFAULT_PATH_TIMEOUT_MS,
-  packAck,
-  unpackAck,
-  handlePush,
-  syncRequestHandler,
-  RnsSyncServer,
-  ensureSyncPath,
-  pushDeltas,
-} from "./rnsSync.js";
-
-export {
-  LxmfDeltaDelivery,
-  messageTitle,
-  messageContent,
-} from "./lxmfSync.js";
-
-export { RfedDeltaSync } from "./rfedSync.js";
+export { RnsIdentityResolver } from "./rnsIdentity.d.ts";
+export { RfedDeltaSync } from "./rfedSync.d.ts";
+export { CHALLENGE_REQUEST_PATH, DEFAULT_CHALLENGE_TIMEOUT_MS, DEFAULT_ESTABLISH_TIMEOUT_MS, challengeRequestHandler, RnsChallengeServer, RnsLinkTransport, establishLink } from "./rnsChallenge.d.ts";
+export { SYNC_REQUEST_PATH, DEFAULT_PUSH_TIMEOUT_MS, DEFAULT_PATH_TIMEOUT_MS, packAck, unpackAck, handlePush, syncRequestHandler, RnsSyncServer, ensureSyncPath, pushDeltas } from "./rnsSync.d.ts";
+export { LxmfDeltaDelivery, messageTitle, messageContent } from "./lxmfSync.d.ts";

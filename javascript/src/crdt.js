@@ -10,6 +10,7 @@
  * deletion horizon, both entries are silently deleted. Incoming Operations
  * older than the horizon are rejected outright (intake rejection, §9).
  */
+/* @ts-self-types="../types/src/crdt.d.ts" */
 
 import { MsgPack } from "@reticulum/core";
 import { Action } from "./operation.js";

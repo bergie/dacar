@@ -16,6 +16,7 @@
  * Hashing uses the Web Crypto `HMAC`/`SHA-256` primitives, so all methods are
  * asynchronous and runtime-portable (browsers, Node, Deno, Bun).
  */
+/* @ts-self-types="../types/src/namespace.d.ts" */
 
 export const DELIMITER = ":";
 export const WILDCARD = "*";

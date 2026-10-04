@@ -37,6 +37,7 @@
  * // event.detail.message is the LXMF message the router just decrypted.
  * await delivery.handleMessage(event.detail.message);
  */
+/* @ts-self-types="../../types/src/transport/lxmfSync.d.ts" */
 
 import { LXMessage as LXMFMessage, LXMFConstants } from "@reticulum/lxmf";
 import { MsgPack } from "@reticulum/core";

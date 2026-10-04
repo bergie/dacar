@@ -19,17 +19,12 @@
  * language implementations. Transport adapters accept overrides (e.g.
  * `topic = RFED_TOPIC`) for deployment-specific values.
  */
-/* @ts-self-types="../types/src/naming.d.ts" */
-
 /** The RNS App Name under which all Dacar services live (§8, §11). */
-export const APP_NAME = "dacar";
-
+export const APP_NAME: "dacar";
 /** Aspects of the §8 Authoritative Challenge destination (App `dacar`). */
-export const CHALLENGE_ASPECTS = Object.freeze(["auth", "v1"]);
-
+export const CHALLENGE_ASPECTS: readonly string[];
 /** The full dotted name of the §8 Authoritative Challenge destination. */
-export const CHALLENGE_DESTINATION = "dacar.auth.v1";
-
+export const CHALLENGE_DESTINATION: "dacar.auth.v1";
 /**
  * Aspects of the direct-link Delta ingestion destination (§11, work doc #16
  * Phase 4a). A constrained node (e.g. an MCU running microReticulum) exposes
@@ -38,21 +33,17 @@ export const CHALLENGE_DESTINATION = "dacar.auth.v1";
  * which makes any transport valid — the same precedent as optical Paper
  * Messages (§11.3).
  */
-export const SYNC_ASPECTS = Object.freeze(["sync", "v1"]);
-
+export const SYNC_ASPECTS: readonly string[];
 /** The full dotted name of the direct-link Delta ingestion destination. */
-export const SYNC_DESTINATION = "dacar.sync.v1";
-
+export const SYNC_DESTINATION: "dacar.sync.v1";
 /**
  * RFed topic for many-to-many CRDT convergence (§11.1). Deployment-overridable
  * default — RFed is broadcast, so shared-network deployments SHOULD set a
  * distinct topic to isolate their feeds.
  */
-export const RFED_TOPIC = "dacar.policy.v1";
-
+export const RFED_TOPIC: "dacar.policy.v1";
 /** LXMF message title for targeted Delta delivery (§11.2). */
-export const LXMF_DELIVERY_TITLE = "dacar/sync/delta";
-
+export const LXMF_DELIVERY_TITLE: "dacar/sync/delta";
 /**
  * LXMF message title for the multi-Delta **batch** envelope (§11.2, work doc
  * #14). The message content is a msgpack array of §5.3 Delta payloads; every
@@ -61,4 +52,4 @@ export const LXMF_DELIVERY_TITLE = "dacar/sync/delta";
  * receiver MUST accept both titles (single for wire compat, batch for chunked
  * bootstrap/paper transfer).
  */
-export const LXMF_BATCH_TITLE = "dacar/sync/batch";
+export const LXMF_BATCH_TITLE: "dacar/sync/batch";

@@ -9,6 +9,7 @@
  * `physical_ms << 16` exceeds `Number.MAX_SAFE_INTEGER` for any realistic
  * timestamp.
  */
+/* @ts-self-types="../types/src/hlc.d.ts" */
 
 export const PHYSICAL_BITS = 48n;
 export const LOGICAL_BITS = 16n;

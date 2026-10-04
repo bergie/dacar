@@ -5,8 +5,14 @@
   "type": "module",
   "main": "src/index.js",
   "exports": {
-    ".": "./src/index.js",
-    "./transport": "./src/transport/index.js",
+    ".": {
+      "types": "./types/src/index.d.ts",
+      "default": "./src/index.js"
+    },
+    "./transport": {
+      "types": "./types/src/transport/index.d.ts",
+      "default": "./src/transport/index.js"
+    },
     "./cli/session": "./src/cli/session.js",
     "./cli/store": "./src/cli/store.js",
     "./package.json": "./package.json"
@@ -16,9 +22,11 @@
   },
   "files": [
     "src",
+    "types",
     "README.md"
   ],
   "scripts": {
+    "types": "tsc --allowJs --declaration --emitDeclarationOnly --outDir types --rootDir . --module nodenext --moduleResolution nodenext --target es2022 --skipLibCheck src/index.js src/transport/index.js && node scripts/fix-dts.mjs",
     "test": "sh scripts/test.sh",
     "test:node": "node --test --test-force-exit test/*.test.js",
     "test:deno": "deno test --allow-read=test,src --allow-env --no-check test/",

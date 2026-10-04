@@ -45,6 +45,7 @@
  * await sync.publish(deltaPayload, nodeHash);
  * ```
  */
+/* @ts-self-types="../../types/src/transport/rfedSync.d.ts" */
 
 import { MsgPack } from "@reticulum/core";
 import {

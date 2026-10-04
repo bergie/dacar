@@ -111,12 +111,15 @@ clean-cpp: ## Remove C++ build/test artifacts
 #       CI instead builds via release-python-dry and uploads through OIDC
 #       trusted publishing (pypa/gh-action-pypi-publish, no token).
 #
-# JSR:  the package is plain JSDoc JS, so --allow-slow-types is always passed.
-#       JSR versions are immutable: a published version can never be reused.
+# JSR:  the package ships generated .d.ts declarations (npm run types) wired to
+#       the JS sources via @ts-self-types pragmas, so fast-check passes and
+#       slow types need not be allowed. If a publish fails on slow types,
+#       regenerate the declarations and re-run. JSR versions are immutable: a
+#       published version can never be reused.
 
 NPM_DIST_TAG ?= rc
 NPM_PUBLISH_FLAGS ?= --access public
-JSR_PUBLISH_FLAGS ?= --allow-slow-types
+JSR_PUBLISH_FLAGS ?=
 
 release: release-python release-js release-jsr
 release-dry: release-python-dry release-js-dry release-jsr-dry

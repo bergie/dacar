@@ -12,6 +12,7 @@
  * hand received bytes to `DeltaReceiver.applyPayload()`, regardless of whether
  * they arrived over RFed, LXMF, or a scanned QR code.
  */
+/* @ts-self-types="../types/src/delta.d.ts" */
 
 import { MsgPack } from "@reticulum/core";
 import { Operation } from "./operation.js";

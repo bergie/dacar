@@ -15,6 +15,7 @@
  * synchronously and uniquely identifies a Tuple, so `toHex(preimage)` doubles as
  * the CRDT's internal map key; the full async SHA-256 is available via `hash()`.
  */
+/* @ts-self-types="../types/src/tuple.d.ts" */
 
 import { toHex } from "@reticulum/core";
 import { HASH_SIZE, bytesEqual } from "./namespace.js";

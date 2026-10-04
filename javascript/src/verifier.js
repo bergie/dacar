@@ -23,6 +23,7 @@
  * itself authorized (its authority traces to a Root Trust Anchor) is resolved
  * later by the Evaluation Engine (§7) against the converged CRDT state.
  */
+/* @ts-self-types="../types/src/verifier.d.ts" */
 
 import { toHex } from "@reticulum/core";
 import { HASH_SIZE } from "./namespace.js";

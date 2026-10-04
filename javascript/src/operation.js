@@ -9,6 +9,7 @@
  * Single-identity issuers carry exactly one signature; Threshold Group issuers
  * carry exactly `N` signatures from distinct members (§5.2).
  */
+/* @ts-self-types="../types/src/operation.d.ts" */
 
 import { Identity, MsgPack, toHex } from "@reticulum/core";
 import { MAX_HLC } from "./hlc.js";
