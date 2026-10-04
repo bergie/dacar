@@ -78,6 +78,7 @@ pip-delete-this-directory.txt
 # JavaScript / Node / TypeScript / Deno
 # ---------------------------------------------------------------------------
 node_modules/
+javascript/types/
 .pnpm-store/
 .eslintcache
 .stylelintcache

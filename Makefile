@@ -20,7 +20,7 @@ J ?= $(shell nproc 2>/dev/null || echo 2)
 
 .PHONY: help install test clean release release-dry
 .PHONY: install-python test-python clean-python
-.PHONY: install-js test-js clean-js
+.PHONY: install-js test-js clean-js js-types
 .PHONY: install-cpp test-cpp clean-cpp
 .PHONY: release-python release-python-dry
 .PHONY: release-js release-js-dry
@@ -111,11 +111,12 @@ clean-cpp: ## Remove C++ build/test artifacts
 #       CI instead builds via release-python-dry and uploads through OIDC
 #       trusted publishing (pypa/gh-action-pypi-publish, no token).
 #
-# JSR:  the package ships generated .d.ts declarations (npm run types) wired to
-#       the JS sources via @ts-self-types pragmas, so fast-check passes and
-#       slow types need not be allowed. If a publish fails on slow types,
-#       regenerate the declarations and re-run. JSR versions are immutable: a
-#       published version can never be reused.
+# JSR:  the .d.ts declarations under javascript/types/ are GENERATED at release
+#       time (npm run types) — they are not committed. They are wired to the JS
+#       sources via @ts-self-types pragmas, so JSR fast-check passes and slow
+#       types need not be allowed. If a publish fails on slow types, regenerate
+#       the declarations and re-run. JSR versions are immutable: a published
+#       version can never be reused.
 
 NPM_DIST_TAG ?= rc
 NPM_PUBLISH_FLAGS ?= --access public
@@ -130,14 +131,17 @@ release-python: ## Build sdist+wheel and upload to PyPI (twine)
 release-python-dry: ## Build sdist+wheel and validate metadata (twine check)
 	cd python && rm -rf dist && $(PYTHON) -m build && $(PYTHON) -m twine check dist/*
 
-release-js: ## Publish to npm with dist-tag $(NPM_DIST_TAG)
+js-types: install-js ## Generate the JS declaration files (javascript/types/)
+	cd javascript && npm run types
+
+release-js: ## Publish to npm with dist-tag $(NPM_DIST_TAG) (prepublishOnly regenerates types/)
 	cd javascript && npm publish $(NPM_PUBLISH_FLAGS) --tag $(NPM_DIST_TAG)
 
 release-js-dry: ## Validate npm packaging without uploading
 	cd javascript && npm publish --dry-run --tag $(NPM_DIST_TAG)
 
-release-jsr: ## Publish to JSR
+release-jsr: js-types ## Publish to JSR
 	cd javascript && deno publish $(JSR_PUBLISH_FLAGS)
 
-release-jsr-dry: ## Validate JSR packaging without uploading (--allow-dirty for local WIP)
+release-jsr-dry: js-types ## Validate JSR packaging without uploading (--allow-dirty for local WIP)
 	cd javascript && deno publish --dry-run $(JSR_PUBLISH_FLAGS) --allow-dirty

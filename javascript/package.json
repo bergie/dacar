@@ -27,6 +27,7 @@
   ],
   "scripts": {
     "types": "tsc --allowJs --declaration --emitDeclarationOnly --outDir types --rootDir . --module nodenext --moduleResolution nodenext --target es2022 --skipLibCheck src/index.js src/transport/index.js && node scripts/fix-dts.mjs",
+    "prepublishOnly": "npm run types",
     "test": "sh scripts/test.sh",
     "test:node": "node --test --test-force-exit test/*.test.js",
     "test:deno": "deno test --allow-read=test,src --allow-env --no-check test/",
@@ -60,5 +61,8 @@
   },
   "publishConfig": {
     "access": "public"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
   }
 }
