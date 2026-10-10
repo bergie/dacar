@@ -15,7 +15,8 @@
     },
     "./cli/session": "./src/cli/session.js",
     "./cli/store": "./src/cli/store.js",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./cli/fileStore": "./src/cli/fileStore.js"
   },
   "bin": {
     "dacar": "src/cli/dacar.js"
