@@ -17,7 +17,7 @@
  */
 /* @ts-self-types="../types/src/index.d.ts" */
 
-export const __version__ = "1.5.0";
+export const __version__ = "1.6.0";
 export const __specVersion__ = "1.0-RC7";
 
 // HLC (§5.1)
