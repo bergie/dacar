@@ -5,6 +5,12 @@ All notable changes to Dacar will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.1] - 2026-10-10
+
+### Added (JavaScript)
+
+- `@reticulum/dacar/cli/fileStore` package export: the Node-only `DacarFileAdapter` (the Python-canonical loose-file store layout, work doc #9) is now importable through the package specifier alongside the already-public `./cli/session` and `./cli/store` subpaths, so library consumers can build their own store-backed tooling on the same on-disk format the two CLIs share.
+
 ## [1.6.0] - 2026-10-10
 
 ### Added (JavaScript)

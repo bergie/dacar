@@ -109,5 +109,5 @@ __all__ = [
     "Verdict",
 ]
 
-__version__ = "1.6.0"
+__version__ = "1.6.1"
 __spec_version__ = "1.0-RC7"
