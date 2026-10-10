@@ -43,6 +43,7 @@ import {
   HASH_SIZE,
   MAX_LEGACY_SALTS,
   SALT_SIZE,
+  bytesEqual,
 } from "../namespace.js";
 import { Keyring } from "../verifier.js";
 
@@ -212,6 +213,32 @@ export class DacarStore {
     const id = await this.loadIdentity();
     if (!id) throw new Error("no signing identity (run `dacar init`)");
     return id.identityHash;
+  }
+
+  /**
+   * Generate a fresh signing identity, rotate the self-anchor, and re-point the
+   * `self` alias (mirrors Python `Store.rotate_identity`). The old identity's
+   * signatures will no longer verify — the caller surfaces that to the user.
+   * @param {import("@reticulum/core").Identity} newIdentity The freshly generated identity.
+   * @returns {Promise<{ oldHash: Uint8Array | null, newHash: Uint8Array }>}
+   */
+  async rotateIdentity(newIdentity) {
+    const old = await this.loadIdentity();
+    await this._adapter.saveKey(await newIdentity.getPrivateKey());
+    // Update anchors: replace the old own hash with the new one.
+    const raw = await this.loadConfig();
+    const anchors = raw.anchors.filter(
+      (a) => !old || !bytesEqual(a, old.identityHash),
+    );
+    if (!anchors.some((a) => bytesEqual(a, newIdentity.identityHash))) {
+      anchors.push(newIdentity.identityHash);
+    }
+    await this.saveConfig({ ...raw, anchors });
+    // Re-point the `self` alias.
+    const aliases = await this.loadAliases();
+    aliases.setSelf(newIdentity.identityHash);
+    await this.saveAliases(aliases);
+    return { oldHash: old ? old.identityHash : null, newHash: newIdentity.identityHash };
   }
 
   // -- clock (HLC) ---------------------------------------------------------

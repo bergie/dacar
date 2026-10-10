@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (JavaScript)
+
+- The Node `dacar` CLI is now feature-compatible with the canonical Python CLI's command surface and output conventions (`dacar/cli/commands.py`). Identities render as `<alias> (<hash>…)` everywhere (aliases take precedence over raw hashes), human summaries go to stderr and machine-readable data to stdout, and `hexToBytes` is now strict (`bytes.fromhex` parity).
+- New commands: `salt new` / `salt set --hex|--file` (§10.2 rotation), `anchor add` / `anchor list`, `identity show` / `identity new` (rotates the self-anchor and re-points the `self` alias), `show <64-hex | alias:relation:object>`, `validate [--fix]` (corruption detection, Python parity — `--fix` is advisory-only there too), `prune` (§9 state pruning plus outbox/sent horizon pruning), `alias add|remove|list|resolve`, and `ledger annotate`.
+- New `grant`/`revoke` flags: `--no-apply`, `-o/--out` (binary payload file), `--binary`, `--legacy <index>` (legacy salt hashing, §10.3), and `--copy-hashes <file>` (salt-free revoke by exact pre-hashed tuple fields); `<relation>`/`<object>` are now optional positionals, local apply failures raise a clear `local apply rejected (§9 stale / §12 future-skew)` error, and the detailed issuance summary (grantee/issuer/object/hlc/payload lines) matches Python.
+- `init` now refuses to re-initialize an existing store, accepts a 32-byte salt file (or 64-hex) via `--salt`, and prints the Python-parity summary (salt/horizon lines + §3.3 fail-open and random-salt warnings).
+- `config show` now reports legacy salts, the authoritative identity, the aliases entry count/path, and the §3.3 fail-open warning; `grants` gained `--grantee`/`--issuer` filters, `--effective` authority annotation, and the Python table layout (status, UTC timestamps, `◂ opaque` marker); `check` gained the best-effort matching-tuple trace; `apply` gained the batch fallback and per-delta detail line.
+- Online commands accept the Python `--rns-config` flag and `$DACAR_RNS_CONFIG` env var (the historical JS `--rns-dir`/`$DACAR_RNS_DIR` keep working).
+- `DacarStore.rotateIdentity()` on `src/cli/store.js` (identity rotation with anchor + `self` alias re-pointing), and the offline command implementations plus `runCommand` error-handling seam are exported from `src/cli/dacar.js` for direct testing.
+
 ### Fixed (JavaScript)
 
 - JSR package score (was 70%): the package failed the *no slow types* check because the entrypoints were plain JS without type declarations, and the *module docs* check because JSR only accepts a module doc whose leading JSDoc block carries an `@module` tag.

@@ -13,20 +13,36 @@
  *
  * Usage:
  *   dacar init
- *   dacar grant <grantee> <relation> <object> [--publish]
+ *   dacar config show
+ *   dacar salt new|set
+ *   dacar anchor add|list
+ *   dacar identity show|new|remember|forget|list
+ *   dacar grant <grantee> [<relation> [<object>]] [--publish|--lxmf <target>]
+ *   dacar revoke <grantee> [<relation> [<object>]] [--publish|--lxmf <target>]
  *   dacar sync
- *   dacar check <grantee> <relation> <object>
- *   dacar grants
- *   dacar revoke <grantee> <relation> <object> [--publish]
  *   dacar publish <file> [<file>...] | --outbox | --sent | --all   (docs #8/#11)
  *   dacar push <node> [<file>...] | --outbox | --sent | --all     (§11, doc #16 4a)
- *   dacar identity remember|forget|list ...
+ *   dacar paper export|import
+ *   dacar apply <payload>
+ *   dacar check <grantee> <relation> <object>
+ *   dacar grants [--all|--revoked] [--grantee] [--issuer] [--effective]
+ *   dacar show <ref>
+ *   dacar validate [--fix]
+ *   dacar prune
+ *   dacar alias add|remove|list|resolve
+ *   dacar ledger annotate
  *
  * Online flags: --node <hash>, --topic <topic>, --interface shared|auto|tcp,
- * --rns-dir <path> (default: ~/.reticulum or $DACAR_RNS_DIR).
+ * --rns-config <path> (default: ~/.reticulum or $DACAR_RNS_CONFIG),
+ * --proprietor <hash>.
+ *
+ * Mirrors the canonical Python CLI's command surface and output conventions
+ * (`dacar/cli/commands.py`): identities render as `<alias> (<hash>…)`, human
+ * summaries go to stderr and payload/machine-readable data to stdout.
  */
 
 import { parseArgs } from "node:util";
+import { readFileSync } from "node:fs";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -41,9 +57,13 @@ import { bootRns } from "./rns_boot.js";
 
 import { Action, Operation, Tuple, Engine } from "../index.js";
 import { DeltaReceiver } from "../delta.js";
+import { unpackHlc, physicalNowMs } from "../hlc.js";
 import { RnsIdentityResolver } from "../transport/rnsIdentity.js";
 import { RFED_TOPIC, APP_NAME } from "../naming.js";
-import { NamespaceHasher, DEFAULT_SALT, SALT_SIZE, HASH_SIZE } from "../namespace.js";
+import {
+  NamespaceHasher, DEFAULT_SALT, SALT_SIZE, HASH_SIZE, MAX_LEGACY_SALTS,
+  bytesEqual, covers,
+} from "../namespace.js";
 import { Keyring, IssuerKeyset } from "../verifier.js";
 
 import { DacarStore, SELF_ALIAS, AliasRegistry } from "./store.js";
@@ -73,7 +93,96 @@ function out(msg) {
   process.stdout.write(msg + "\n");
 }
 
+/**
+ * Render an identity the way the Python CLI does (work doc #2 output
+ * convention): `<alias> (<short-hash>…)`, or `? (<short-hash>…)` when the
+ * hash has no alias.
+ * @param {Uint8Array} hash
+ * @param {import("./store.js").AliasRegistry} aliases
+ * @param {boolean} [full]
+ * @returns {string}
+ */
+function renderIdentity(hash, aliases, full = false) {
+  const name = aliases.primaryName(hash);
+  const sh = shortHash(hash, full);
+  return name ? `${name} (${sh})` : `? (${sh})`;
+}
+
+/**
+ * Render an HLC's physical component as a UTC `YYYY-MM-DD HH:MM` timestamp
+ * (Python `_utc`), or `-` for a null timestamp.
+ * @param {bigint | number | null} hlc
+ * @returns {string}
+ */
+function utcFromHlc(hlc) {
+  if (!hlc) return "-";
+  const ms = Number(hlc >> 16n);
+  return new Date(ms).toISOString().slice(0, 16).replace("T", " ");
+}
+
+/** Render an HLC as the Python CLI does: `0x…` zero-padded to 16 hex digits. */
+function hlcHex(hlc) {
+  return `0x${hlc.toString(16).padStart(16, "0")}`;
+}
+
+/**
+ * Render a relation: ledger plaintext when known, else the bracketed hash.
+ * @param {Uint8Array} relationHash
+ * @param {{ relation?: string | null } | undefined} ledgerRow
+ * @param {boolean} [full]
+ */
+function renderRelation(relationHash, ledgerRow, full = false) {
+  if (ledgerRow && ledgerRow.relation) return ledgerRow.relation;
+  return `[${shortHash(relationHash, full)}]`;
+}
+
+/**
+ * Render an object: ledger plaintext when known, else bracketed hashes.
+ * @param {Uint8Array[]} objectHashes
+ * @param {boolean} wildcard
+ * @param {{ object?: string | null } | undefined} ledgerRow
+ * @param {boolean} [full]
+ */
+function renderObject(objectHashes, wildcard, ledgerRow, full = false) {
+  if (ledgerRow && ledgerRow.object) return ledgerRow.object;
+  const n = objectHashes.length;
+  if (n === 0) return wildcard ? "[*]" : "[∅]";
+  const head = shortHash(objectHashes[0], full);
+  const more = n > 1 ? ` · ${n} seg` : "";
+  return `[${head}${more}]`;
+}
+
 class CliError extends Error {}
+
+/** Cryptographically secure random bytes (Python `_generate_salt`). */
+function randomBytes(len) {
+  const out = new Uint8Array(len);
+  crypto.getRandomValues(out);
+  return out;
+}
+
+/**
+ * Parse a `--salt`/`salt set` value that is either 64-hex or a path to a
+ * 32-byte raw salt file (mirrors Python `_parse_salt_value`).
+ * @param {string} value
+ * @returns {Promise<Uint8Array>}
+ */
+async function saltFromValue(value) {
+  const hexCandidate = value.toLowerCase().startsWith("0x") ? value.slice(2) : value;
+  if (hexCandidate.length === SALT_SIZE * 2) {
+    try {
+      const salt = hexToBytes(hexCandidate);
+      if (salt.length === SALT_SIZE) return salt;
+    } catch {
+      // fall through to file interpretation
+    }
+  }
+  const data = new Uint8Array(await readFile(value));
+  if (data.length !== SALT_SIZE) {
+    throw new CliError(`salt file ${JSON.stringify(value)} must contain ${SALT_SIZE} bytes, got ${data.length}`);
+  }
+  return data;
+}
 
 // ---------------------------------------------------------------------------
 // Store + RNS resolution
@@ -89,20 +198,35 @@ async function openStore(args) {
   return new DacarStore(adapter, { identityBytes: args.identity ? await readFile(args.identity) : null });
 }
 
+/**
+ * Resolve an alias or 16-byte (32-hex) hash to a 16-byte identity hash
+ * (mirrors Python `resolve_identity`, including its error messages).
+ * @param {string} value
+ * @param {import("./store.js").AliasRegistry} aliases
+ * @returns {Uint8Array}
+ */
 function resolveIdentityHash(value, aliases) {
   const fromAlias = aliases.resolve(value);
   if (fromAlias) return fromAlias;
-  const clean = value.toLowerCase().replace(/^0x/, "");
-  const raw = hexToBytes(clean);
-  if (raw.length !== 16) {
+  const clean = value.trim().toLowerCase().replace(/^0x/, "");
+  let raw;
+  try {
+    raw = hexToBytes(clean);
+  } catch {
     throw new CliError(`unknown identity ${JSON.stringify(value)} (not a known alias or 16-byte hex hash)`);
+  }
+  if (raw.length !== 16) {
+    throw new CliError(`identity ${JSON.stringify(value)} is ${raw.length} bytes; expected 16 (32 hex)`);
   }
   return raw;
 }
 
 function hexToBytes(hex) {
   const clean = hex.startsWith("0x") ? hex.slice(2) : hex;
-  const out = new Uint8Array(Math.floor(clean.length / 2));
+  if (clean.length % 2 !== 0 || !/^[0-9a-fA-F]*$/.test(clean)) {
+    throw new Error(`invalid hex string (length ${clean.length})`);
+  }
+  const out = new Uint8Array(clean.length / 2);
   for (let i = 0; i < out.length; i++) {
     out[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
   }
@@ -128,7 +252,9 @@ function asRnsPubKey(pubKey) {
 }
 
 async function resolveRnsConfigDir(args) {
-  const explicit = args.rnsDir ?? process.env.DACAR_RNS_DIR;
+  // `--rns-config` is the Python-parity flag name; `--rns-dir` is the
+  // historical JS name (both accepted). Same for the env vars.
+  const explicit = args.rnsConfig ?? args.rnsDir ?? process.env.DACAR_RNS_CONFIG ?? process.env.DACAR_RNS_DIR;
   if (explicit) return explicit;
   const user = join(homedir(), ".reticulum");
   try {
@@ -207,18 +333,41 @@ async function resolveLxmfTarget(args, store, aliases) {
 
 async function cmdInit(args) {
   const path = args.store || defaultStorePath();
+  const existing = new DacarStore(new DacarFileAdapter(path));
+  if (await existing.exists()) {
+    throw new CliError(`store already initialized at ${path}`);
+  }
   await mkdir(path, { recursive: true });
   const adapter = new DacarFileAdapter(path);
+  /** @type {Uint8Array | undefined} */ let salt;
+  const saltProvided = args.salt != null;
+  if (saltProvided) {
+    salt = await saltFromValue(String(args.salt));
+    if (bytesEqual(salt, DEFAULT_SALT)) {
+      err("WARNING: --salt is the default null salt (§3.3 fail-open on privacy).");
+    }
+  }
   const store = await DacarStore.init(adapter, {
-    salt: args.salt ? hexToBytes(args.salt) : undefined,
+    salt,
     horizonDays: parseInt(args.horizon || "180", 10),
     identityBytes: args.identity ? await readFile(args.identity) : undefined,
   });
   const identity = await store.loadIdentity();
   const aliases = await store.loadAliases();
+  const raw = await store.loadConfig();
   err("✔ initialized store at " + path);
-  err("  identity : " + shortHash(identity.identityHash, args.fullHashes));
-  err("  anchor   : " + shortHash(identity.identityHash, args.fullHashes) + " (self)");
+  err(`  identity : ${renderIdentity(identity.identityHash, aliases, args.fullHashes)}`);
+  err(`  anchor   : ${renderIdentity(identity.identityHash, aliases, args.fullHashes)} (self)`);
+  err(`  salt     : ${shortHash(raw.primarySalt, args.fullHashes)}` +
+    (bytesEqual(raw.primarySalt, DEFAULT_SALT) ? " (default null — FAIL-OPEN)" : " (random)"));
+  err(`  horizon  : ${raw.horizonDays} days`);
+  if (bytesEqual(raw.primarySalt, DEFAULT_SALT)) {
+    err("  WARNING: primary salt is the default null (§3.3 fail-open on privacy).");
+  }
+  if (!saltProvided) {
+    err("  WARNING: a unique random salt was generated. Grants will be opaque across");
+    err("           nodes unless they share the same salt (see README).");
+  }
   return 0;
 }
 
@@ -226,18 +375,145 @@ async function cmdConfigShow(args) {
   const store = await openStore(args);
   const raw = await store.loadConfig();
   const aliases = await store.loadAliases();
-  err("store: " + (args.store || defaultStorePath()));
+  const path = args.store || defaultStorePath();
+  const full = args.fullHashes || args.reveal;
+  err("store: " + path);
   err("[salt]");
-  err("  primary   : " + (args.reveal ? toHex(raw.primarySalt) : "<masked (use --reveal)>"));
+  const isDefault = bytesEqual(raw.primarySalt, DEFAULT_SALT);
+  err("  primary   : " + (args.reveal ? toHex(raw.primarySalt) : "<masked (use --reveal)>") +
+    (isDefault ? "  ⚠ FAIL-OPEN (default null)" : ""));
+  raw.legacySalts.forEach((legacy, i) => {
+    err(`  legacy${i}   : ${args.reveal ? toHex(legacy) : "<masked>"}`);
+  });
   err("[trust]");
-  for (const a of raw.anchors) err("  anchor    : " + shortHash(a, args.fullHashes));
+  for (const a of raw.anchors) err("  anchor    : " + renderIdentity(a, aliases, full));
+  if (raw.authoritative) {
+    err("  authoritative : " + renderIdentity(raw.authoritative, aliases, full));
+  }
   err("[policy]");
   err("  deletion_horizon_days : " + raw.horizonDays);
   err("[rfed]");
   err("  topic : " + raw.rfedTopic);
-  err("  node  : " + (raw.rfedNode ? shortHash(raw.rfedNode, args.fullHashes) : "(not set)"));
+  err("  node  : " + (raw.rfedNode ? renderIdentity(raw.rfedNode, aliases, full) : "(not set)"));
   err("[lxmf]");
-  err("  proprietor : " + (raw.lxmfProprietor ? shortHash(raw.lxmfProprietor, args.fullHashes) : "(not set)"));
+  err("  proprietor : " + (raw.lxmfProprietor ? renderIdentity(raw.lxmfProprietor, aliases, full) : "(not set)"));
+  err(`[aliases] ${aliases.entries.length} entries (${join(path, "aliases")})`);
+  if (isDefault) {
+    err("WARNING: primary salt is the default null (§3.3 fail-open on privacy).");
+  }
+  return 0;
+}
+
+// -- salt (§3.3/§10.2) ------------------------------------------------------
+
+async function cmdSaltNew(args) {
+  const store = await openStore(args);
+  const raw = await store.loadConfig();
+  // §10.2 rotation: old primary → legacy0, old legacy0 → legacy1, drop old legacy1.
+  const newPrimary = randomBytes(SALT_SIZE);
+  const newLegacy = [raw.primarySalt, ...raw.legacySalts.slice(0, 1)].slice(0, MAX_LEGACY_SALTS);
+  await store.saveConfig({ ...raw, primarySalt: newPrimary, legacySalts: newLegacy });
+  err("✔ rotated primary salt (old primary → legacy0, §10.2)");
+  err("  primary : " + shortHash(newPrimary, args.fullHashes) +
+    (bytesEqual(newPrimary, DEFAULT_SALT) ? "  ⚠ FAIL-OPEN" : ""));
+  for (let i = 0; i < newLegacy.length; i++) {
+    err(`  legacy${i}: ${shortHash(newLegacy[i], args.fullHashes)}`);
+  }
+  return 0;
+}
+
+async function cmdSaltSet(args) {
+  const store = await openStore(args);
+  const raw = await store.loadConfig();
+  /** @type {Uint8Array} */ let salt;
+  if (args.hex != null) {
+    try {
+      salt = hexToBytes(String(args.hex));
+    } catch {
+      throw new CliError(`--hex is not valid hex: ${JSON.stringify(args.hex)}`);
+    }
+  } else if (args.file != null) {
+    salt = new Uint8Array(await readFile(String(args.file)));
+    if (salt.length !== SALT_SIZE) {
+      throw new CliError(`salt file must contain ${SALT_SIZE} bytes, got ${salt.length}`);
+    }
+  } else {
+    throw new CliError("salt set requires --hex <hex> or --file <path>");
+  }
+  if (salt.length !== SALT_SIZE) {
+    throw new CliError(`salt must be ${SALT_SIZE} bytes, got ${salt.length}`);
+  }
+  await store.saveConfig({ ...raw, primarySalt: salt });
+  err("✔ set primary salt to " + shortHash(salt, args.fullHashes) +
+    (bytesEqual(salt, DEFAULT_SALT) ? "  ⚠ FAIL-OPEN (default null)" : ""));
+  return 0;
+}
+
+// -- anchors (§4.2) ---------------------------------------------------------
+
+async function cmdAnchorAdd(args) {
+  const store = await openStore(args);
+  const aliases = await store.loadAliases();
+  const anchor = resolveIdentityHash(args.hash, aliases);
+  const raw = await store.loadConfig();
+  if (raw.anchors.some((a) => bytesEqual(a, anchor))) {
+    throw new CliError(`anchor already present: ${renderIdentity(anchor, aliases, args.fullHashes)}`);
+  }
+  await store.saveConfig({ ...raw, anchors: [...raw.anchors, anchor] });
+  err(`✔ added anchor ${renderIdentity(anchor, aliases, args.fullHashes)}`);
+  return 0;
+}
+
+async function cmdAnchorList(args) {
+  const store = await openStore(args);
+  const raw = await store.loadConfig();
+  const aliases = await store.loadAliases();
+  if (!raw.anchors.length) {
+    err("(no Root Trust Anchors configured)");
+    return 0;
+  }
+  err(`ROOT TRUST ANCHORS (${raw.anchors.length})`);
+  for (const a of raw.anchors) err("  " + renderIdentity(a, aliases, args.fullHashes));
+  if (raw.authoritative) {
+    err("authoritative: " + renderIdentity(raw.authoritative, aliases, args.fullHashes));
+  }
+  return 0;
+}
+
+// -- identity show / new ----------------------------------------------------
+
+async function cmdIdentityShow(args) {
+  const store = await openStore(args);
+  const identity = await store.loadIdentity();
+  if (!identity) {
+    throw new CliError("no signing identity (run `dacar init` or `dacar identity new`)");
+  }
+  const aliases = await store.loadAliases();
+  const path = args.store || defaultStorePath();
+  err(`identity : ${renderIdentity(identity.identityHash, aliases, args.fullHashes)}`);
+  err("  source  : " + (args.identity ? `--identity ${args.identity}` : join(path, "identity.key")));
+  err(`  pubkey  : ${toHex((await identity.getPublicKey()).slice(32))}`);
+  if (aliases.entries.length) {
+    err("aliases  :");
+    for (const entry of aliases.entries) {
+      err(`  ${toHex(entry.hash)}  ${entry.names.join(" ")}` + (entry.note ? `  # ${entry.note}` : ""));
+    }
+  }
+  return 0;
+}
+
+async function cmdIdentityNew(args) {
+  const store = await openStore(args);
+  const newIdentity = await Identity.generate();
+  const { oldHash, newHash } = await store.rotateIdentity(newIdentity);
+  const aliases = await store.loadAliases();
+  const path = args.store || defaultStorePath();
+  err("✔ generated new signing identity");
+  err("  old : " + (oldHash ? shortHash(oldHash, args.fullHashes) : "(none)"));
+  err(`  new : ${renderIdentity(newHash, aliases, args.fullHashes)}`);
+  err(`  file: ${join(path, "identity.key")} (mode 0600)`);
+  err("  NOTE: previous identity's signatures will no longer verify; " +
+    "self-anchor rotated to the new identity.");
   return 0;
 }
 
@@ -249,19 +525,96 @@ async function cmdRevoke(args) {
   return _issue(args, Action.REVOKE);
 }
 
+/**
+ * Parse a `--copy-hashes` file: `relation_hash=<hex>`, `object_hashes=<hex>:<hex>`,
+ * `wildcard=true|false` (mirrors Python `_parse_copy_hashes`).
+ * @param {string} path
+ * @returns {{ relationHash: Uint8Array, objectHashes: Uint8Array[], wildcard: boolean }}
+ */
+function parseCopyHashes(path) {
+  let relationHash = null;
+  const objectHashes = [];
+  let wildcard = false;
+  const text = readFileSync(path, "utf8");
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#") || !line.includes("=")) continue;
+    const eq = line.indexOf("=");
+    const key = line.slice(0, eq).trim();
+    const val = line.slice(eq + 1).trim();
+    if (key === "relation_hash") {
+      try {
+        relationHash = hexToBytes(val);
+      } catch {
+        throw new CliError(`--copy-hashes file has an invalid relation_hash: ${val}`);
+      }
+    } else if (key === "object_hashes") {
+      for (const part of val.split(":")) {
+        if (!part) continue;
+        try {
+          objectHashes.push(hexToBytes(part));
+        } catch {
+          throw new CliError(`--copy-hashes file has an invalid object hash: ${part}`);
+        }
+      }
+    } else if (key === "wildcard") {
+      wildcard = ["true", "1", "yes"].includes(val.toLowerCase());
+    }
+  }
+  if (!relationHash || relationHash.length !== HASH_SIZE) {
+    throw new CliError("--copy-hashes file must define a 16-byte relation_hash");
+  }
+  return { relationHash, objectHashes, wildcard };
+}
+
+/**
+ * Build the tuple to issue (mirrors Python `_build_tuple`): plaintext
+ * `relation`/`object` (with an optional `--legacy` salt index) or the exact
+ * pre-hashed fields from `--copy-hashes` (a salt-free revoke path).
+ * @returns {Promise<{ tuple: Tuple, objectId: string | null, relation: string | null, wildcard: boolean | null }>}
+ */
+async function buildTuple(args, config, aliases, issuerHash) {
+  const grantee = resolveIdentityHash(args.grantee, aliases);
+  if (args["copy-hashes"]) {
+    const { relationHash, objectHashes, wildcard } = parseCopyHashes(args["copy-hashes"]);
+    const tuple = new Tuple({
+      relationHash, objectHashes, wildcard, grantee, issuer: issuerHash,
+    });
+    return { tuple, objectId: null, relation: null, wildcard: null };
+  }
+  const relation = args.relation;
+  const objectId = args.object;
+  if (relation == null || objectId == null) {
+    throw new CliError("grant/revoke requires <relation> and <object> (or --copy-hashes <file>)");
+  }
+  let hasher = config.primaryHasher;
+  if (args.legacy != null) {
+    const legacy = config.legacySalts;
+    if (args.legacy < 0 || args.legacy >= legacy.length) {
+      throw new CliError(
+        `--legacy index ${args.legacy} out of range (have ${legacy.length} legacy salts)`,
+      );
+    }
+    hasher = new NamespaceHasher(legacy[args.legacy]);
+  }
+  const wildcard = objectId.endsWith("*") && objectId !== "*";
+  const tuple = await Tuple.fromPlaintext({
+    objectId, relation, grantee, issuer: issuerHash, hasher,
+  });
+  return { tuple, objectId, relation, wildcard };
+}
+
 async function _issue(args, action) {
   const store = await openStore(args);
   const config = await store.loadConfigValidated();
   const aliases = await store.loadAliases();
   const identity = await store.loadIdentity();
-  if (!identity) throw new CliError("no signing identity (run `dacar init`)");
+  if (!identity) throw new CliError("no signing identity (run `dacar init` or `dacar identity new`)");
 
-  const grantee = resolveIdentityHash(args.grantee, aliases);
-  const hasher = config.primaryHasher;
-  const tuple = await Tuple.fromPlaintext({
-    objectId: args.object, relation: args.relation, grantee, issuer: identity.identityHash, hasher,
-  });
+  const { tuple, objectId, relation, wildcard } =
+    await buildTuple(args, config, aliases, identity.identityHash);
 
+  // Monotonic HLC, persisted across invocations.
   const clock = await store.loadClock();
   const hlc = clock.now();
   await store.saveClock(clock);
@@ -269,19 +622,62 @@ async function _issue(args, action) {
   const op = await new Operation({ tuple, action, hlc }).sign(identity);
   const payload = op.toPayload();
 
-  const state = await store.loadState(config);
-  state.apply(op);
-  await store.saveState(state);
+  let applied = false;
+  if (!args["no-apply"]) {
+    const state = await store.loadState(config);
+    applied = state.apply(op);
+    if (!applied) {
+      throw new CliError("local apply rejected (§9 stale / §12 future-skew)");
+    }
+    await store.saveState(state);
+  }
 
-  // Record plaintext ledger.
-  const ledger = await store.loadLedger();
-  ledger.set(toHex(await tuple.hash()), { object: args.object, relation: args.relation, wildcard: args.object.endsWith("*") && args.object !== "*", firstSeen: Number(hlc >> 16n) });
-  await store.saveLedger(ledger);
+  // Record plaintext ledger for any locally-issued op with known plaintext.
+  // §13.6: first_seen is the *physical* HLC timestamp (high 48 bits), not the
+  // full 64-bit HLC — matching the Python CLI so ledger.msgpack stays
+  // byte-identical across implementations (§13.11).
+  if (objectId != null && relation != null) {
+    const ledger = await store.loadLedger();
+    const { physicalMs } = unpackHlc(hlc);
+    ledger.set(toHex(await tuple.hash()), {
+      object: objectId, relation, wildcard: !!wildcard, firstSeen: physicalMs,
+    });
+    await store.saveLedger(ledger);
+  }
 
-  out(toHex(payload));
-  err(`✔ ${action === Action.GRANT ? "granted" : "revoked"} ${shortHash(grantee, args.fullHashes)}  ${args.relation}  on  ${args.object}`);
-  err(`  hlc     : 0x${hlc.toString(16)}`);
-  err(`  payload : hex on stdout (${payload.length} bytes)`);
+  // Emit the signed payload (hex on stdout by default).
+  let where;
+  if (args.out) {
+    await writeFile(String(args.out), payload);
+    where = `binary file ${args.out}`;
+  } else if (args.binary) {
+    process.stdout.write(payload);
+    where = "binary on stdout";
+  } else {
+    out(toHex(payload));
+    where = "hex on stdout";
+  }
+
+  const verb = action === Action.GRANT ? "granted" : "revoked";
+  err(`✔ ${verb.padEnd(8)} ${renderIdentity(tuple.grantee, aliases, args.fullHashes)}  ` +
+    `${relation ?? "[hash]"}  on  ${objectId ?? "[hash]"}`);
+  err(`  grantee : ${renderIdentity(tuple.grantee, aliases, args.fullHashes)}`);
+  err(`  issuer  : ${renderIdentity(tuple.issuer, aliases, args.fullHashes)}`);
+  if (objectId != null) {
+    const nseg = objectId === "*" ? 0 : objectId.split(":").filter((s) => s).length;
+    err(`  object  : ${objectId}  (${nseg} segment${nseg !== 1 ? "s" : ""}` +
+      `${wildcard ? ", wildcard" : ""})`);
+  } else {
+    err(`  object  : [copy-hashes, ${tuple.objectHashes.length} segment(s)` +
+      `${tuple.wildcard ? ", wildcard" : ""}]`);
+  }
+  err(`  hlc     : ${hlcHex(hlc)}`);
+  err(`  payload : ${where} (${payload.length} bytes)`);
+  if (args["no-apply"]) {
+    err("  (not applied locally: --no-apply)");
+  } else if (applied) {
+    err("  (applied locally)");
+  }
 
   if (args.publish || args.lxmf) {
     // Durability (work doc #11): enqueue the signed payload to the outbox
@@ -314,8 +710,7 @@ async function _issue(args, action) {
     }
   } else {
     // Outbox (work doc #8): queue locally-issued deltas for `publish --outbox`.
-    // (JS `grant` always applies locally — there is no `--no-apply` — so every
-    // non-publish grant is a candidate for later batch publish.)
+    // `--no-apply` only governs local CRDT apply, not whether the delta was issued.
     const outbox = await store.loadOutbox();
     outbox.push(payload);
     await store.saveOutbox(outbox);
@@ -559,12 +954,62 @@ async function cmdCheck(args) {
   const config = await store.loadConfigValidated();
   const state = await store.loadState(config);
   const aliases = await store.loadAliases();
+  const ledger = await store.loadLedger();
   const engine = new Engine(config, state);
   const grantee = resolveIdentityHash(args.grantee, aliases);
   const allowed = await engine.evaluate(args.object, args.relation, grantee);
+
   const mark = allowed ? "✔" : "✘";
-  err(`${mark} ${allowed ? "ALLOW" : "DENY"} ${shortHash(grantee, args.fullHashes)}  ${args.relation}  ${args.object}`);
+  const verdict = allowed ? "ALLOW" : "DENY";
+  err(`${mark} ${verdict.padEnd(5)} ${renderIdentity(grantee, aliases, args.fullHashes)}  ` +
+    `${args.relation}  ${args.object}`);
+
+  // Best-effort trace: find the matching active tuples across all salts.
+  const matches = [];
+  for await (const m of findMatchingTuples(config, state, args.relation, args.object, grantee)) {
+    matches.push(m);
+  }
+  if (!matches.length) {
+    err("  no matching active tuple");
+  } else {
+    for (const [kind, tuple] of matches) {
+      const row = ledger.get(toHex(await tuple.hash()));
+      const rel = renderRelation(tuple.relationHash, row, args.fullHashes);
+      const obj = row && row.object ? row.object : "[hash]";
+      const issuerLabel = renderIdentity(tuple.issuer, aliases, args.fullHashes);
+      const anchor = config.isRootAnchor(tuple.issuer)
+        ? "is a Root Trust Anchor"
+        : "is NOT an anchor";
+      const tag = kind === "deny" ? "deny" : "allow";
+      err(`  ${tag.padEnd(5)} : ${issuerLabel} ${rel} ${obj}  (${anchor})`);
+    }
+  }
   return allowed ? 0 : 1;
+}
+
+/**
+ * Yield `[kind, tuple, hasher]` for active tuples matching the request
+ * (mirrors Python `_find_matching_tuples`).
+ * @param {import("../config.js").Config} config
+ * @param {import("../crdt.js").StateVector} state
+ * @param {string} relation
+ * @param {string} objectId
+ * @param {Uint8Array} grantee
+ */
+async function* findMatchingTuples(config, state, relation, objectId, grantee) {
+  for (const hasher of config.hashers) {
+    const allowRh = await hasher.hashRelation(relation);
+    const denyRh = await hasher.hashRelation("-" + relation);
+    const { hashes: objHashes } = await hasher.hashObject(objectId);
+    for (const tuple of state.activeTuples()) {
+      if (!bytesEqual(tuple.grantee, grantee)) continue;
+      if (bytesEqual(tuple.relationHash, denyRh) && covers(tuple.objectHashes, tuple.wildcard, objHashes)) {
+        yield ["deny", tuple, hasher];
+      } else if (bytesEqual(tuple.relationHash, allowRh) && covers(tuple.objectHashes, tuple.wildcard, objHashes)) {
+        yield ["allow", tuple, hasher];
+      }
+    }
+  }
 }
 
 async function cmdApply(args) {
@@ -573,15 +1018,35 @@ async function cmdApply(args) {
   const state = await store.loadState(config);
   const keyring = await store.keyringForVerify();
   const rx = new DeltaReceiver(state, keyring);
-  const data = args.payload === "-"
-    ? new Uint8Array(await readStdin())
-    : await readFile(args.payload);
-  const applied = await rx.applyPayload(data);
-  if (applied) {
+  const data = await readPayloadInput(args.payload, !!args.binary);
+  if (!data.length) throw new CliError("empty payload");
+
+  // Try a single delta first; fall back to a batch.
+  if (await rx.applyPayload(data)) {
     await store.saveState(state);
-    err(`✔ applied 1 delta`);
+    err("✔ applied 1 delta");
+    try {
+      const op = Operation.fromPayload(data);
+      const aliases = await store.loadAliases();
+      const ledger = await store.loadLedger();
+      const row = ledger.get(toHex(await op.tuple.hash()));
+      err(`  ${renderIdentity(op.grantee, aliases, args.fullHashes)}  ` +
+        `${renderRelation(op.relationHash, row, args.fullHashes)}  ` +
+        `${renderObject(op.objectHashes, op.wildcard, row, args.fullHashes)}  ` +
+        `← ${renderIdentity(op.issuer, aliases, args.fullHashes)}`);
+    } catch {
+      // best-effort detail line only
+    }
     return 0;
   }
+
+  const count = await rx.applyPayloads(data);
+  if (count > 0) {
+    await store.saveState(state);
+    err(`✔ applied ${count} delta(s) (batch)`);
+    return 0;
+  }
+
   err("✘ delta rejected (unknown issuer, bad signature, stale §9, or malformed)");
   return 1;
 }
@@ -622,7 +1087,19 @@ function coercePayload(data, forceBinary) {
   return hexToBytes(trimmed);
 }
 
-export { coercePayload, recordPublish };
+export {
+  coercePayload, recordPublish,
+  // Pure helpers (unit-testable seams, mirroring Python's commands.py surface).
+  renderIdentity, renderRelation, renderObject, utcFromHlc, hlcHex,
+  saltFromValue, prunePayloadList, findMatchingTuples, parseCopyHashes,
+  // Command implementations (offline commands are directly testable).
+  cmdInit, cmdConfigShow, cmdSaltNew, cmdSaltSet, cmdAnchorAdd, cmdAnchorList,
+  cmdIdentityShow, cmdIdentityNew, cmdIdentityRemember, cmdIdentityForget,
+  cmdIdentityList, cmdGrant, cmdRevoke, cmdSync, cmdPublish, cmdPush,
+  cmdPaperExport, cmdPaperImport, cmdApply, cmdCheck, cmdGrants, cmdShow,
+  cmdValidate, cmdPrune, cmdAliasAdd, cmdAliasRemove, cmdAliasList,
+  cmdAliasResolve, cmdLedgerAnnotate,
+};
 
 // ---------------------------------------------------------------------------
 // paper messages (§11.3, work doc #14)
@@ -1129,6 +1606,7 @@ async function cmdIdentityRemember(args) {
   const store = await openStore(args);
   const aliases = await store.loadAliases();
   const issuerHash = resolveIdentityHash(args.hash, aliases);
+  const path = args.store || defaultStorePath();
 
   let pubKey;
   if (args.pubkey) {
@@ -1144,7 +1622,8 @@ async function cmdIdentityRemember(args) {
     const recalled = await rns.transport.recallIdentity(issuerHash, true);
     if (!recalled) {
       throw new CliError(
-        `could not recall ${shortHash(issuerHash, args.fullHashes)} from RNS; use --pubkey <hex> or --file <path>`,
+        `could not recall ${renderIdentity(issuerHash, aliases, args.fullHashes)} from RNS; ` +
+          "use --pubkey <hex> or --file <path> to specify the key out-of-band",
       );
     }
     pubKey = await recalled.getPublicKey();
@@ -1154,9 +1633,9 @@ async function cmdIdentityRemember(args) {
   const keyring = await store.loadKeyring();
   keyring.registerSingle(issuerHash, pubKey);
   await store.saveKeyring(keyring);
-  err(`✔ remembered issuer ${shortHash(issuerHash, args.fullHashes)}`);
-  err(`  pubkey : ${toHex(pubKey.slice(32)).slice(0, SHORT_HASH)}…`);
-  err(`  cache  : ${keyring.size} entries`);
+  err(`✔ remembered issuer ${renderIdentity(issuerHash, aliases, args.fullHashes)}`);
+  err(`  pubkey : ${toHex(pubKey.slice(32))}`);
+  err(`  cache  : ${join(path, "identities.msgpack")} (${keyring.size} entries)`);
   return 0;
 }
 
@@ -1164,6 +1643,7 @@ async function cmdIdentityForget(args) {
   const store = await openStore(args);
   const aliases = await store.loadAliases();
   const issuerHash = resolveIdentityHash(args.hash, aliases);
+  const path = args.store || defaultStorePath();
 
   if (!args.force) {
     // Refuse to purge an issuer with active grants in the live CRDT.
@@ -1175,7 +1655,7 @@ async function cmdIdentityForget(args) {
     }
     if (active > 0) {
       throw new CliError(
-        `issuer ${shortHash(issuerHash, args.fullHashes)} has ${active} active grant(s) in the live CRDT; ` +
+        `issuer ${renderIdentity(issuerHash, aliases, args.fullHashes)} has ${active} active grant(s) in the live CRDT; ` +
           "forgetting it would make its revokes unverifiable (use --force to override)",
       );
     }
@@ -1183,11 +1663,11 @@ async function cmdIdentityForget(args) {
 
   const keyring = await store.loadKeyring();
   if (!keyring.forget(issuerHash)) {
-    throw new CliError(`issuer ${shortHash(issuerHash, args.fullHashes)} not in the cache`);
+    throw new CliError(`issuer ${renderIdentity(issuerHash, aliases, args.fullHashes)} not in the cache`);
   }
   await store.saveKeyring(keyring);
-  err(`✔ forgot issuer ${shortHash(issuerHash, args.fullHashes)}`);
-  err(`  cache : ${keyring.size} entries`);
+  err(`✔ forgot issuer ${renderIdentity(issuerHash, aliases, args.fullHashes)}`);
+  err(`  cache : ${join(path, "identities.msgpack")} (${keyring.size} entries)`);
   return 0;
 }
 
@@ -1195,7 +1675,8 @@ async function cmdIdentityList(args) {
   const store = await openStore(args);
   const aliases = await store.loadAliases();
   const keyring = await store.loadKeyring();
-  err(`ISSUER IDENTITY CACHE (${keyring.size})`);
+  const path = args.store || defaultStorePath();
+  err(`ISSUER IDENTITY CACHE (${keyring.size})  ${join(path, "identities.msgpack")}`);
   if (keyring.size === 0) {
     err("(none — use `dacar identity remember <hash>` to seed)");
     return 0;
@@ -1206,7 +1687,8 @@ async function cmdIdentityList(args) {
     // memory it's padded to a 64-byte RNS key (zeros ‖ Ed25519). Show the
     // meaningful Ed25519 half.
     const ed25519 = pub.length === 64 ? pub.slice(32) : pub;
-    err(`  ${shortHash(hexToBytes(hashHex), args.fullHashes)}  pubkey=${toHex(ed25519).slice(0, SHORT_HASH)}…`);
+    err(`  ${renderIdentity(hexToBytes(hashHex), aliases, args.fullHashes)}  ` +
+      `pubkey=${toHex(ed25519).slice(0, SHORT_HASH)}…`);
   }
   return 0;
 }
@@ -1217,26 +1699,457 @@ async function cmdGrants(args) {
   const state = await store.loadState(config);
   const aliases = await store.loadAliases();
   const ledger = await store.loadLedger();
-  /** @type {any[]} */ const rows = [];
+  const engine = args.effective ? new Engine(config, state) : null;
+  const path = args.store || defaultStorePath();
+
+  const rows = [];
   for (const entry of state._entries.values()) {
     const active = entry.addTs !== null && (entry.removeTs === null || entry.addTs > entry.removeTs);
     if (args.revoked && active) continue;
     if (!args.all && !args.revoked && !active) continue;
+    if (args.grantee != null) {
+      const wanted = resolveIdentityHash(String(args.grantee), aliases);
+      if (!bytesEqual(entry.tuple.grantee, wanted)) continue;
+    }
+    if (args.issuer != null) {
+      const wanted = resolveIdentityHash(String(args.issuer), aliases);
+      if (!bytesEqual(entry.tuple.issuer, wanted)) continue;
+    }
     rows.push({ entry, active });
   }
+
   const label = args.revoked ? "REVOKED TOMBSTONES" : args.all ? "ALL TUPLES" : "ACTIVE GRANTS";
-  err(`${label} (${rows.length})`);
+  err(`${label} (${rows.length})${" ".repeat(16)}store: ${path}`);
+  if (!rows.length) {
+    err("(none)");
+    return 0;
+  }
+
+  err("GRANTEE              RELATION   OBJECT           ISSUER               STATUS   TIMESTAMP");
   for (const { entry, active } of rows) {
     const t = entry.tuple;
     const row = ledger.get(toHex(await t.hash()));
-    const rel = row?.relation || `[${shortHash(t.relationHash, args.fullHashes)}]`;
-    const obj = row?.object || "[hash]";
-    err(
-      `${shortHash(t.grantee, args.fullHashes)}  ${rel}  ${obj}  ← ${shortHash(t.issuer, args.fullHashes)}  ` +
-        `${active ? "active" : "revoked"}`,
-    );
+    const grantee = renderIdentity(t.grantee, aliases, args.fullHashes);
+    const relation = renderRelation(t.relationHash, row, args.fullHashes);
+    const obj = renderObject(t.objectHashes, t.wildcard, row, args.fullHashes);
+    const issuer = renderIdentity(t.issuer, aliases, args.fullHashes);
+    const status = active ? "active" : "revoked";
+    const ts = active ? utcFromHlc(entry.addTs) : utcFromHlc(entry.removeTs);
+    let opaque = "";
+    if (!(row && row.object)) opaque = " ◂ opaque";
+    let effective = "";
+    if (engine !== null && row && row.object) {
+      // The issuer is "effective" iff its authority traces to a root anchor.
+      // A root anchor is effective by definition (the genesis tuple is
+      // implicit, §4.2); a delegated issuer is effective iff the engine
+      // grants it admin on this object.
+      const hasAuth = config.isRootAnchor(t.issuer) ||
+        await engine.evaluate(row.object, "admin", t.issuer);
+      effective = hasAuth ? " ✔" : " ⚠";
+    }
+    err(`${grantee.padEnd(20)} ${relation.padEnd(10)} ${obj.padEnd(16)} ` +
+      `${issuer.padEnd(20)} ${status.padEnd(8)} ${ts}${opaque}${effective}`);
   }
   return 0;
+}
+
+// ---------------------------------------------------------------------------
+// show / validate / prune
+// ---------------------------------------------------------------------------
+
+async function cmdShow(args) {
+  const store = await openStore(args);
+  const config = await store.loadConfigValidated();
+  const state = await store.loadState(config);
+  const aliases = await store.loadAliases();
+  const ledger = await store.loadLedger();
+
+  const ref = String(args.ref).trim();
+  let shown = false;
+  // Tuple-hash form (64 hex = the 32-byte §6.1 SHA-256 Tuple Hash).
+  if (ref.length === 64) {
+    let tupleHash = null;
+    try {
+      tupleHash = hexToBytes(ref);
+    } catch {
+      tupleHash = null;
+    }
+    if (tupleHash && tupleHash.length === 32) {
+      for (const entry of state._entries.values()) {
+        if (bytesEqual(await entry.tuple.hash(), tupleHash)) {
+          await printTupleDetail(entry, aliases, ledger, args.fullHashes);
+          shown = true;
+          break;
+        }
+      }
+    }
+  }
+
+  if (!shown) {
+    // alias:relation:object form — search across issuers/salts.
+    const parts = ref.split(":");
+    if (parts.length < 2) {
+      throw new CliError("show expects a 64-hex tuple hash or <alias>:<relation>:<object>");
+    }
+    const granteeAlias = parts[0];
+    const relation = parts[1];
+    const objectId = parts.length > 2 ? parts.slice(2).join(":") : "";
+    const grantee = resolveIdentityHash(granteeAlias, aliases);
+    for (const hasher of config.hashers) {
+      const allowRh = await hasher.hashRelation(relation);
+      const { hashes: objHashes } = await hasher.hashObject(objectId);
+      for (const entry of state._entries.values()) {
+        const t = entry.tuple;
+        if (!bytesEqual(t.grantee, grantee)) continue;
+        if (bytesEqual(t.relationHash, allowRh) && covers(t.objectHashes, t.wildcard, objHashes)) {
+          await printTupleDetail(entry, aliases, ledger, args.fullHashes);
+          shown = true;
+        }
+      }
+    }
+  }
+
+  if (!shown) throw new CliError(`no tuple found for ${JSON.stringify(ref)}`);
+  return 0;
+}
+
+/**
+ * Print one state entry's full detail (Python `_print_tuple_detail`).
+ * @param {{ tuple: import("../tuple.js").Tuple, addTs: bigint | null, removeTs: bigint | null }} entry
+ */
+async function printTupleDetail(entry, aliases, ledger, full) {
+  const t = entry.tuple;
+  const row = ledger.get(toHex(await t.hash()));
+  const active = entry.addTs !== null && (entry.removeTs === null || entry.addTs > entry.removeTs);
+  err(`tuple   : ${toHex(await t.hash())}`);
+  err(`  status  : ${active ? "ACTIVE" : "REVOKED"}`);
+  err(`  grantee : ${renderIdentity(t.grantee, aliases, full)}`);
+  err(`  issuer  : ${renderIdentity(t.issuer, aliases, full)}`);
+  err(`  relation: ${renderRelation(t.relationHash, row, full)}`);
+  err(`  object  : ${renderObject(t.objectHashes, t.wildcard, row, full)}`);
+  err(`  wildcard: ${t.wildcard}`);
+  err(`  segments: ${t.objectHashes.length}`);
+  err(`  added   : ${utcFromHlc(entry.addTs)}  (hlc ${entry.addTs ? hlcHex(entry.addTs) : "-"})`);
+  err(`  removed : ${utcFromHlc(entry.removeTs)}  (hlc ${entry.removeTs ? hlcHex(entry.removeTs) : "-"})`);
+}
+
+async function cmdValidate(args) {
+  const store = await openStore(args);
+  const config = await store.loadConfigValidated();
+  const state = await store.loadState(config);
+  const aliases = await store.loadAliases();
+  const ledger = await store.loadLedger();
+  const path = args.store || defaultStorePath();
+
+  const suspicious = [];
+  let checkedTuples = 0;
+
+  // First check all ledger entries (corruption is often here).
+  for (const [tupleHashHex, row] of ledger) {
+    if (row.object) {
+      // Objects use the `:` separator — a comma is ALWAYS invalid.
+      if (row.object.includes(",")) {
+        suspicious.push({
+          source: "ledger",
+          reason: `INVALID: object contains comma (objects use ':' separator): '${row.object}'`,
+          tupleHash: tupleHashHex,
+          hasStateTuple: state.has(toHex(await tupleHashBytes(tupleHashHex))),
+        });
+      } else if (row.object.length > 100) {
+        suspicious.push({
+          source: "ledger",
+          reason: `object unusually long: ${row.object.length} chars`,
+          tupleHash: tupleHashHex,
+          objectPreview: row.object.slice(0, 80) + "...",
+          hasStateTuple: state.has(toHex(await tupleHashBytes(tupleHashHex))),
+        });
+      }
+    }
+  }
+
+  // Then check state tuples.
+  for (const entry of state._entries.values()) {
+    checkedTuples += 1;
+    const t = entry.tuple;
+    const tupleHashHex = toHex(await t.hash());
+    if (suspicious.some((s) => s.tupleHash === tupleHashHex)) continue;
+
+    const row = ledger.get(tupleHashHex);
+    if (row && row.object) {
+      if (row.object.includes(",")) {
+        suspicious.push({
+          source: "ledger",
+          reason: `object contains commas: '${row.object}'`,
+          tupleHash: tupleHashHex,
+          grantee: renderIdentity(t.grantee, aliases, false),
+          issuer: renderIdentity(t.issuer, aliases, false),
+          ledgerObject: row.object,
+          segmentCount: t.objectHashes.length,
+        });
+        continue;
+      }
+      if (row.object.length > 100) {
+        suspicious.push({
+          source: "ledger",
+          reason: `object unusually long: ${row.object.length} chars`,
+          tupleHash: tupleHashHex,
+          grantee: renderIdentity(t.grantee, aliases, false),
+          issuer: renderIdentity(t.issuer, aliases, false),
+          ledgerObject: row.object.slice(0, 80) + "...",
+        });
+      }
+    }
+
+    // More than 10 segments is unusual (may indicate concatenation).
+    if (t.objectHashes.length > 10) {
+      suspicious.push({
+        source: "state",
+        reason: `unusual number of object segments: ${t.objectHashes.length}`,
+        tupleHash: tupleHashHex,
+        grantee: renderIdentity(t.grantee, aliases, false),
+        issuer: renderIdentity(t.issuer, aliases, false),
+        segmentHashes: t.objectHashes.slice(0, 5).map((h) => toHex(h).slice(0, 16)),
+      });
+    }
+
+    // Real hashes are random-looking; a segment with many printable ASCII
+    // bytes suggests plaintext ended up in the hash slots.
+    for (const h of t.objectHashes) {
+      let printable = 0;
+      for (const b of h) {
+        if (b >= 32 && b < 127) printable += 1;
+      }
+      if (printable > 8) {
+        suspicious.push({
+          source: "state",
+          reason: `suspicious object segment hash (contains ${printable}/16 printable ASCII chars)`,
+          tupleHash: tupleHashHex,
+          grantee: renderIdentity(t.grantee, aliases, false),
+          issuer: renderIdentity(t.issuer, aliases, false),
+          suspiciousHash: toHex(h),
+        });
+        break;
+      }
+    }
+  }
+
+  err(`Checked ${checkedTuples} tuple(s) and ${ledger.size} ledger entries`);
+
+  if (suspicious.length) {
+    err(`Found ${suspicious.length} suspicious entry/entries:`);
+    let i = 1;
+    for (const item of suspicious) {
+      err("");
+      err(`[${i}] [${String(item.source).toUpperCase()}] ${item.reason}`);
+      err(`    Tuple hash: ${item.tupleHash}`);
+      if (item.grantee) err(`    Grantee: ${item.grantee}`);
+      if (item.issuer) err(`    Issuer: ${item.issuer}`);
+      if (item.ledgerObject) err(`    Ledger object: ${item.ledgerObject}`);
+      if (item.objectPreview) err(`    Object preview: ${item.objectPreview}`);
+      if (item.segmentCount != null) err(`    Segment count: ${item.segmentCount}`);
+      if (item.hasStateTuple != null) err(`    Has matching state tuple: ${item.hasStateTuple}`);
+      if (item.segmentHashes) err(`    First 5 segment hashes: ${item.segmentHashes.join(", ")}`);
+      if (item.suspiciousHash) err(`    Suspicious hash: ${item.suspiciousHash}`);
+      i += 1;
+    }
+
+    if (args.fix) {
+      err("");
+      err("⚠ --fix is not yet implemented");
+      err("  To manually clean up corrupted state:");
+      err(`  1. Back up your store directory: cp -r ${path} ${path}.backup`);
+      err("  2. Delete the corrupted files:");
+      err(`     rm ${join(path, "state.msgpack")}`);
+      err(`     rm ${join(path, "ledger.msgpack")}`);
+      err("  3. Re-sync from scratch: dacar sync");
+      err("");
+      err("  WARNING: This will remove all locally-issued grants that");
+      err("           haven't been published to RFed or backed up.");
+      return 1;
+    }
+    err("");
+    err("To remove corrupted entries, run: dacar validate --fix");
+    err("(This will require re-syncing from RFed to restore valid grants)");
+    return 1;
+  }
+  err("✔ No corruption detected");
+  return 0;
+}
+
+/** Parse a 64-hex ledger/state tuple-hash key into 32 bytes (or null). */
+async function tupleHashBytes(hex) {
+  try {
+    const raw = hexToBytes(hex);
+    return raw.length === 32 ? raw : new Uint8Array(0);
+  } catch {
+    return new Uint8Array(0);
+  }
+}
+
+async function cmdPrune(args) {
+  const store = await openStore(args);
+  const config = await store.loadConfigValidated();
+  const state = await store.loadState(config);
+  const count = state.prune();
+  await store.saveState(state);
+  err(`✔ pruned ${count} resolved tombstone pair(s) (§9)`);
+  // Also drop outbox entries older than the §9 horizon: such deltas are
+  // intake-rejected by receivers (§9) so publishing them is pointless, and
+  // this keeps the outbox bounded for long-lived offline nodes (work doc #8).
+  const dropped = await pruneOutbox(store, state.deletionHorizonMs);
+  if (dropped) {
+    err(`  outbox: pruned ${dropped} stale delta(s) (older than horizon)`);
+  }
+  // And the sent box: stale entries would be intake-rejected on re-send, so
+  // the durable replay log is bounded the same way (work doc #11).
+  const sentDropped = await pruneSent(store, state.deletionHorizonMs);
+  if (sentDropped) {
+    err(`  sent: pruned ${sentDropped} stale delta(s) (older than horizon)`);
+  }
+  return 0;
+}
+
+/**
+ * Split payloads by the §9 horizon (mirrors Python `_prune_payload_list`).
+ * Returns `[kept, dropped]`; entries that fail to decode are kept.
+ * @param {Uint8Array[]} payloads
+ * @param {number} horizonMs
+ * @param {number} [nowMs]
+ * @returns {[Uint8Array[], number]}
+ */
+function prunePayloadList(payloads, horizonMs, nowMs) {
+  const now = nowMs ?? physicalNowMs();
+  const cutoff = now - horizonMs;
+  /** @type {Uint8Array[]} */ const kept = [];
+  let dropped = 0;
+  for (const payload of payloads) {
+    let physicalMs;
+    try {
+      physicalMs = unpackHlc(Operation.fromPayload(payload).hlc).physicalMs;
+    } catch {
+      kept.push(payload); // can't decode -> keep (don't destroy)
+      continue;
+    }
+    if (physicalMs < cutoff) dropped += 1;
+    else kept.push(payload);
+  }
+  return [kept, dropped];
+}
+
+/** @param {DacarStore} store @param {number} horizonMs @returns {Promise<number>} */
+async function pruneOutbox(store, horizonMs) {
+  const outbox = await store.loadOutbox();
+  if (!outbox.length) return 0;
+  const [kept, dropped] = prunePayloadList(outbox, horizonMs);
+  if (dropped) await store.saveOutbox(kept);
+  return dropped;
+}
+
+/** @param {DacarStore} store @param {number} horizonMs @returns {Promise<number>} */
+async function pruneSent(store, horizonMs) {
+  const sent = await store.loadSent();
+  if (!sent.length) return 0;
+  const [kept, dropped] = prunePayloadList(sent, horizonMs);
+  if (dropped) await store.saveSent(kept);
+  return dropped;
+}
+
+// ---------------------------------------------------------------------------
+// aliases / ledger
+// ---------------------------------------------------------------------------
+
+async function cmdAliasAdd(args) {
+  const store = await openStore(args);
+  const aliases = await store.loadAliases();
+  const hashBytes = resolveIdentityHash(args.hash, aliases);
+  const existing = aliases.resolve(args.name);
+  if (existing && !bytesEqual(existing, hashBytes)) {
+    throw new CliError(
+      `alias ${JSON.stringify(args.name)} already names a different hash (${shortHash(existing, args.fullHashes)})`,
+    );
+  }
+  aliases.add(args.name, hashBytes, args.note);
+  await store.saveAliases(aliases);
+  err(`✔ alias ${JSON.stringify(args.name)} → ${renderIdentity(hashBytes, aliases, args.fullHashes)}`);
+  return 0;
+}
+
+async function cmdAliasRemove(args) {
+  const store = await openStore(args);
+  const aliases = await store.loadAliases();
+  if (!aliases.remove(args.name)) {
+    throw new CliError(`no alias named ${JSON.stringify(args.name)}`);
+  }
+  await store.saveAliases(aliases);
+  err(`✔ removed alias ${JSON.stringify(args.name)}`);
+  return 0;
+}
+
+async function cmdAliasList(args) {
+  const store = await openStore(args);
+  const aliases = await store.loadAliases();
+  if (!aliases.entries.length) {
+    err("(no aliases)");
+    return 0;
+  }
+  for (const entry of aliases.entries) {
+    let line = `${toHex(entry.hash)}  ${entry.names.join(" ")}`;
+    if (entry.note) line += `  # ${entry.note}`;
+    err(line);
+  }
+  return 0;
+}
+
+async function cmdAliasResolve(args) {
+  const store = await openStore(args);
+  const aliases = await store.loadAliases();
+  const h = aliases.resolve(args.name);
+  if (!h) throw new CliError(`unknown alias ${JSON.stringify(args.name)}`);
+  // Print the full hash to stdout (machine-readable).
+  out(toHex(h));
+  return 0;
+}
+
+async function cmdLedgerAnnotate(args) {
+  const store = await openStore(args);
+  let tupleHash;
+  try {
+    tupleHash = hexToBytes(args.tupleHash);
+  } catch {
+    throw new CliError(`tuple-hash must be hex, got ${JSON.stringify(args.tupleHash)}`);
+  }
+  if (tupleHash.length !== 32) {
+    throw new CliError(`tuple-hash must be 32 bytes (64 hex), got ${tupleHash.length}`);
+  }
+  const ledger = await store.loadLedger();
+  const key = toHex(tupleHash);
+  const row = ledger.get(key) ?? { object: null, relation: null, wildcard: null, firstSeen: 0 };
+  if (args.object != null) row.object = args.object;
+  if (args.relation != null) row.relation = args.relation;
+  ledger.set(key, row);
+  await store.saveLedger(ledger);
+  err(`✔ annotated tuple ${toHex(tupleHash).slice(0, SHORT_HASH)}…`);
+  return 0;
+}
+
+/**
+ * Run a command implementation with the CLI's error handling (`CliError` →
+ * `error: …` on stderr + exit code 1) without going through `process.argv`
+ * dispatch — the seam Python gets for free from `argparse` + `main`.
+ * @template T
+ * @param {() => Promise<T>} fn
+ * @returns {Promise<T>}
+ */
+export async function runCommand(fn) {
+  try {
+    return await fn();
+  } catch (e) {
+    if (e instanceof CliError) {
+      err("error: " + e.message);
+      return /** @type {T} */ (1);
+    }
+    throw e;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1250,26 +2163,38 @@ const SUBCOMMANDS = {
       show: { run: cmdConfigShow, opts: { reveal: "boolean" }, online: false },
     },
   },
+  salt: {
+    sub: {
+      new: { run: cmdSaltNew, opts: {}, online: false },
+      set: { run: cmdSaltSet, opts: { hex: "string", file: "string" }, online: false },
+    },
+  },
+  anchor: {
+    sub: {
+      add: { run: cmdAnchorAdd, opts: {}, positional: ["hash"], online: false },
+      list: { run: cmdAnchorList, opts: {}, online: false },
+    },
+  },
   grant: {
     run: cmdGrant,
-    opts: { publish: "boolean", lxmf: "string", direct: "boolean", node: "string", discover: "boolean", topic: "string", proprietor: "string", "rns-dir": "string", interface: "string" },
+    opts: { "no-apply": "boolean", out: "string", binary: "boolean", legacy: "string", "copy-hashes": "string", publish: "boolean", lxmf: "string", direct: "boolean", node: "string", discover: "boolean", topic: "string", proprietor: "string", "rns-config": "string", "rns-dir": "string", interface: "string" },
     positional: ["grantee", "relation", "object"],
     online: true,
   },
   revoke: {
     run: cmdRevoke,
-    opts: { publish: "boolean", lxmf: "string", direct: "boolean", node: "string", discover: "boolean", topic: "string", proprietor: "string", "rns-dir": "string", interface: "string" },
+    opts: { "no-apply": "boolean", out: "string", binary: "boolean", legacy: "string", "copy-hashes": "string", publish: "boolean", lxmf: "string", direct: "boolean", node: "string", discover: "boolean", topic: "string", proprietor: "string", "rns-config": "string", "rns-dir": "string", interface: "string" },
     positional: ["grantee", "relation", "object"],
     online: true,
   },
   sync: {
     run: cmdSync,
-    opts: { lxmf: "boolean", "no-lxmf": "boolean", node: "string", discover: "boolean", topic: "string", proprietor: "string", "rns-dir": "string", interface: "string" },
+    opts: { lxmf: "boolean", "no-lxmf": "boolean", node: "string", discover: "boolean", topic: "string", proprietor: "string", "rns-config": "string", "rns-dir": "string", interface: "string" },
     online: true,
   },
   publish: {
     run: cmdPublish,
-    opts: { all: "boolean", outbox: "boolean", sent: "boolean", binary: "boolean", lxmf: "string", direct: "boolean", node: "string", discover: "boolean", topic: "string", proprietor: "string", "rns-dir": "string", interface: "string" },
+    opts: { all: "boolean", outbox: "boolean", sent: "boolean", binary: "boolean", lxmf: "string", direct: "boolean", node: "string", discover: "boolean", topic: "string", proprietor: "string", "rns-config": "string", "rns-dir": "string", interface: "string" },
     // variable file list (0..N) accessed via args._positionals
     online: true,
   },
@@ -1278,20 +2203,20 @@ const SUBCOMMANDS = {
     // The target node is positional[0]; the payload file list (0..N) is
     // positionals 1..N, read from args._positionals in cmdPush (a leading
     // fixed positional plus a variadic rest can't use the `positional` map).
-    opts: { all: "boolean", outbox: "boolean", sent: "boolean", binary: "boolean", timeout: "string", "rns-dir": "string", interface: "string" },
+    opts: { all: "boolean", outbox: "boolean", sent: "boolean", binary: "boolean", timeout: "string", "rns-config": "string", "rns-dir": "string", interface: "string" },
     online: true,
   },
   paper: {
     sub: {
       export: {
         run: cmdPaperExport,
-        opts: { payload: "string", outbox: "boolean", sent: "boolean", all: "boolean", file: "string", "out-dir": "string", manifest: "string", binary: "boolean", "rns-dir": "string", interface: "string" },
+        opts: { payload: "string", outbox: "boolean", sent: "boolean", all: "boolean", file: "string", "out-dir": "string", manifest: "string", binary: "boolean", "rns-config": "string", "rns-dir": "string", interface: "string" },
         positional: ["target"],
         online: true,
       },
       import: {
         run: cmdPaperImport,
-        opts: { manifest: "string", "rns-dir": "string", interface: "string" },
+        opts: { manifest: "string", "rns-config": "string", "rns-dir": "string", interface: "string" },
         // variable URI/file list (1..N) accessed via args._positionals
         online: true,
       },
@@ -1299,12 +2224,30 @@ const SUBCOMMANDS = {
   },
   apply: { run: cmdApply, opts: { binary: "boolean" }, positional: ["payload"], online: false },
   check: { run: cmdCheck, opts: {}, positional: ["grantee", "relation", "object"], online: false },
-  grants: { run: cmdGrants, opts: { all: "boolean", revoked: "boolean" }, online: false },
+  grants: { run: cmdGrants, opts: { all: "boolean", revoked: "boolean", grantee: "string", issuer: "string", effective: "boolean" }, online: false },
+  show: { run: cmdShow, opts: {}, positional: ["ref"], online: false },
+  validate: { run: cmdValidate, opts: { fix: "boolean" }, online: false },
+  prune: { run: cmdPrune, opts: {}, online: false },
+  alias: {
+    sub: {
+      add: { run: cmdAliasAdd, opts: { note: "string" }, positional: ["name", "hash"], online: false },
+      remove: { run: cmdAliasRemove, opts: {}, positional: ["name"], online: false },
+      list: { run: cmdAliasList, opts: {}, online: false },
+      resolve: { run: cmdAliasResolve, opts: {}, positional: ["name"], online: false },
+    },
+  },
+  ledger: {
+    sub: {
+      annotate: { run: cmdLedgerAnnotate, opts: { object: "string", relation: "string" }, positional: ["tupleHash"], online: false },
+    },
+  },
   identity: {
     sub: {
+      show: { run: cmdIdentityShow, opts: {}, online: false },
+      new: { run: cmdIdentityNew, opts: {}, online: false },
       remember: {
         run: cmdIdentityRemember,
-        opts: { pubkey: "string", file: "string", "rns-dir": "string", interface: "string", force: "boolean" },
+        opts: { pubkey: "string", file: "string", "rns-config": "string", "rns-dir": "string", interface: "string", force: "boolean" },
         positional: ["hash"],
         online: true,
       },
@@ -1317,7 +2260,7 @@ const SUBCOMMANDS = {
 function buildOptions(spec) {
   const opts = {};
   for (const [k, t] of Object.entries(spec.opts || {})) {
-    opts[k] = { type: t };
+    opts[k] = { type: t, ...(k === "out" ? { short: "o" } : {}) };
   }
   // --verbose / -v is global: accepted by every (sub)command so it never
   // errors out, and threaded into bootRns to raise the Reticulum log
