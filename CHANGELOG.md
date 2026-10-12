@@ -5,6 +5,12 @@ All notable changes to Dacar will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed (JavaScript)
+
+- The `@reticulum/*` dependencies (`core`, `lxmf`, `node`, `rfed`) were bumped in lockstep from `^0.9.3` to `^0.9.8`. `@reticulum/core` 0.9.8 adopts the Python RNS canonical 64-byte private-key export (`X25519_priv ‖ Ed25519_priv`) as the default for `Identity.getPrivateKey()` (previously a reticulum-js-specific 128-byte priv+pub blob), so JS `identity.key` files are now interchangeable with Python Reticulum key files — including the canonical Python CLI's `--identity PATH`. Verified compatibility in both directions: legacy 128-byte key files written by 0.9.3 still load (`Identity.fromBytes` and `loadOrGenerate` accept both formats, identity hash and public key preserved), and JS-written 64-byte files load in Python RNS. No migration is needed; stored operations, keyrings, and wire formats are unaffected (they use public keys and identity hashes, which are unchanged).
+
 ## [1.6.1] - 2026-10-10
 
 ### Added (JavaScript)

@@ -18,9 +18,12 @@
  * `<dir>/<key>` with the matching mode, and lists them back via `keys`.
  *
  * The node's own signing **identity private key** stays library-native:
- * `FileStorageAdapter` writes/reads `<dir>/identity.key` (128-byte priv+pub),
- * which coexists with — and is distinct from — Python's 64-byte `<dir>/identity`.
- * A store therefore carries the identity of whichever CLI initialized it.
+ * `FileStorageAdapter` writes/reads `<dir>/identity.key` (64-byte
+ * Python-compatible priv-only format as of `@reticulum/core` ≥0.9.8; key files
+ * written by older reticulum-js in the legacy 128-byte priv+pub layout still
+ * load), which coexists with — and is distinct from — Python's
+ * `<dir>/identity`. A store therefore carries the identity of whichever CLI
+ * initialized it.
  *
  * Node-only (imports `node:fs` + `@reticulum/node`); the portable record
  * encode/decode lives in `src/cli/store.js` (browser-safe, no `fs`).

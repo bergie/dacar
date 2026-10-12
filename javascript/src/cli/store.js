@@ -28,8 +28,10 @@
  *
  * The node's own signing **identity private key** is the ONE intentional
  * divergence: it stays library-native (Python RNS → 64-byte priv-only
- * `identity`; `@reticulum/core` → 128-byte priv+pub `identity.key` via
- * `adapter.loadKey`/`saveKey`). The two files coexist under different names; a
+ * `identity`; `@reticulum/core` ≥0.9.8 → same 64-byte Python-compatible format
+ * as `identity.key` via `adapter.loadKey`/`saveKey`; key files written by
+ * older reticulum-js in the legacy 128-byte priv+pub layout still load).
+ * The two files coexist under different names; a
  * store carries the identity of whichever CLI initialized it.
  */
 
@@ -101,8 +103,9 @@ export class DacarStore {
   /**
    * @param {import("@reticulum/core").StorageAdapter} adapter
    * @param {Object} [opts]
-   * @param {Uint8Array | string} [opts.identityBytes] A 128-byte private-key blob
-   *   overriding the store's own identity (mirrors Python's `--identity PATH`).
+   * @param {Uint8Array | string} [opts.identityBytes] Private-key bytes (64-byte
+   *   Python-compatible format, or legacy 128-byte priv+pub) overriding the
+   *   store's own identity (mirrors Python's `--identity PATH`).
    */
   constructor(adapter, opts = {}) {
     this._adapter = adapter;
@@ -122,7 +125,8 @@ export class DacarStore {
    * @param {Object} [opts]
    * @param {Uint8Array} [opts.salt] 32-byte Privacy Salt (default: random).
    * @param {number} [opts.horizonDays]
-   * @param {Uint8Array} [opts.identityBytes] 128-byte private-key blob to adopt.
+   * @param {Uint8Array} [opts.identityBytes] Private-key bytes (64-byte
+   *   Python-compatible format, or legacy 128-byte priv+pub) to adopt.
    * @returns {Promise<DacarStore>}
    */
   static async init(adapter, opts = {}) {
